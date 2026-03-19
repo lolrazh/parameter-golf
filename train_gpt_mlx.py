@@ -62,6 +62,7 @@ class Hyperparameters:
     warmup_steps: int = int(os.environ.get("WARMUP_STEPS", 20))
     warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", 1200))
     max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
+    val_tokens_limit: int = int(os.environ.get("VAL_TOKENS_LIMIT", 0))
 
     # Model (defaults match the current baseline setup).
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -864,6 +865,10 @@ def main() -> None:
         args.tokenizer_path,
     )
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    if args.val_tokens_limit > 0:
+        limit = (args.val_tokens_limit // args.train_seq_len) * args.train_seq_len + 1
+        val_tokens = val_tokens[:limit]
+        log(f"val_tokens_limit:{args.val_tokens_limit} actual_val_tokens:{val_tokens.size - 1}")
 
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size
