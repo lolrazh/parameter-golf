@@ -26,6 +26,7 @@ Local MLX experiments on M4 Air. Comparing val_loss at 200 steps (SEED=1337, SEQ
 | 12 | baseline_h100 | (default 9L×512d) | 2.6852 | 1.5903 | 1.6189 | 341 | baseline |
 | 13 | wide_6L_640d_h100 | 6L×640d | 2.6517 | 1.5705 | 1.6024 | 352 | BEST |
 | 14 | deep_12L_448d_h100 | 12L×448d | 3.0072 | 1.7810 | 1.8363 | 252 | WORST |
+| 32 | baseline_5min | default 9L×512d, 5 min | 2.3195 | 1.3738 | 1.3766 | 856 | 5-min baseline |
 
 **Width ceiling search (local M4, 3× LR baseline = 6L×640d @ 3.9868)**
 

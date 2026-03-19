@@ -30,12 +30,14 @@ image = (
         "huggingface-hub",
         "setuptools",
         "typing-extensions==4.15.0",
+        "zstandard",
     )
     .add_local_file("data/cached_challenge_fineweb.py", remote_path="/root/data/cached_challenge_fineweb.py", copy=True)
     .run_commands(
         "cd /root && python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 10"
     )
     .add_local_file("train_gpt.py", remote_path="/root/train_gpt.py")
+    .add_local_file("sota_train_gpt.py", remote_path="/root/sota_train_gpt.py")
 )
 
 
@@ -68,9 +70,12 @@ def train(
     muon_momentum_warmup_start: float = 0.85,
     muon_momentum_warmup_steps: int = 500,
     muon_momentum: float = 0.95,
+    use_sota: bool = False,
 ):
     import os
     import subprocess
+
+    script = "/root/sota_train_gpt.py" if use_sota else "/root/train_gpt.py"
 
     env = {
         **os.environ,
@@ -105,7 +110,7 @@ def train(
         "TOKENIZER_PATH": "/root/data/tokenizers/fineweb_1024_bpe.model",
     }
 
-    cmd = ["torchrun", "--standalone", "--nproc_per_node=1", "/root/train_gpt.py"]
+    cmd = ["torchrun", "--standalone", "--nproc_per_node=1", script]
 
     print(f"=== Parameter Golf: {run_id} ===")
     print(f"Config: {num_layers}L {model_dim}d {num_heads}h {num_kv_heads}kv {mlp_mult}x_mlp")
@@ -158,6 +163,7 @@ def main(
     muon_momentum_warmup_start: float = 0.85,
     muon_momentum_warmup_steps: int = 500,
     muon_momentum: float = 0.95,
+    use_sota: bool = False,
 ):
     train.remote(
         run_id=run_id,
@@ -187,4 +193,5 @@ def main(
         muon_momentum=muon_momentum,
         muon_momentum_warmup_start=muon_momentum_warmup_start,
         muon_momentum_warmup_steps=muon_momentum_warmup_steps,
+        use_sota=use_sota,
     )
