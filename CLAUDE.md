@@ -43,16 +43,23 @@ python3 train_gpt_mlx.py
 - **Noise**: Differences < 0.1 in val_loss at 200 steps are likely noise. Keep seed fixed (default 1337).
 - **Thermal**: M4 Air throttles after ~5-10s peak. Runs should finish in 2-5 min total.
 
-### Cloud (1xH100)
+### Cloud via Modal (1xH100, ~$0.11 per 2-min experiment)
 ```bash
-RUN_ID=baseline_sp1024 \
-DATA_PATH=./data/datasets/fineweb10B_sp1024/ \
-TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
-VOCAB_SIZE=1024 \
-torchrun --standalone --nproc_per_node=1 train_gpt.py
-```
+# Minimal verify run (~10 steps, ~$0.01)
+modal run train_modal.py --run-id verify --iterations 10 --max-wallclock 30 --val-tokens-limit 32768
 
-### Cloud (8xH100 — leaderboard)
+# 2-min baseline (~340 steps, ~$0.11)
+modal run train_modal.py --run-id baseline_h100 --max-wallclock 120
+
+# 2-min experiment with custom config
+modal run train_modal.py --run-id wide_6L --max-wallclock 120 --num-layers 6 --model-dim 640
+```
+- Data is cached in the Modal image (downloaded at build time).
+- Default batch size: 524K tokens (real H100 batch, not local toy batch).
+- Default val: 1M tokens (fast but reliable on H100).
+- Use `--max-wallclock 120` for experiments, `--max-wallclock 600` for final runs.
+
+### Cloud direct (RunPod, 8xH100 — leaderboard submission only)
 ```bash
 torchrun --standalone --nproc_per_node=8 train_gpt.py
 ```
