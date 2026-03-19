@@ -36,3 +36,4 @@ Local MLX experiments on M4 Air. Comparing val_loss at 200 steps (SEED=1337, SEQ
 | 17 | val_embed_6L_640d | value embeddings on 6L×640d | 4.0020 | +0.015 | noise | +324K params, scales need more steps to learn? |
 | 18 | recurse_6L_640d_2x | depth recurrence 2× on 6L×640d | 4.0885 | +0.102 | worse | 2× slower per step, double compute but same params |
 | 19 | lawa_6L_640d | LAWA (5 snapshots, every 10 steps) | 4.0197 | +0.033 | noise | averaging too-noisy snapshots at 200 steps. needs longer runs |
+| 20 | val_embed_fixed | val_emb_scale=0.1 init (vs 0.0) | 4.0019 | +0.015 | noise | init wasn't the issue. val_embed just doesn't help at 200 steps |

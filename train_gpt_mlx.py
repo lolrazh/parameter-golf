@@ -408,7 +408,7 @@ class GPT(nn.Module):
         # Gives attention direct access to token identity. kv_dim matches V projection.
         kv_dim = num_kv_heads * (dim // num_heads)
         self.val_emb = nn.Embedding(vocab_size, kv_dim)
-        self.val_emb_scale = mx.zeros((num_layers,), dtype=mx.float32)
+        self.val_emb_scale = mx.ones((num_layers,), dtype=mx.float32) * 0.1
 
         for b in self.blocks:
             b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
