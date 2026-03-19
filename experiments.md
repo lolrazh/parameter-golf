@@ -18,3 +18,11 @@ Local MLX experiments on M4 Air. Comparing val_loss at 200 steps (SEED=1337, SEQ
 | 9 | deep_12L_448d | 12 layers × 448d (vs 9×512) | 4.1726 | +0.115 | worse | deeper+narrower hurt. more layers = slower convergence? |
 | 10 | wide_6L_640d | 6 layers × 640d (vs 9×512) | 3.9868 | -0.071 | BEST | wider+shallower wins at 200 steps. 17.9M params |
 | 11 | mlp_3x | MLP_MULT=3 (vs 2) | 4.0571 | -0.001 | noise | 21.8M params (+28%), no improvement. bad param ROI |
+
+**H100 runs (1xH100, 2 min, 524K batch, val on 1M tokens)**
+
+| # | Run ID | Change | val_loss | val_bpb | post-quant BPB | steps | verdict |
+|---|--------|--------|----------|---------|----------------|-------|---------|
+| 12 | baseline_h100 | (default 9L×512d) | 2.6852 | 1.5903 | 1.6189 | 341 | baseline |
+| 13 | wide_6L_640d_h100 | 6L×640d | 2.6517 | 1.5705 | 1.6024 | 352 | BEST |
+| 14 | deep_12L_448d_h100 | 12L×448d | 3.0072 | 1.7810 | 1.8363 | 252 | WORST |
