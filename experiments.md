@@ -45,3 +45,16 @@ Local MLX experiments on M4 Air. Comparing val_loss at 200 steps (SEED=1337, SEQ
 |---|--------|--------|----------|-------|---------|-------|
 | 22 | baseline_400 | 6L×640d baseline at 400 steps | 3.7124 | — | baseline | ~5.5 min, big drop from 200-step (3.99→3.71) |
 | 23 | val_embed_400 | value embeddings at 400 steps | 3.7144 | +0.002 | noise | still nothing. val_embed not helping even with more steps |
+
+**Rapid sweep on 6L×640d (local M4, 3× LR, 200 steps, baseline = 3.9868)**
+
+| # | Run ID | Change | val_loss | delta | verdict | notes |
+|---|--------|--------|----------|-------|---------|-------|
+| 24 | grad_clip | GRAD_CLIP_NORM=1.0 | 3.9972 | -0.009 | noise | marginal, leaning positive |
+| 25 | muon3 | MUON_BACKEND_STEPS=3 (vs 5) | 4.1522 | +0.165 | WORSE | worse orthogonalization, not worth speed gain |
+| 26 | full_mha | NUM_KV_HEADS=8 (full MHA) | 4.0212 | +0.034 | noise | extra KV params didn't help |
+| 27 | heads4 | NUM_HEADS=4 head_dim=160 | 3.9907 | +0.004 | noise | halving heads barely hurts! saves KV params |
+| 28 | drop_mlp0 | DROP_FIRST_MLP=1 | 4.0149 | +0.028 | noise | MLP matters even on layer 0 |
+| 29 | lr_retune_2x | 6L×640d at 2× LR | 4.1071 | +0.120 | worse | 3× is right for this shape too |
+| 30 | lr_retune_4x | 6L×640d at 4× LR | 4.0076 | +0.021 | noise | 3× still best |
+| 31 | muon_mom_099 | MUON_MOMENTUM=0.99 (vs 0.95) | 4.0014 | +0.015 | noise | slightly more aggressive, no help |

@@ -79,6 +79,7 @@ class Hyperparameters:
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
     depth_recurrence: int = int(os.environ.get("DEPTH_RECURRENCE", 1))
     use_swiglu: bool = bool(int(os.environ.get("USE_SWIGLU", "0")))
+    drop_first_mlp: bool = bool(int(os.environ.get("DROP_FIRST_MLP", "0")))
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -385,12 +386,13 @@ class Block(nn.Module):
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
 
-    def __call__(self, x: mx.array, x0: mx.array, ve: mx.array | None = None) -> mx.array:
+    def __call__(self, x: mx.array, x0: mx.array, ve: mx.array | None = None, skip_mlp: bool = False) -> mx.array:
         mix = self.resid_mix.astype(x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x), ve=ve)
         x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        if not skip_mlp:
+            x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -401,13 +403,14 @@ class GPT(nn.Module):
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float, depth_recurrence: int = 1, use_swiglu: bool = False):
+                 qk_gain_init: float, depth_recurrence: int = 1, use_swiglu: bool = False, drop_first_mlp: bool = False):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
         self.depth_recurrence = depth_recurrence
+        self._drop_first_mlp = drop_first_mlp
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
         self.num_encoder_layers = num_layers // 2
@@ -445,7 +448,8 @@ class GPT(nn.Module):
             skips: list[mx.array] = []
             for i in range(self.num_encoder_layers):
                 ve = self.val_emb_scale[i].astype(x.dtype) * ve_raw
-                x = self.blocks[i](x, x0, ve=ve)
+                skip_mlp = (self._drop_first_mlp and i == 0 and _loop == 0)
+                x = self.blocks[i](x, x0, ve=ve, skip_mlp=skip_mlp)
                 skips.append(x)
             for i in range(self.num_decoder_layers):
                 if skips:
@@ -924,6 +928,7 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         depth_recurrence=args.depth_recurrence,
         use_swiglu=args.use_swiglu,
+        drop_first_mlp=args.drop_first_mlp,
     )
     opt = SplitOptimizers(model, args)
 
