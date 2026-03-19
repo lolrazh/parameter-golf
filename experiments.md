@@ -7,3 +7,9 @@ Local MLX experiments on M4 Air. Comparing val_loss at 200 steps (SEED=1337, SEQ
 | # | Run ID | Change from baseline | val_loss | delta | verdict | notes |
 |---|--------|---------------------|----------|-------|---------|-------|
 | 0 | baseline_v1 | (none — default config) | 4.3525 | — | baseline | 9L 512d 8h 4kv 2x_mlp, 17M params, ~102s |
+| 1 | lr_0.25x | all LRs × 0.25 | 4.9135 | +0.561 | worse | way too slow to learn in 200 steps |
+| 2 | lr_0.5x | all LRs × 0.5 | 4.5117 | +0.159 | worse | still too conservative |
+| 3 | lr_2x | all LRs × 2.0 | 4.1910 | -0.162 | BETTER | despite early spike to 8.77, recovered and won |
+| 4 | lr_1.5x | all LRs × 1.5 | 4.2450 | -0.108 | better | between baseline and 2x, as expected |
+| 5 | lr_3x | all LRs × 3.0 | 4.0579 | -0.295 | BETTER | spike to 11.97! but recovered. still climbing? |
+| 6 | lr_4x | all LRs × 4.0 | 3.9874 | -0.365 | BEST | spike to 15.0, recovered. brutal throttling though |
