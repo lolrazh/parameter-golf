@@ -77,6 +77,7 @@ class Hyperparameters:
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    depth_recurrence: int = int(os.environ.get("DEPTH_RECURRENCE", 1))
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -321,11 +322,13 @@ class CausalSelfAttention(nn.Module):
         self.rope = nn.RoPE(self.head_dim, traditional=False, base=rope_base)
         self.scale = self.head_dim ** -0.5
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, ve: mx.array | None = None) -> mx.array:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        if ve is not None:
+            v = v + ve.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
         q = self.rope(rms_norm(q).astype(COMPUTE_DTYPE))
         k = self.rope(rms_norm(k).astype(COMPUTE_DTYPE))
@@ -367,10 +370,10 @@ class Block(nn.Module):
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
 
-    def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, x0: mx.array, ve: mx.array | None = None) -> mx.array:
         mix = self.resid_mix.astype(x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        attn_out = self.attn(self.attn_norm(x), ve=ve)
         x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
@@ -383,12 +386,13 @@ class GPT(nn.Module):
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+                 qk_gain_init: float, depth_recurrence: int = 1):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
+        self.depth_recurrence = depth_recurrence
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
         self.num_encoder_layers = num_layers // 2
@@ -400,6 +404,11 @@ class GPT(nn.Module):
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
+        # Value embedding: learned per-token vectors mixed into attention values.
+        # Gives attention direct access to token identity. kv_dim matches V projection.
+        kv_dim = num_kv_heads * (dim // num_heads)
+        self.val_emb = nn.Embedding(vocab_size, kv_dim)
+        self.val_emb_scale = mx.zeros((num_layers,), dtype=mx.float32)
 
         for b in self.blocks:
             b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
@@ -415,18 +424,20 @@ class GPT(nn.Module):
     def __call__(self, input_ids: mx.array) -> mx.array:
         x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
         x0 = x
-        skips: list[mx.array] = []
+        ve_raw = self.val_emb(input_ids).astype(COMPUTE_DTYPE)
 
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            # Odd layer counts have one more decoder block than encoder block. The baseline only
-            # applies a skip connection when one exists, then runs the remaining decoder block(s)
-            # without an added skip.
-            if skips:
-                x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        for _loop in range(self.depth_recurrence):
+            skips: list[mx.array] = []
+            for i in range(self.num_encoder_layers):
+                ve = self.val_emb_scale[i].astype(x.dtype) * ve_raw
+                x = self.blocks[i](x, x0, ve=ve)
+                skips.append(x)
+            for i in range(self.num_decoder_layers):
+                if skips:
+                    x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
+                layer_idx = self.num_encoder_layers + i
+                ve = self.val_emb_scale[layer_idx].astype(x.dtype) * ve_raw
+                x = self.blocks[layer_idx](x, x0, ve=ve)
         return self.final_norm(x)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
@@ -896,6 +907,7 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        depth_recurrence=args.depth_recurrence,
     )
     opt = SplitOptimizers(model, args)
 
@@ -994,6 +1006,11 @@ def main() -> None:
 
         train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name)
 
+    # LAWA: keep a sliding window of recent parameter snapshots for weight averaging.
+    lawa_window = int(os.environ.get("LAWA_WINDOW", 0))
+    lawa_every = int(os.environ.get("LAWA_EVERY", 10))
+    lawa_snapshots: list[dict[str, mx.array]] = []
+
     train_time_ms = 0.0
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
     stop_after_step: int | None = None
@@ -1003,6 +1020,15 @@ def main() -> None:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
         if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
             train_time_ms += 1000.0 * (time.perf_counter() - t0)
+            # LAWA: average recent snapshots before final eval
+            if last_step and len(lawa_snapshots) >= 2:
+                log(f"lawa:averaging {len(lawa_snapshots)} snapshots (every {lawa_every} steps, window {lawa_window})")
+                avg = {}
+                for k in lawa_snapshots[0]:
+                    stacked = [s[k] for s in lawa_snapshots]
+                    avg[k] = sum(stacked) * (1.0 / len(stacked))
+                model.update(tree_unflatten(list(avg.items())))
+                lawa_snapshots.clear()
             # Validation always scans the same fixed full validation split.
             val_loss, val_bpb = eval_val(
                 args,
@@ -1040,6 +1066,13 @@ def main() -> None:
         train_loss_value = float(train_loss.item())
         opt.step(model, grads, step=step, lr_mul=lr_mul)
         mx.synchronize()
+
+        # LAWA snapshot collection
+        if lawa_window > 0 and (step + 1) % lawa_every == 0:
+            snap = {k: mx.array(v) for k, v in tree_flatten(model.parameters())}
+            lawa_snapshots.append(snap)
+            if len(lawa_snapshots) > lawa_window:
+                lawa_snapshots.pop(0)
 
         step_ms = 1000.0 * (time.perf_counter() - step_t0)
         approx_train_time_ms = train_time_ms + 1000.0 * (time.perf_counter() - t0)

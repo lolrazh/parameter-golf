@@ -26,3 +26,13 @@ Local MLX experiments on M4 Air. Comparing val_loss at 200 steps (SEED=1337, SEQ
 | 12 | baseline_h100 | (default 9L×512d) | 2.6852 | 1.5903 | 1.6189 | 341 | baseline |
 | 13 | wide_6L_640d_h100 | 6L×640d | 2.6517 | 1.5705 | 1.6024 | 352 | BEST |
 | 14 | deep_12L_448d_h100 | 12L×448d | 3.0072 | 1.7810 | 1.8363 | 252 | WORST |
+
+**Width ceiling search (local M4, 3× LR baseline = 6L×640d @ 3.9868)**
+
+| # | Run ID | Change | val_loss | delta | verdict | notes |
+|---|--------|--------|----------|-------|---------|-------|
+| 15 | wide_5L_720d | 5L×720d (18.9M params) | 4.0225 | +0.036 | worse | too wide, too few layers |
+| 16 | wide_4L_768d | 4L×768d (17.3M params) | 4.0694 | +0.083 | worse | 4 layers not enough depth |
+| 17 | val_embed_6L_640d | value embeddings on 6L×640d | 4.0020 | +0.015 | noise | +324K params, scales need more steps to learn? |
+| 18 | recurse_6L_640d_2x | depth recurrence 2× on 6L×640d | 4.0885 | +0.102 | worse | 2× slower per step, double compute but same params |
+| 19 | lawa_6L_640d | LAWA (5 snapshots, every 10 steps) | 4.0197 | +0.033 | noise | averaging too-noisy snapshots at 200 steps. needs longer runs |
