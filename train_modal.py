@@ -16,6 +16,11 @@ import modal
 
 app = modal.App("parameter-golf")
 
+# Image layers ordered for cache efficiency:
+# 1. pip deps (rarely change)
+# 2. data download script (rarely changes)
+# 3. download data (cached unless script changes)
+# 4. train_gpt.py (changes often — doesn't invalidate data cache)
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
@@ -26,25 +31,15 @@ image = (
         "setuptools",
         "typing-extensions==4.15.0",
     )
+    .add_local_file("data/cached_challenge_fineweb.py", remote_path="/root/data/cached_challenge_fineweb.py", copy=True)
     .run_commands(
-        # Download data at image build time so it's cached across runs
-        "pip install huggingface-hub",
-        "python3 -c \""
-        "from huggingface_hub import snapshot_download; "
-        "snapshot_download('willdepueoai/parameter-golf', repo_type='dataset', "
-        "local_dir='/data/parameter-golf', allow_patterns=['datasets/fineweb10B_sp1024/*', 'tokenizers/*', 'manifest.json'])"
-        "\"",
+        "cd /root && python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 10"
     )
+    .add_local_file("train_gpt.py", remote_path="/root/train_gpt.py")
 )
 
 
-@app.function(
-    image=image,
-    gpu="H100",
-    timeout=900,  # 15 min max (training + eval + buffer)
-    mounts=[modal.Mount.from_local_file("train_gpt.py", remote_path="/root/train_gpt.py"),
-            modal.Mount.from_local_file("data/cached_challenge_fineweb.py", remote_path="/root/data/cached_challenge_fineweb.py")],
-)
+@app.function(image=image, gpu="H100", timeout=900)
 def train(
     run_id: str = "test",
     max_wallclock: int = 120,
@@ -71,19 +66,6 @@ def train(
 ):
     import os
     import subprocess
-
-    # Set up data paths — use the cached HF download
-    data_path = "/data/parameter-golf/datasets/fineweb10B_sp1024"
-    tokenizer_path = "/data/parameter-golf/tokenizers/fineweb_1024_bpe.model"
-
-    # Symlink data into expected locations if needed
-    os.makedirs("/root/data/datasets", exist_ok=True)
-    os.makedirs("/root/data/tokenizers", exist_ok=True)
-    if not os.path.exists(f"/root/{data_path.lstrip('/')}"):
-        os.symlink(data_path, "/root/data/datasets/fineweb10B_sp1024")
-    tok_dest = "/root/data/tokenizers/fineweb_1024_bpe.model"
-    if not os.path.exists(tok_dest):
-        os.symlink(tokenizer_path, tok_dest)
 
     env = {
         **os.environ,
@@ -113,7 +95,6 @@ def train(
         "TOKENIZER_PATH": "/root/data/tokenizers/fineweb_1024_bpe.model",
     }
 
-    # Run with torchrun for single GPU (handles DDP init cleanly)
     cmd = ["torchrun", "--standalone", "--nproc_per_node=1", "/root/train_gpt.py"]
 
     print(f"=== Parameter Golf: {run_id} ===")
@@ -122,18 +103,17 @@ def train(
     print(f"Val tokens limit: {val_tokens_limit}")
     print("=" * 60)
 
-    result = subprocess.run(cmd, env=env, capture_output=False, text=True, cwd="/root")
+    result = subprocess.run(cmd, env=env, cwd="/root")
 
     if result.returncode != 0:
         print(f"FAILED with exit code {result.returncode}")
         return
 
-    # Print the log file for easy reading
+    # Print the log file
     log_path = f"/root/logs/{run_id}.txt"
     if os.path.exists(log_path):
         with open(log_path) as f:
             lines = f.readlines()
-        # Print last 30 lines (contains val results)
         print("\n=== RESULTS (last 30 lines) ===")
         for line in lines[-30:]:
             print(line, end="")
