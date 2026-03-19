@@ -18,16 +18,28 @@ This is an L(N) optimization problem: minimize loss given a fixed parameter coun
 
 ## Running
 
-### Local MLX smoke test
+### Local MLX experiment (fast feedback loop)
 ```bash
 source .venv/bin/activate
-RUN_ID=mlx_smoke \
+RUN_ID=experiment_name \
 ITERATIONS=200 \
-TRAIN_BATCH_TOKENS=8192 \
+TRAIN_BATCH_TOKENS=4096 \
+GRAD_ACCUM_STEPS=1 \
+TRAIN_SEQ_LEN=512 \
 VAL_LOSS_EVERY=0 \
-VAL_BATCH_SIZE=8192 \
+VAL_BATCH_SIZE=131072 \
+WARMUP_STEPS=0 \
+MAX_WALLCLOCK_SECONDS=0 \
+TRAIN_LOG_EVERY=10 \
+SKIP_SERIALIZATION=1 \
 python3 train_gpt_mlx.py
 ```
+- **Why these values**: 4K batch + seq_len 512 = fast steps on M4 Air. 131K val batch = fast eval.
+  SKIP_SERIALIZATION=1 skips int8 quantization roundtrip (saves a second full validation pass).
+  WARMUP_STEPS=0 skips compile warmup (~30s saved). 200 iters avoids early volatility.
+- **Metric**: Use `val_loss` for local comparison (monotonically related to BPB).
+- **Noise**: Differences < 0.1 in val_loss at 200 steps are likely noise. Keep seed fixed (default 1337).
+- **Thermal**: M4 Air throttles after ~5-10s peak. Runs should finish in 2-5 min total.
 
 ### Cloud (1xH100)
 ```bash

@@ -1054,6 +1054,9 @@ def main() -> None:
     # We always write a raw artifact and a quantized artifact, then validate the
     # quantized roundtrip directly by loading the dequantized tensors back into the
     # model and running one final validation pass.
+    if os.environ.get("SKIP_SERIALIZATION", "0") == "1":
+        log("skip_serialization:1 — skipping model save + quantized roundtrip eval")
+        return
     out_path = out_dir / f"{args.run_id}_mlx_model.npz"
     flat_state = {k: v for k, v in tree_flatten(model.state)}
     mx.savez(str(out_path), **flat_state)
