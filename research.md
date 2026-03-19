@@ -10,7 +10,7 @@ Priority: ★★★ = high impact + low effort, ★★ = high impact + medium ef
 ## Proven Speedrun Tricks (from modded-nanogpt, battle-tested)
 - [ ] ★★★ Value embeddings: learned embed tables mixed into attention values. Near-zero FLOP cost, WR-setting.
 - [ ] ★★★ Smear module: `x[t] += 0.07 * sigmoid(gate) * x[t-1]`. Bigram stats. Basically free.
-- [ ] ★★★ Logit softcap 15 (not 30): modded-nanogpt tuned this down.
+- [x] ★★★ Logit softcap 15 (not 30): NO CHANGE at 200 steps (4.0863 vs 4.0579). Noise.
 - [ ] ★★★ LAWA (Latest Weight Averaging): running avg of recent checkpoints. Free generalization boost.
 - [ ] ★★ Drop first MLP: layer 0 doesn't need MLP. Saves params to redistribute.
 - [ ] ★★ Backout mechanism: store residual at 2/3 depth, subtract learned fraction before LM head.
