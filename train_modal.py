@@ -8,6 +8,9 @@ Examples:
     modal run train_modal.py --run-id sota_6x640_2m --max-wallclock 120 \
         --overrides 'NUM_LAYERS=6,MODEL_DIM=640,EVAL_STRIDE=0'
 
+    modal run train_modal.py --run-id clean_9x512_5m --max-wallclock 300 \
+        --overrides 'NUM_LAYERS=9,MODEL_DIM=512,EVAL_STRIDE=0' --save-checkpoint
+
 Short-run metric policy:
     - `metric_mode=auto` picks the final pre-quant validation BPB for short runs
       (`max_wallclock <= 180`) because the int6 roundtrip can be misleading early.
@@ -46,6 +49,8 @@ image = (
         copy=True,
     )
     .run_commands("cd /root && python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 10")
+    .add_local_file("quant_sweep.py", remote_path="/root/quant_sweep.py")
+    .add_local_file("sota_train_gpt.py", remote_path="/root/sota_train_gpt.py")
     .add_local_file("sota_train_gpt.py", remote_path="/root/train_gpt.py")
 )
 
@@ -228,6 +233,11 @@ def train(
     eval_stride: int = -1,
     overrides: str = "",
     metric_mode: str = "auto",
+    save_checkpoint: bool = False,
+    run_quant_sweep: bool = False,
+    quant_recipes: str = "",
+    quant_val_tokens_limit: int = 1_048_576,
+    quant_probe_blocks: bool = False,
 ):
     import os
     import subprocess
@@ -269,6 +279,36 @@ def train(
 
     verify_effective_config(lines, effective_overrides)
     print_summary(lines, metric_mode=metric_mode, max_wallclock=max_wallclock)
+    if run_quant_sweep:
+        quant_cmd = [
+            "python3",
+            "/root/quant_sweep.py",
+            "--checkpoint-path",
+            "/root/final_model.pt",
+            "--run-id",
+            f"{run_id}_quant",
+            "--overrides",
+            override_text,
+            "--val-tokens-limit",
+            str(quant_val_tokens_limit),
+            "--output-path",
+            f"/root/logs/{run_id}_quant.json",
+        ]
+        if quant_recipes.strip():
+            quant_cmd.extend(["--recipes", quant_recipes])
+        if quant_probe_blocks:
+            quant_cmd.append("--probe-blocks")
+        print("\n=== QUANT SWEEP ===")
+        quant_proc = subprocess.run(quant_cmd, env=env, cwd="/root", check=False)
+        if quant_proc.returncode != 0:
+            raise RuntimeError(f"quant sweep failed with exit code {quant_proc.returncode}")
+    if save_checkpoint:
+        checkpoint_path = "/root/final_model.pt"
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"checkpoint not found: {checkpoint_path}")
+        with open(checkpoint_path, "rb") as f:
+            return f.read()
+    return None
 
 
 @app.local_entrypoint()
@@ -281,8 +321,14 @@ def main(
     eval_stride: int = -1,
     overrides: str = "",
     metric_mode: str = "auto",
+    save_checkpoint: bool = False,
+    checkpoint_dir: str = "checkpoints",
+    run_quant_sweep: bool = False,
+    quant_recipes: str = "",
+    quant_val_tokens_limit: int = 1_048_576,
+    quant_probe_blocks: bool = False,
 ):
-    train.remote(
+    checkpoint_bytes = train.remote(
         run_id=run_id,
         max_wallclock=max_wallclock,
         train_log_every=train_log_every,
@@ -291,4 +337,17 @@ def main(
         eval_stride=eval_stride,
         overrides=overrides,
         metric_mode=metric_mode,
+        save_checkpoint=save_checkpoint,
+        run_quant_sweep=run_quant_sweep,
+        quant_recipes=quant_recipes,
+        quant_val_tokens_limit=quant_val_tokens_limit,
+        quant_probe_blocks=quant_probe_blocks,
     )
+    if save_checkpoint and checkpoint_bytes is not None:
+        from pathlib import Path
+
+        out_dir = Path(checkpoint_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{run_id}.pt"
+        out_path.write_bytes(checkpoint_bytes)
+        print(f"saved_checkpoint:{out_path}")
