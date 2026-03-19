@@ -63,6 +63,11 @@ def train(
     qk_gain_init: float = 1.5,
     warmdown_iters: int = 1200,
     grad_clip_norm: float = 0.0,
+    eval_stride: int = 0,
+    eval_seq_len: int = 0,
+    muon_momentum_warmup_start: float = 0.85,
+    muon_momentum_warmup_steps: int = 500,
+    muon_momentum: float = 0.95,
 ):
     import os
     import subprocess
@@ -91,6 +96,11 @@ def train(
         "QK_GAIN_INIT": str(qk_gain_init),
         "WARMDOWN_ITERS": str(warmdown_iters),
         "GRAD_CLIP_NORM": str(grad_clip_norm),
+        "EVAL_STRIDE": str(eval_stride),
+        "EVAL_SEQ_LEN": str(eval_seq_len),
+        "MUON_MOMENTUM": str(muon_momentum),
+        "MUON_MOMENTUM_WARMUP_START": str(muon_momentum_warmup_start),
+        "MUON_MOMENTUM_WARMUP_STEPS": str(muon_momentum_warmup_steps),
         "DATA_PATH": "/root/data/datasets/fineweb10B_sp1024",
         "TOKENIZER_PATH": "/root/data/tokenizers/fineweb_1024_bpe.model",
     }
@@ -143,6 +153,11 @@ def main(
     qk_gain_init: float = 1.5,
     warmdown_iters: int = 1200,
     grad_clip_norm: float = 0.0,
+    eval_stride: int = 0,
+    eval_seq_len: int = 0,
+    muon_momentum_warmup_start: float = 0.85,
+    muon_momentum_warmup_steps: int = 500,
+    muon_momentum: float = 0.95,
 ):
     train.remote(
         run_id=run_id,
@@ -167,4 +182,9 @@ def main(
         qk_gain_init=qk_gain_init,
         warmdown_iters=warmdown_iters,
         grad_clip_norm=grad_clip_norm,
+        eval_stride=eval_stride,
+        eval_seq_len=eval_seq_len,
+        muon_momentum=muon_momentum,
+        muon_momentum_warmup_start=muon_momentum_warmup_start,
+        muon_momentum_warmup_steps=muon_momentum_warmup_steps,
     )

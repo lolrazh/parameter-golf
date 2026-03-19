@@ -86,6 +86,11 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
+    # Sliding window eval: overlap eval windows so each scored token gets near-full context.
+    # stride=0 means no sliding window (default baseline behavior).
+    eval_stride = int(os.environ.get("EVAL_STRIDE", 0))
+    eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 0))  # 0 = use train_seq_len
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -276,6 +281,96 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def eval_val_sliding(
+    args: Hyperparameters,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    log_fn=None,
+) -> tuple[float, float]:
+    """Sliding window eval: each scored token gets near-full context."""
+    seq_len = args.eval_seq_len if args.eval_seq_len > 0 else args.train_seq_len
+    stride = args.eval_stride
+    if stride <= 0 or stride >= seq_len:
+        raise ValueError(f"EVAL_STRIDE must be in (0, {seq_len}), got {stride}")
+
+    total_tokens = val_tokens.numel()
+    # Each rank handles a contiguous chunk of the validation set
+    chunk_start = (total_tokens * rank) // world_size
+    chunk_end = (total_tokens * (rank + 1)) // world_size
+
+    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
+    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    n_windows = 0
+    model.eval()
+    with torch.inference_mode():
+        # Slide window across the rank's chunk
+        pos = chunk_start
+        while pos + seq_len < chunk_end:
+            window = val_tokens[pos : pos + seq_len + 1].to(device=device, dtype=torch.int64)
+            x = window[:-1].unsqueeze(0)  # (1, seq_len)
+            y = window[1:]                # (seq_len,)
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                log_probs = model.forward_logits(x)  # (1, seq_len, vocab)
+
+            log_probs = log_probs.squeeze(0)  # (seq_len, vocab)
+
+            # Only score the last `stride` tokens (they have near-full context)
+            # Exception: first window scores from position 0
+            if pos == chunk_start:
+                score_start = 0
+            else:
+                score_start = seq_len - stride
+
+            scored_positions = torch.arange(score_start, seq_len, device=device)
+            scored_targets = y[score_start:]
+            scored_log_probs = log_probs[scored_positions]
+
+            # Gather log probs for the actual targets
+            token_nll = -scored_log_probs.gather(1, scored_targets.unsqueeze(1)).squeeze(1)
+
+            val_loss_sum += token_nll.to(torch.float64).sum()
+            val_token_count += float(scored_targets.numel())
+
+            # Byte counting for BPB
+            if score_start == 0:
+                prev_ids = x.squeeze(0)[score_start:]
+            else:
+                prev_ids = x.squeeze(0)[score_start:]
+            tgt_ids = scored_targets
+            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+            val_byte_count += token_bytes.to(torch.float64).sum()
+
+            n_windows += 1
+            pos += stride
+
+            if log_fn is not None and n_windows % 500 == 0:
+                log_fn(f"sliding_eval_progress: windows={n_windows} pos={pos}/{chunk_end}")
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = float((val_loss_sum / val_token_count).item())
+    bits_per_token = val_loss / math.log(2.0)
+    tokens_per_byte = val_token_count.item() / val_byte_count.item()
+    model.train()
+    if log_fn is not None:
+        log_fn(f"sliding_eval_done: windows={n_windows} stride={stride} seq_len={seq_len}")
+    return val_loss, float(bits_per_token * tokens_per_byte)
+
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -723,6 +818,27 @@ class GPT(nn.Module):
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
+        """Forward pass returning per-token log-probabilities (for sliding window eval)."""
+        x = self.tok_emb(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x0 = x
+        skips: list[Tensor] = []
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, x0)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        x = self.final_norm(x)
+        if self.tie_embeddings:
+            logits_proj = F.linear(x, self.tok_emb.weight)
+        else:
+            logits_proj = self.lm_head(x)
+        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        return F.log_softmax(logits.float(), dim=-1)
+
 
 # -----------------------------
 # TRAINING
@@ -977,18 +1093,17 @@ def main() -> None:
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
-            val_loss, val_bpb = eval_val(
-                args,
-                model,
-                rank,
-                world_size,
-                device,
-                grad_accum_steps,
-                val_tokens,
-                base_bytes_lut,
-                has_leading_space_lut,
-                is_boundary_token_lut,
-            )
+            if args.eval_stride > 0 and last_step:
+                val_loss, val_bpb = eval_val_sliding(
+                    args, model, rank, world_size, device, val_tokens,
+                    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                    log_fn=log0,
+                )
+            else:
+                val_loss, val_bpb = eval_val(
+                    args, model, rank, world_size, device, grad_accum_steps,
+                    val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
@@ -1099,18 +1214,17 @@ def main() -> None:
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
-        args,
-        model,
-        rank,
-        world_size,
-        device,
-        grad_accum_steps,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
-    )
+    if args.eval_stride > 0:
+        q_val_loss, q_val_bpb = eval_val_sliding(
+            args, model, rank, world_size, device, val_tokens,
+            base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            log_fn=log0,
+        )
+    else:
+        q_val_loss, q_val_bpb = eval_val(
+            args, model, rank, world_size, device, grad_accum_steps,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        )
     torch.cuda.synchronize()
     log0(
         f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
