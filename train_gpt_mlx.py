@@ -78,6 +78,7 @@ class Hyperparameters:
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
     depth_recurrence: int = int(os.environ.get("DEPTH_RECURRENCE", 1))
+    use_swiglu: bool = bool(int(os.environ.get("USE_SWIGLU", "0")))
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -340,13 +341,26 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # Baseline MLP uses relu^2 instead of GELU/SiLU. It is cheap and works well in this setup.
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, use_swiglu: bool = False):
         super().__init__()
-        hidden = dim * mlp_mult
-        self.fc = CastedLinear(dim, hidden)
-        self.proj = CastedLinear(hidden, dim)
+        self.use_swiglu = use_swiglu
+        if use_swiglu:
+            # SwiGLU: 3 matrices. Hidden dim adjusted so total params ≈ relu² with 2 matrices.
+            # 2 matrices at dim*mlp_mult = 3 matrices at dim*mlp_mult*2/3
+            hidden = int(dim * mlp_mult * 2 / 3)
+            # Round to nearest multiple of 8 for hardware efficiency
+            hidden = ((hidden + 7) // 8) * 8
+            self.fc_gate = CastedLinear(dim, hidden)
+            self.fc_up = CastedLinear(dim, hidden)
+            self.proj = CastedLinear(hidden, dim)
+        else:
+            hidden = dim * mlp_mult
+            self.fc = CastedLinear(dim, hidden)
+            self.proj = CastedLinear(hidden, dim)
 
     def __call__(self, x: mx.array) -> mx.array:
+        if self.use_swiglu:
+            return self.proj(nn.silu(self.fc_gate(x)) * self.fc_up(x))
         x = nn.relu(self.fc(x))
         return self.proj(x * x)
 
@@ -360,12 +374,13 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        use_swiglu: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNormNoWeight()
         self.mlp_norm = RMSNormNoWeight()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult, use_swiglu=use_swiglu)
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
@@ -386,7 +401,7 @@ class GPT(nn.Module):
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float, depth_recurrence: int = 1):
+                 qk_gain_init: float, depth_recurrence: int = 1, use_swiglu: bool = False):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -400,7 +415,7 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
         self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, use_swiglu=use_swiglu)
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
@@ -908,6 +923,7 @@ def main() -> None:
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
         depth_recurrence=args.depth_recurrence,
+        use_swiglu=args.use_swiglu,
     )
     opt = SplitOptimizers(model, args)
 
