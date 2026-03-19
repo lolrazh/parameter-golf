@@ -1052,6 +1052,11 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
+    log0(
+        f"model_shape:num_layers:{args.num_layers} model_dim:{args.model_dim} "
+        f"mlp_mult:{args.mlp_mult} vocab_size:{args.vocab_size}"
+    )
+    log0(f"eval_config:eval_stride:{args.eval_stride} train_seq_len:{args.train_seq_len}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
