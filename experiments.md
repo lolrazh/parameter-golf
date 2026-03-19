@@ -4,6 +4,8 @@ Local MLX experiments on M4 Air. Comparing val_loss at 200 steps (SEED=1337, SEQ
 
 **Rules**: Change ONE thing per experiment. Keep seed fixed. Differences < 0.1 val_loss = noise.
 
+**Harness note (2026-03-19):** A later SOTA-fork `9x512 vs 6x640` 2-minute Modal comparison was invalidated because the assumed `9x512` "baseline" inherited `6x640` defaults from `sota_train_gpt.py`. Do not use that mislabeled comparison for architecture decisions; rerun with explicit overrides through `train_modal.py`. This note does **not** invalidate the H100 rows below, which came from the earlier baseline script.
+
 | # | Run ID | Change from baseline | val_loss | delta | verdict | notes |
 |---|--------|---------------------|----------|-------|---------|-------|
 | 0 | baseline_v1 | (none — default config) | 4.3525 | — | baseline | 9L 512d 8h 4kv 2x_mlp, 17M params, ~102s |
