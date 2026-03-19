@@ -30,6 +30,7 @@ def train(run_id: str = "run", max_wallclock: int = 120, train_log_every: int = 
         "RUN_ID": run_id,
         "MAX_WALLCLOCK_SECONDS": str(max_wallclock),
         "TRAIN_LOG_EVERY": str(train_log_every),
+        "EVAL_STRIDE": "0",  # disable sliding window for dev runs (saves ~15 min)
         "DATA_PATH": "/root/data/datasets/fineweb10B_sp1024",
         "TOKENIZER_PATH": "/root/data/tokenizers/fineweb_1024_bpe.model",
     }
