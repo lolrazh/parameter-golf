@@ -38,3 +38,10 @@ Local MLX experiments on M4 Air. Comparing val_loss at 200 steps (SEED=1337, SEQ
 | 19 | lawa_6L_640d | LAWA (5 snapshots, every 10 steps) | 4.0197 | +0.033 | noise | averaging too-noisy snapshots at 200 steps. needs longer runs |
 | 20 | val_embed_fixed | val_emb_scale=0.1 init (vs 0.0) | 4.0019 | +0.015 | noise | init wasn't the issue. val_embed just doesn't help at 200 steps |
 | 21 | swiglu_6L_640d | SwiGLU activation (vs relu²) | 4.0525 | +0.066 | worse | matched params, slower convergence. relu² wins at this scale |
+
+**400-step runs (local M4, 6L×640d, 3× LR)**
+
+| # | Run ID | Change | val_loss | delta | verdict | notes |
+|---|--------|--------|----------|-------|---------|-------|
+| 22 | baseline_400 | 6L×640d baseline at 400 steps | 3.7124 | — | baseline | ~5.5 min, big drop from 200-step (3.99→3.71) |
+| 23 | val_embed_400 | value embeddings at 400 steps | 3.7144 | +0.002 | noise | still nothing. val_embed not helping even with more steps |
