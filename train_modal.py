@@ -77,38 +77,61 @@ def train(
 
     script = "/root/sota_train_gpt.py" if use_sota else "/root/train_gpt.py"
 
-    env = {
-        **os.environ,
-        "RUN_ID": run_id,
-        "MAX_WALLCLOCK_SECONDS": str(max_wallclock),
-        "ITERATIONS": str(iterations),
-        "NUM_LAYERS": str(num_layers),
-        "MODEL_DIM": str(model_dim),
-        "NUM_HEADS": str(num_heads),
-        "NUM_KV_HEADS": str(num_kv_heads),
-        "MLP_MULT": str(mlp_mult),
-        "VOCAB_SIZE": str(vocab_size),
-        "TRAIN_SEQ_LEN": str(train_seq_len),
-        "TRAIN_BATCH_TOKENS": str(train_batch_tokens),
-        "LOGIT_SOFTCAP": str(logit_softcap),
-        "MATRIX_LR": str(matrix_lr),
-        "SCALAR_LR": str(scalar_lr),
-        "TIED_EMBED_LR": str(embed_lr),
-        "VAL_TOKENS_LIMIT": str(val_tokens_limit),
-        "VAL_LOSS_EVERY": str(val_loss_every),
-        "TRAIN_LOG_EVERY": str(train_log_every),
-        "ROPE_BASE": str(rope_base),
-        "QK_GAIN_INIT": str(qk_gain_init),
-        "WARMDOWN_ITERS": str(warmdown_iters),
-        "GRAD_CLIP_NORM": str(grad_clip_norm),
-        "EVAL_STRIDE": str(eval_stride),
-        "EVAL_SEQ_LEN": str(eval_seq_len),
-        "MUON_MOMENTUM": str(muon_momentum),
-        "MUON_MOMENTUM_WARMUP_START": str(muon_momentum_warmup_start),
-        "MUON_MOMENTUM_WARMUP_STEPS": str(muon_momentum_warmup_steps),
-        "DATA_PATH": "/root/data/datasets/fineweb10B_sp1024",
-        "TOKENIZER_PATH": "/root/data/tokenizers/fineweb_1024_bpe.model",
-    }
+    # When use_sota=True, only pass essentials + explicit overrides.
+    # Let the SOTA script's baked-in defaults handle everything else.
+    if use_sota:
+        env = {
+            **os.environ,
+            "RUN_ID": run_id,
+            "MAX_WALLCLOCK_SECONDS": str(max_wallclock),
+            "VAL_TOKENS_LIMIT": str(val_tokens_limit),
+            "VAL_LOSS_EVERY": str(val_loss_every),
+            "TRAIN_LOG_EVERY": str(train_log_every),
+            "DATA_PATH": "/root/data/datasets/fineweb10B_sp1024",
+            "TOKENIZER_PATH": "/root/data/tokenizers/fineweb_1024_bpe.model",
+        }
+        # Only override model shape if explicitly changed from defaults
+        if num_layers != 9:
+            env["NUM_LAYERS"] = str(num_layers)
+        if model_dim != 512:
+            env["MODEL_DIM"] = str(model_dim)
+        if num_heads != 8:
+            env["NUM_HEADS"] = str(num_heads)
+        if num_kv_heads != 4:
+            env["NUM_KV_HEADS"] = str(num_kv_heads)
+    else:
+        env = {
+            **os.environ,
+            "RUN_ID": run_id,
+            "MAX_WALLCLOCK_SECONDS": str(max_wallclock),
+            "ITERATIONS": str(iterations),
+            "NUM_LAYERS": str(num_layers),
+            "MODEL_DIM": str(model_dim),
+            "NUM_HEADS": str(num_heads),
+            "NUM_KV_HEADS": str(num_kv_heads),
+            "MLP_MULT": str(mlp_mult),
+            "VOCAB_SIZE": str(vocab_size),
+            "TRAIN_SEQ_LEN": str(train_seq_len),
+            "TRAIN_BATCH_TOKENS": str(train_batch_tokens),
+            "LOGIT_SOFTCAP": str(logit_softcap),
+            "MATRIX_LR": str(matrix_lr),
+            "SCALAR_LR": str(scalar_lr),
+            "TIED_EMBED_LR": str(embed_lr),
+            "VAL_TOKENS_LIMIT": str(val_tokens_limit),
+            "VAL_LOSS_EVERY": str(val_loss_every),
+            "TRAIN_LOG_EVERY": str(train_log_every),
+            "ROPE_BASE": str(rope_base),
+            "QK_GAIN_INIT": str(qk_gain_init),
+            "WARMDOWN_ITERS": str(warmdown_iters),
+            "GRAD_CLIP_NORM": str(grad_clip_norm),
+            "EVAL_STRIDE": str(eval_stride),
+            "EVAL_SEQ_LEN": str(eval_seq_len),
+            "MUON_MOMENTUM": str(muon_momentum),
+            "MUON_MOMENTUM_WARMUP_START": str(muon_momentum_warmup_start),
+            "MUON_MOMENTUM_WARMUP_STEPS": str(muon_momentum_warmup_steps),
+            "DATA_PATH": "/root/data/datasets/fineweb10B_sp1024",
+            "TOKENIZER_PATH": "/root/data/tokenizers/fineweb_1024_bpe.model",
+        }
 
     cmd = ["torchrun", "--standalone", "--nproc_per_node=1", script]
 
