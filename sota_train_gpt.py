@@ -354,8 +354,10 @@ def eval_val_sliding_window(
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     # Eval batch: how many windows per forward pass. Tune for memory.
-    eval_batch = int(os.environ.get("SW_EVAL_BATCH", 32))
+    eval_batch = int(os.environ.get("SW_EVAL_BATCH", 64))
 
+    # Compile forward_logits for faster eval (separate from training compile)
+    compiled_logits = torch.compile(base_model.forward_logits, dynamic=False)
     base_model.eval()
     with torch.inference_mode():
         window_list = list(range(win_start, win_end))
@@ -371,7 +373,7 @@ def eval_val_sliding_window(
             ]).to(device=device, dtype=torch.int64)  # [B, seq_len]
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                logits = base_model.forward_logits(inputs)  # [B, seq_len, vocab]
+                logits = compiled_logits(inputs)  # [B, seq_len, vocab]
 
             # Score only the last `stride` positions per window.
             # logits[:, j, :] predicts the token AFTER position j in the input.
