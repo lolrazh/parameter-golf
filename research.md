@@ -92,59 +92,46 @@
 - [ ] **TTT on top of the real stack**
   - Expensive and not first priority, but still one of the few ideas with large upside left
 
-## Current Fast-Honest Stack
+## Current Implemented Stack
 
-- [x] `9x512`
-- [x] `MLP_MULT=3`
-- [x] int6 per-row quant + zstd-22
-- [x] front-heavy selective precision (`front3_back1_8_middle6`)
-- [x] SmearGate + BigramHash (improved: zero-init, learnable scale, better hash)
-- [x] sliding-window eval implementation available
-- [x] seq2048 (default in sota_train_gpt.py)
-- [x] Muon weight decay (muon_wd=0.02, adam_wd=0.01)
-- [x] SWA (checkpoint averaging during warmdown)
-- [x] Orthogonal init + projection scaling
-- [x] Grad clipping 0.3
+- [x] 11L×512d, MLP 3x, GQA (8h/4kv), RoPE, relu², U-Net skips
+- [x] SmearGate + BigramHash(10240×128) — zero-init, learnable scale, improved hash
+- [x] XSA (Exclusive Self Attention) on last 3 layers — zero-param eval gain
+- [x] int6 per-row quant + zstd-22 + front-heavy preset (`front3_back1_8_middle6`)
+- [x] FP16 tied embedding passthrough (FP16_EMBED=1)
+- [x] Sliding window eval (stride=64, compiled forward_logits, batch=64)
+- [x] seq2048 training, batch 786K tokens/step
+- [x] Muon WD=0.02, AdamW WD=0.01, grad clip 0.3
+- [x] Orthogonal init + 1/sqrt(2L) projection scaling
+- [x] SWA (checkpoint averaging during warmdown, SWA_EVERY=50)
 - [x] Higher LRs (matrix=0.04, scalar=0.04, embed=0.05)
-- [x] Aggressive Muon momentum (0.95, warmup from 0.85 over 500 steps)
-- [ ] late QAT (always-on STE is current approach — late activation not yet tried)
-- [ ] Flash Attention 3 (H100-only, ~10-20% throughput gain)
-- [ ] FP16 tied embedding passthrough (not yet integrated)
-- [ ] real frontier-sized 8xH100 run
+- [x] Late QAT toggle (QAT_START_FRAC, default 0.0 = always-on STE)
+- [x] Flash Attention 3 (conditional import, SDPA fallback)
+- [x] TTT (test-time training, full-model SGD on val data)
+- [x] Depth recurrence (NUM_RECURRENCE × blocks + optional LoRA adapters)
+- [ ] FA3 package installed on cloud (compiling on A6000)
+- [ ] Mixed int5/int6 quant (int5 MLP, int6 attn — merged SOTA uses this)
+- [ ] Larger vocab (4096/8192)
+- [ ] Real 8xH100 SXM submission run (RunPod)
 
-## Winning PR Configs (for reference)
+## Competition State (as of 2026-03-21)
 
-### Best validated pending (1.1326 BPB, 3-seed mean 1.1326)
-```
-NUM_LAYERS=11, 512d, MLP_MULT=3, seq2048, batch=786K
-SmearGate + BigramHash(2048x128), OrthoInit
-MUON_WD=0.04, ADAM_WD=0.04, GRAD_CLIP=0.3
-MATRIX_LR=0.025, SCALAR_LR=0.025, TIED_EMBED_LR=0.035
-MUON_MOMENTUM=0.99 (warmup 0.92→0.99 over 1500), WARMDOWN=3000
-SWA every 200 steps during warmdown, int6+zstd-22, FA3
-sliding window stride=64, 7412 steps @ 81ms/step on 8xH100
-```
+**Merged SOTA**: 1.1428 BPB (thwu1 — 10L, mixed int5/int6, BigramHash(10240), SWA, Muon WD)
+**Best pending**: 1.1303 BPB (PR #254 — TTT + full meta stack, 3-seed validated)
+**Paid prefix banned**: Organizers ruled it out-of-scope
 
-### PR #65 (former SOTA, 1.1630 BPB)
-```
-MLP_MULT=3, QAT int6, sliding window stride=64
-seq_len=1024, batch=524K, 12395 steps, ~48ms/step on 8xH100
-```
+### The Meta Stack (every top submission uses all of these)
+- 11L×512d, MLP 3x, GQA, SmearGate + BigramHash, OrthoInit
+- Int6 (or mixed int5/int6) + zstd-22 + FP16 embedding
+- Muon WD 0.03-0.04, SWA, sliding window stride=64, FA3
 
-### PR #70 (1.1659 BPB)
-```
-MATRIX_LR=0.020 SCALAR_LR=0.020 TIED_EMBED_LR=0.030
-MUON_MOMENTUM=0.99 MUON_MOMENTUM_WARMUP_STEPS=1500 MUON_MOMENTUM_WARMUP_START=0.92
-WARMDOWN_ITERS=3000 MLP_MULT=3 int6+zstd-22, sliding window stride=256
-```
-
-### PR #61 (1.1793 BPB — key insight: train 2048 not 4096)
-```
-TRAIN_SEQ_LEN=2048 TRAIN_BATCH_TOKENS=786432
-MATRIX_LR=0.02 SCALAR_LR=0.02 TIED_EMBED_LR=0.03
-MUON_MOMENTUM=0.99 WARMDOWN_ITERS=3000 GRAD_CLIP_NORM=0.3
-sliding window stride=512
-```
+### Frontier Differentiators (what separates top from pack)
+- **TTT (full-weight SGD)** — ~0.01 BPB eval-time gain (PR #254)
+- **XSA (last 3 layers)** — ~0.002 BPB, zero params (PR #265)
+- **Mixed int5/int6** — int5 MLP + int6 attn, fits more layers (merged SOTA)
+- **BigramHash(10240)** — larger hash table (merged SOTA)
+- **Depth recurrence** — 5 unique blocks looped for 11 effective depth (PR #268, pending)
+- **EMA weight averaging** — untapped by most submissions (PR #274)
 
 ## Cloud Experiment Plan
 
@@ -152,35 +139,40 @@ sliding window stride=512
 
 **Run queue** (ordered):
 
-### 1. Verify run (~$0.01)
+**Platform**: Thunder Compute A100 production ($1.79/hr). Final submission on RunPod 8xH100 SXM.
+**Launch**: `RANK=0 LOCAL_RANK=0 WORLD_SIZE=1 MASTER_ADDR=127.0.0.1 MASTER_PORT=29501`
+
+### 1. Full-stack 5-min baseline with XSA + BigramHash(10240)
 ```bash
-modal run train_modal.py --run-id verify_v2 --max-wallclock 30 \
-    --overrides 'ITERATIONS=10,VAL_TOKENS_LIMIT=32768'
+RUN_ID=xsa_bigram10k_5m NUM_LAYERS=11 EVAL_STRIDE=64 \
+QUANT_PRESET=front3_back1_8_middle6 TTT_ENABLED=0 SWA_EVERY=50 \
+MAX_WALLCLOCK_SECONDS=300 python3 sota_train_gpt.py
 ```
 
-### 2. Full-stack 5-min baseline (~$0.27)
-All new defaults: 9x512, seq2048, WD, SWA, ortho init, SmearGate, grad clip, etc.
+### 2. Depth recurrence: 5 blocks × 3 loops = 15 virtual layers
 ```bash
-modal run train_modal.py --run-id fullstack_9x512_5m --max-wallclock 300 \
-    --overrides 'EVAL_STRIDE=64,QUANT_PRESET=front3_back1_8_middle6'
+RUN_ID=recur_5x3_lora8 NUM_LAYERS=5 NUM_RECURRENCE=3 LORA_RANK=8 \
+EVAL_STRIDE=64 QUANT_PRESET=front3_back1_8_middle6 SWA_EVERY=50 \
+MAX_WALLCLOCK_SECONDS=300 python3 sota_train_gpt.py
 ```
 
-### 3. Late QAT comparison (~$0.27)
-Same as above but with late QAT activation at 70% of training:
+### 3. Late QAT (70% activation) vs always-on
 ```bash
-modal run train_modal.py --run-id fullstack_lateqat_5m --max-wallclock 300 \
-    --overrides 'EVAL_STRIDE=64,QUANT_PRESET=front3_back1_8_middle6,QAT_START_FRAC=0.7'
+RUN_ID=lateqat_70_5m NUM_LAYERS=11 QAT_START_FRAC=0.7 \
+EVAL_STRIDE=64 QUANT_PRESET=front3_back1_8_middle6 SWA_EVERY=50 \
+MAX_WALLCLOCK_SECONDS=300 python3 sota_train_gpt.py
 ```
 
-### 4. 11-layer attempt (~$0.27)
-More layers funded by int6 headroom:
+### 4. TTT on properly trained model (10-min train first)
 ```bash
-modal run train_modal.py --run-id fullstack_11L_5m --max-wallclock 300 \
-    --overrides 'NUM_LAYERS=11,EVAL_STRIDE=64,QUANT_PRESET=front3_back1_8_middle6'
+RUN_ID=ttt_tuned_10m NUM_LAYERS=11 EVAL_STRIDE=64 \
+QUANT_PRESET=front3_back1_8_middle6 TTT_ENABLED=1 TTT_LR=3e-4 \
+TTT_MAX_SECONDS=200 SWA_EVERY=50 MAX_WALLCLOCK_SECONDS=600 \
+python3 sota_train_gpt.py
 ```
 
-### 5. Full 10-min submission run on dedicated GPU (when available)
+### 5. Final submission (RunPod 8xH100 SXM)
 ```bash
 torchrun --standalone --nproc_per_node=8 sota_train_gpt.py
-# Env: NUM_LAYERS=11 EVAL_STRIDE=64 QUANT_PRESET=front3_back1_8_middle6
+# Best config from experiments above
 ```
