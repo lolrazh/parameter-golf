@@ -42,10 +42,33 @@
 - **XSA** is new (~0.002 BPB, zero params)
 - **Depth recurrence** independently proposed by another competitor (PR #268)
 
+## Cloud Saga (lessons learned the hard way)
+- **Modal**: $3.50/run (not $0.27 as estimated). Nearly exhausted.
+- **Thunder H100 PCIe production**: Works with torch.compile. ~1150ms/step. SSH drops kill foreground processes. FA3 compile killed by accident ($1.80 wasted).
+- **Thunder A6000 prototyping**: FA3 compile too slow on 4 vCPUs. Abandoned.
+- **Thunder A100 production**: torch.compile OOMs on Triton shared memory (A100 has 166KB vs H100's 228KB). Cannot run our model with compile. 3300ms/step without compile = unusable.
+- **Final choice**: Back to Thunder H100 PCIe production ($2.49/hr). Everything works there.
+- **Lesson**: Always verify torch.compile works on target hardware BEFORE committing to it.
+
+## New Features Added (late session)
+- **XSA (Exclusive Self Attention)**: Zero-param eval gain on last 3 layers
+- **BigramHash(10240)**: Bumped from 4096, matching merged SOTA
+- **TORCH_COMPILE toggle**: Env var to disable compile for hardware compatibility
+- **Compiled sliding window eval**: torch.compile on forward_logits + batch 64
+- **run_experiment.sh**: Single-experiment runner for autoresearch loop
+- **results.tsv**: Append-only experiment log
+
+## Competition Update (March 21)
+- Merged SOTA: 1.1428 BPB (mixed int5/int6 + BigramHash(10240))
+- Best pending: 1.1303 BPB (TTT + full stack)
+- Paid prefix BANNED by organizers
+- New techniques: XSA, mixed int5/int6, depth recurrence (PR #268)
+
 ## Next Steps
-1. FA3 finishes compiling on A6000 → snapshot → A100 production
-2. Run #1: Full stack with XSA + BigramHash(10240) baseline
-3. Run #2: Depth recurrence (5 blocks × 3 loops)
-4. Run #3: Late QAT comparison
-5. Run #4: TTT on properly trained model (10-min train)
-6. Final: Best config on RunPod 8xH100 SXM
+1. Verify 5-min run on new H100 instance
+2. Set up Ralph Loop autoresearch — 3-min training cycles, ~12/hr
+3. Run #1: Full stack with XSA + BigramHash(10240) baseline
+4. Run #2: Depth recurrence (5 blocks × 3 loops)
+5. Run #3: Late QAT comparison
+6. Run #4: TTT on properly trained model (10-min train)
+7. Final: Best config on RunPod 8xH100 SXM
