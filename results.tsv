@@ -1,1 +1,5 @@
-run_id	steps	prequant_bpb	postquant_bpb	artifact_bytes	step_avg_ms	timestamp
+run_id	steps	prequant_bpb	postquant_bpb	artifact_bytes	step_avg_ms	timestamp	notes
+fullstack_11L_5m	386	1.4874	1.5959	9875401	778.79	2026-03-20T00:00:00	Modal H100 SXM, best quant gap +0.11
+fullstack_11L_ttt_v2	258	1.6839	1.8948	8460774	1166.06	2026-03-21T00:00:00	Thunder H100 PCIe, TTT didnt help
+fullstack_11L_10m	515	1.4038	1.6234	10646376	1166.30	2026-03-21T00:00:00	Thunder H100 PCIe, best prequant
+test_h100_5m	254	1.6907	2.0218	8534501	1181.71	2026-03-21T00:00:00	Thunder H100 PCIe, XSA+BigramHash10240+compiled eval

@@ -50,5 +50,5 @@ When you have exhausted all ideas or reached post-quant BPB < 1.50, output: <pro
 ## How to launch
 
 ```bash
-/ralph-loop "<paste prompt above>" --max-iterations 30 --completion-promise "TARGET REACHED"
+/ralph-loop "Read autoresearch_prompt.md for full instructions. You are an autonomous ML researcher. Each iteration: read results.tsv, pick ONE change, run a 3-min experiment on the GPU via SSH, log the result. Keep improvements, revert regressions. Target: post-quant BPB below 1.50." --max-iterations 30 --completion-promise "TARGET REACHED"
 ```
