@@ -148,18 +148,39 @@ sliding window stride=512
 
 ## Cloud Experiment Plan
 
-**Platform**: Modal (L4 ~$0.02/run, H100 ~$0.15/run)
+**Budget**: ~$10 Modal remaining, considering Latitude/ThunderCompute for dedicated GPU.
 
-**Test durations on 1xH100**:
-- Full 10 min: ~1700 steps, ~$0.55 (final validation only)
-- 5 min: ~850 steps, ~$0.27 (good signal)
-- 2 min: ~340 steps, ~$0.11 (quick comparison)
+**Run queue** (ordered):
 
-**Implementation order**:
-1. Sliding window eval → test on H100 2-min
-2. Muon tuning (env vars) → test on H100 2-min
-3. Stack sliding window + Muon → test on H100 5-min
-4. int6 quant + zstd → test artifact size
-5. QAT → test quant penalty
-6. MLP 3x (enabled by int6) → test on H100 5-min
-7. Full stack → H100 10-min submission run
+### 1. Verify run (~$0.01)
+```bash
+modal run train_modal.py --run-id verify_v2 --max-wallclock 30 \
+    --overrides 'ITERATIONS=10,VAL_TOKENS_LIMIT=32768'
+```
+
+### 2. Full-stack 5-min baseline (~$0.27)
+All new defaults: 9x512, seq2048, WD, SWA, ortho init, SmearGate, grad clip, etc.
+```bash
+modal run train_modal.py --run-id fullstack_9x512_5m --max-wallclock 300 \
+    --overrides 'EVAL_STRIDE=64,QUANT_PRESET=front3_back1_8_middle6'
+```
+
+### 3. Late QAT comparison (~$0.27)
+Same as above but with late QAT activation at 70% of training:
+```bash
+modal run train_modal.py --run-id fullstack_lateqat_5m --max-wallclock 300 \
+    --overrides 'EVAL_STRIDE=64,QUANT_PRESET=front3_back1_8_middle6,QAT_START_FRAC=0.7'
+```
+
+### 4. 11-layer attempt (~$0.27)
+More layers funded by int6 headroom:
+```bash
+modal run train_modal.py --run-id fullstack_11L_5m --max-wallclock 300 \
+    --overrides 'NUM_LAYERS=11,EVAL_STRIDE=64,QUANT_PRESET=front3_back1_8_middle6'
+```
+
+### 5. Full 10-min submission run on dedicated GPU (when available)
+```bash
+torchrun --standalone --nproc_per_node=8 sota_train_gpt.py
+# Env: NUM_LAYERS=11 EVAL_STRIDE=64 QUANT_PRESET=front3_back1_8_middle6
+```
