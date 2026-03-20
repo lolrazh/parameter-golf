@@ -94,6 +94,12 @@ Local MLX experiments on M4 Air. Comparing val_loss at 200 steps (SEED=1337, SEQ
 |---|--------|--------|--------------|----------------|-----------|-------------|---------|
 | 57 | smear_bigram_9x512_5m | USE_SMEARGATE=1, BIGRAM_HASH=4096x128, QUANT_PRESET=front3_back1_8_middle6 | 1.4537 | 1.7074 | +0.2537 | 7,688,931 | promising: post-quant better, prequant slightly worse |
 
+**Full-stack competitive build (1xH100, 5 min train, sliding window eval stride=64)**
+
+| # | Run ID | Change | prequant BPB | post-quant BPB | sliding BPB | quant gap | steps | total bytes | verdict |
+|---|--------|--------|--------------|----------------|-------------|-----------|-------|-------------|---------|
+| 58 | fullstack_11L_5m | 11L, WD, ortho init, SWA(broken), SmearGate(0.0), seq2048, batch786K, FP16 embed, QAT always-on | 1.4874 | 1.5959 | 1.5778 | +0.1085 | 386 | 9,875,401 | BIG WIN on quant gap; undertrained (779ms/step); SWA needs fix |
+
 **Width ceiling search (local M4, 3× LR baseline = 6L×640d @ 3.9868)**
 
 | # | Run ID | Change | val_loss | delta | verdict | notes |
