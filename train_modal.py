@@ -223,7 +223,7 @@ def print_summary(lines: list[str], metric_mode: str, max_wallclock: int) -> Non
         print(sliding_line)
 
 
-@app.function(image=image, gpu="H100", timeout=900)
+@app.function(image=image, gpu="H100", timeout=1800)
 def train(
     run_id: str = "run",
     max_wallclock: int = 120,
@@ -250,6 +250,7 @@ def train(
     )
     env = {
         **os.environ,
+        "PYTHONUNBUFFERED": "1",
         "RUN_ID": run_id,
         "MAX_WALLCLOCK_SECONDS": str(max_wallclock),
         "TRAIN_LOG_EVERY": str(train_log_every),

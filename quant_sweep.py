@@ -77,6 +77,8 @@ class QuantRecipe:
 
 def make_recipe_catalog(num_layers: int, control_patterns: tuple[str, ...]) -> dict[str, QuantRecipe]:
     outer_patterns = ("tok_emb", f"blocks.0.", f"blocks.{num_layers - 1}.")
+    front2_patterns = ("tok_emb", "blocks.0.", "blocks.1.")
+    front2_back1_patterns = ("tok_emb", "blocks.0.", "blocks.1.", f"blocks.{num_layers - 1}.")
     attn_patterns = ("tok_emb", ".attn.")
     catalog = {
         "current": QuantRecipe(
@@ -102,6 +104,18 @@ def make_recipe_catalog(num_layers: int, control_patterns: tuple[str, ...]) -> d
             description="Int8 embedding plus first/last blocks, int6 middle blocks.",
             keep_fp32_patterns=control_patterns,
             quant_range_patterns=((127, outer_patterns),),
+        ),
+        "front2_8_middle6": QuantRecipe(
+            name="front2_8_middle6",
+            description="Int8 embedding plus first two blocks, int6 elsewhere.",
+            keep_fp32_patterns=control_patterns,
+            quant_range_patterns=((127, front2_patterns),),
+        ),
+        "front2_back1_8_middle6": QuantRecipe(
+            name="front2_back1_8_middle6",
+            description="Int8 embedding plus first two blocks and last block, int6 elsewhere.",
+            keep_fp32_patterns=control_patterns,
+            quant_range_patterns=((127, front2_back1_patterns),),
         ),
         "fp16_tok_emb_attn8": QuantRecipe(
             name="fp16_tok_emb_attn8",
@@ -250,7 +264,7 @@ def main() -> None:
     parser.add_argument("--tokenizer-path", default="./data/tokenizers/fineweb_1024_bpe.model")
     parser.add_argument(
         "--recipes",
-        default="current,fp16_tok_emb,attn8_mlp6,outer8_middle6,fp16_tok_emb_attn8",
+        default="current,fp16_tok_emb,attn8_mlp6,outer8_middle6,front2_8_middle6,front2_back1_8_middle6,fp16_tok_emb_attn8",
         help="Comma-separated recipe names.",
     )
     parser.add_argument("--probe-blocks", action="store_true", help="Also add one-block-at-a-time int8 probes.")

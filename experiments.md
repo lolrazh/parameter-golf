@@ -30,6 +30,40 @@ Local MLX experiments on M4 Air. Comparing val_loss at 200 steps (SEED=1337, SEQ
 | 14 | deep_12L_448d_h100 | 12L×448d | 3.0072 | 1.7810 | 1.8363 | 252 | WORST |
 | 32 | baseline_5min | default 9L×512d, 5 min | 2.3195 | 1.3738 | 1.3766 | 856 | 5-min baseline |
 
+**SOTA-fork quant sweeps (1xH100, 5 min train, 1M-token sweep proxy on same checkpoint)**
+
+**Rule**: Compare quant-sweep rows only against each other. The sweep uses a fast proxy eval and is not directly comparable to the trainer's final full-val BPB.
+
+| # | Run ID | Recipe / change | proxy prequant BPB | proxy post-quant BPB | delta | total bytes | verdict |
+|---|--------|-----------------|--------------------|----------------------|-------|-------------|---------|
+| 33 | clean_9x512_5m_quant2 | current int6 export | 1.7956 | 3.0332 | +1.2376 | 5,033,018 | baseline |
+| 34 | clean_9x512_5m_quant2 | fp16_tok_emb | 1.7956 | 3.0332 | +1.2376 | 5,466,490 | no gain |
+| 35 | clean_9x512_5m_quant2 | attn8_mlp6 | 1.7956 | 2.7745 | +0.9789 | 6,814,427 | better |
+| 36 | clean_9x512_5m_quant2 | outer8_middle6 | 1.7956 | 2.5734 | +0.7778 | 6,194,293 | BEST |
+| 37 | clean_9x512_5m_quant2 | fp16_tok_emb_attn8 | 1.7956 | 2.7740 | +0.9784 | 7,254,647 | better, worse than outer8 |
+
+**Quant sensitivity probe (1xH100, 5 min train, 1M-token sweep proxy on same checkpoint)**
+
+**Rule**: These rows are for ranking which blocks deserve extra bits. Compare within this probe run only.
+
+| # | Run ID | Recipe / change | proxy prequant BPB | proxy post-quant BPB | delta | total bytes | verdict |
+|---|--------|-----------------|--------------------|----------------------|-------|-------------|---------|
+| 38 | clean_9x512_5m_probe3 | current int6 export | 1.7955 | 3.0401 | +1.2446 | 4,945,700 | baseline |
+| 39 | clean_9x512_5m_probe3 | outer8_middle6 | 1.7955 | 2.5603 | +0.7647 | 6,017,292 | best coarse recipe |
+| 40 | clean_9x512_5m_probe3 | probe_block_0_int8 | 1.7955 | 2.6105 | +0.8150 | 5,554,656 | MOST sensitive block |
+| 41 | clean_9x512_5m_probe3 | probe_block_1_int8 | 1.7955 | 2.7692 | +0.9736 | 5,518,118 | second-most sensitive |
+| 42 | clean_9x512_5m_probe3 | probe_block_8_int8 | 1.7955 | 2.9729 | +1.1774 | 5,487,122 | small gain |
+| 43 | clean_9x512_5m_probe3 | probe_block_2_int8 .. probe_block_7_int8 | 1.7955 | 2.9095 .. 3.0324 | +1.1140 .. +1.2368 | ~5.45M .. 5.57M | mostly weak / noisy |
+
+**Front-heavy mixed quant follow-up (1xH100, 5 min train, 1M-token sweep proxy on same checkpoint)**
+
+| # | Run ID | Recipe / change | proxy prequant BPB | proxy post-quant BPB | delta | total bytes | verdict |
+|---|--------|-----------------|--------------------|----------------------|-------|-------------|---------|
+| 44 | clean_9x512_5m_followup1 | current int6 export | 1.7945 | 3.0692 | +1.2747 | 4,946,288 | baseline |
+| 45 | clean_9x512_5m_followup1 | outer8_middle6 | 1.7945 | 2.6002 | +0.8056 | 6,045,820 | solid |
+| 46 | clean_9x512_5m_followup1 | front2_8_middle6 | 1.7945 | 2.3373 | +0.5427 | 6,094,980 | BETTER |
+| 47 | clean_9x512_5m_followup1 | front2_back1_8_middle6 | 1.7945 | 2.2886 | +0.4940 | 6,711,561 | BEST |
+
 **Width ceiling search (local M4, 3× LR baseline = 6L×640d @ 3.9868)**
 
 | # | Run ID | Change | val_loss | delta | verdict | notes |
