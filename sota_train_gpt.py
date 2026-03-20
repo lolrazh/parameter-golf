@@ -80,6 +80,10 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    use_smeargate = bool(int(os.environ.get("USE_SMEARGATE", "0")))
+    bigram_hash_buckets = int(os.environ.get("BIGRAM_HASH_BUCKETS", 4096))
+    bigram_hash_dim = int(os.environ.get("BIGRAM_HASH_DIM", 128))
+    smear_gate_init = float(os.environ.get("SMEAR_GATE_INIT", -3.0))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -422,7 +426,7 @@ INT8_FULL_RANGE_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "INT8_FULL_RANGE_PATTERNS",
-        "tok_emb",
+        "tok_emb,bigram_hash_emb",
     ).split(",")
     if pattern
 )
@@ -828,6 +832,10 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        use_smeargate: bool,
+        bigram_hash_buckets: int,
+        bigram_hash_dim: int,
+        smear_gate_init: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -835,7 +843,21 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.use_smeargate = use_smeargate
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.bigram_hash_buckets = bigram_hash_buckets if use_smeargate else 0
+        if use_smeargate:
+            if bigram_hash_buckets <= 0:
+                raise ValueError(f"bigram_hash_buckets must be positive when USE_SMEARGATE=1, got {bigram_hash_buckets}")
+            if bigram_hash_dim <= 0:
+                raise ValueError(f"bigram_hash_dim must be positive when USE_SMEARGATE=1, got {bigram_hash_dim}")
+            self.bigram_hash_emb = nn.Embedding(bigram_hash_buckets, bigram_hash_dim)
+            self.bigram_hash_proj = CastedLinear(bigram_hash_dim, model_dim, bias=False)
+            self.smear_gate = nn.Parameter(torch.full((model_dim,), smear_gate_init, dtype=torch.float32))
+        else:
+            self.bigram_hash_emb = None
+            self.bigram_hash_proj = None
+            self.smear_gate = None
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -862,12 +884,29 @@ class GPT(nn.Module):
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+        if self.bigram_hash_emb is not None:
+            nn.init.normal_(self.bigram_hash_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+        if self.bigram_hash_proj is not None:
+            nn.init.normal_(self.bigram_hash_proj.weight, mean=0.0, std=self.tied_embed_init_std)
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def embed_tokens(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
+        if not self.use_smeargate:
+            return x
+        if self.bigram_hash_emb is None or self.bigram_hash_proj is None or self.smear_gate is None:
+            raise RuntimeError("SmearGate/BigramHash requested but not initialized")
+        prev_ids = torch.cat((input_ids[:, :1], input_ids[:, :-1]), dim=1)
+        prev_x = torch.cat((x[:, :1], x[:, :-1]), dim=1)
+        pair_hash = ((prev_ids.to(torch.int64) * 1031) ^ input_ids.to(torch.int64)) % self.bigram_hash_buckets
+        bigram_x = self.bigram_hash_proj(self.bigram_hash_emb(pair_hash))
+        gate = torch.sigmoid(self.smear_gate).to(dtype=x.dtype)[None, None, :]
+        return (1.0 - gate) * (x + bigram_x) + gate * prev_x
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        x = self.embed_tokens(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
@@ -894,7 +933,7 @@ class GPT(nn.Module):
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         """Return logits without computing loss. Used for sliding window eval."""
-        x = self.tok_emb(input_ids)
+        x = self.embed_tokens(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
@@ -1026,6 +1065,10 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        use_smeargate=args.use_smeargate,
+        bigram_hash_buckets=args.bigram_hash_buckets,
+        bigram_hash_dim=args.bigram_hash_dim,
+        smear_gate_init=args.smear_gate_init,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1052,9 +1095,16 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    token_params = [base_model.tok_emb.weight]
+    if base_model.bigram_hash_emb is not None:
+        token_params.append(base_model.bigram_hash_emb.weight)
+    if base_model.bigram_hash_proj is not None:
+        matrix_params.append(base_model.bigram_hash_proj.weight)
+    if base_model.smear_gate is not None:
+        scalar_params.append(base_model.smear_gate)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+        [{"params": token_params, "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1093,6 +1143,11 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(
+        f"smeargate:enabled:{int(args.use_smeargate)} "
+        f"bigram_hash_buckets:{args.bigram_hash_buckets if args.use_smeargate else 0} "
+        f"bigram_hash_dim:{args.bigram_hash_dim if args.use_smeargate else 0}"
+    )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "

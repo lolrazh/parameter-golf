@@ -82,6 +82,18 @@ Local MLX experiments on M4 Air. Comparing val_loss at 200 steps (SEED=1337, SEQ
 |---|--------|--------|--------------|----------------|-----------|-------------|---------|
 | 55 | clean_9x512_5m_front3b1_eval2 | QUANT_PRESET=front3_back1_8_middle6 | 1.4444 | 1.7629 | +0.3185 | 7,225,310 | BIG WIN |
 
+**Aggressive larger-model proxy (1xH100, 5 min train, sliding-window attempt)**
+
+| # | Run ID | Change | prequant BPB | post-quant BPB | sliding BPB | total bytes | verdict |
+|---|--------|--------|--------------|----------------|-------------|-------------|---------|
+| 56 | frontier_11x640_5m_sw64 | 11L×640d, QUANT_PRESET=front3_back1_8_middle6, stride=64 | 1.6784 | 2.5008 | timeout | 9,064,054 | worse at 5 min; fits budget, undertrained |
+
+**SmearGate + BigramHash baseline (1xH100, 5 min train, normal trainer final eval)**
+
+| # | Run ID | Change | prequant BPB | post-quant BPB | quant gap | total bytes | verdict |
+|---|--------|--------|--------------|----------------|-----------|-------------|---------|
+| 57 | smear_bigram_9x512_5m | USE_SMEARGATE=1, BIGRAM_HASH=4096x128, QUANT_PRESET=front3_back1_8_middle6 | 1.4537 | 1.7074 | +0.2537 | 7,688,931 | promising: post-quant better, prequant slightly worse |
+
 **Width ceiling search (local M4, 3× LR baseline = 6L×640d @ 3.9868)**
 
 | # | Run ID | Change | val_loss | delta | verdict | notes |
