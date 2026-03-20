@@ -64,6 +64,18 @@ Local MLX experiments on M4 Air. Comparing val_loss at 200 steps (SEED=1337, SEQ
 | 46 | clean_9x512_5m_followup1 | front2_8_middle6 | 1.7945 | 2.3373 | +0.5427 | 6,094,980 | BETTER |
 | 47 | clean_9x512_5m_followup1 | front2_back1_8_middle6 | 1.7945 | 2.2886 | +0.4940 | 6,711,561 | BEST |
 
+**Expanded front-heavy mixed quant follow-up (1xH100, 5 min train, 1M-token sweep proxy on same checkpoint)**
+
+| # | Run ID | Recipe / change | proxy prequant BPB | proxy post-quant BPB | delta | total bytes | verdict |
+|---|--------|-----------------|--------------------|----------------------|-------|-------------|---------|
+| 48 | clean_9x512_5m_followup2 | current int6 export | 1.7962 | 3.1298 | +1.3335 | 4,996,226 | baseline |
+| 49 | clean_9x512_5m_followup2 | outer8_middle6 | 1.7962 | 2.6121 | +0.8159 | 6,096,011 | okay |
+| 50 | clean_9x512_5m_followup2 | front2_8_middle6 | 1.7962 | 2.3638 | +0.5675 | 6,166,558 | better |
+| 51 | clean_9x512_5m_followup2 | front2_back1_8_middle6 | 1.7962 | 2.3144 | +0.5182 | 6,669,190 | strong |
+| 52 | clean_9x512_5m_followup2 | front3_back1_8_middle6 | 1.7962 | 2.1003 | +0.3041 | 7,335,031 | BEST |
+| 53 | clean_9x512_5m_followup2 | front2_back2_8_middle6 | 1.7962 | 2.2628 | +0.4666 | 7,247,510 | better |
+| 54 | clean_9x512_5m_followup2 | front2_back1_attn8 | 1.7962 | 2.9375 | +1.1412 | 5,601,427 | bad, attention-only not enough |
+
 **Width ceiling search (local M4, 3× LR baseline = 6L×640d @ 3.9868)**
 
 | # | Run ID | Change | val_loss | delta | verdict | notes |
