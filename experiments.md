@@ -100,6 +100,7 @@ Local MLX experiments on M4 Air. Comparing val_loss at 200 steps (SEED=1337, SEQ
 |---|--------|--------|--------------|----------------|-------------|-----------|-------|-------------|---------|
 | 58 | fullstack_11L_5m | 11L, WD, ortho init, SWA(broken), SmearGate(0.0), seq2048, batch786K, FP16 embed, QAT always-on | 1.4874 | 1.5959 | 1.5778 | +0.1085 | 386 | 9,875,401 | BIG WIN on quant gap; undertrained (779ms/step); SWA needs fix |
 | 59 | fullstack_11L_ttt_v2 | same + SWA(5 snap) + TTT(1811 steps) on Thunder H100 PCIe | 1.6839 | 1.8948 | 1.8966 | +0.2109 | 258 | 8,460,774 | PCIe ~50% slower; TTT didn't help (model too undertrained); SWA worked |
+| 60 | fullstack_11L_10m | 10 min train, no TTT, SWA(10 snap), Thunder H100 PCIe | 1.4038 | 1.6234 | (killed) | +0.2196 | 515 | 10,646,376 | best prequant yet; sliding eval killed by SSH drop |
 
 **Width ceiling search (local M4, 3× LR baseline = 6L×640d @ 3.9868)**
 
