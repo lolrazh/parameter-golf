@@ -63,43 +63,47 @@ class Hyperparameters:
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 6))
+    num_layers = int(os.environ.get("NUM_LAYERS", 9))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 640))
+    model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 3))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-    use_smeargate = bool(int(os.environ.get("USE_SMEARGATE", "0")))
+    use_smeargate = bool(int(os.environ.get("USE_SMEARGATE", "1")))
     bigram_hash_buckets = int(os.environ.get("BIGRAM_HASH_BUCKETS", 4096))
     bigram_hash_dim = int(os.environ.get("BIGRAM_HASH_DIM", 128))
-    smear_gate_init = float(os.environ.get("SMEAR_GATE_INIT", -3.0))
+    smear_gate_init = float(os.environ.get("SMEAR_GATE_INIT", 0.0))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
-    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.030))
+    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.020))
-    scalar_lr = float(os.environ.get("SCALAR_LR", 0.020))
-    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
+    scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
-    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
-    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
+    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
+    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+    muon_wd = float(os.environ.get("MUON_WD", 0.02))
+    adam_wd = float(os.environ.get("ADAM_WD", 0.01))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
+    swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
+    swa_every = int(os.environ.get("SWA_EVERY", 200))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -125,10 +129,10 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
+    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True, weight_decay: float = 0.0):
         super().__init__(
             params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
+            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov, weight_decay=weight_decay),
         )
 
     @torch.no_grad()
@@ -150,6 +154,7 @@ class Muon(torch.optim.Optimizer):
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
+            wd = group["weight_decay"]
 
             total_params = sum(int(p.numel()) for p in params)
             updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
@@ -176,6 +181,8 @@ class Muon(torch.optim.Optimizer):
 
             curr = 0
             for p in params:
+                if wd > 0:
+                    p.data.mul_(1.0 - lr * wd)
                 g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
                 p.add_(g, alpha=-lr)
                 curr += p.numel()
@@ -399,7 +406,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear_gate,bigram_scale",
     ).split(",")
     if pattern
 )
@@ -853,10 +860,12 @@ class GPT(nn.Module):
                 raise ValueError(f"bigram_hash_dim must be positive when USE_SMEARGATE=1, got {bigram_hash_dim}")
             self.bigram_hash_emb = nn.Embedding(bigram_hash_buckets, bigram_hash_dim)
             self.bigram_hash_proj = CastedLinear(bigram_hash_dim, model_dim, bias=False)
+            self.bigram_scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
             self.smear_gate = nn.Parameter(torch.full((model_dim,), smear_gate_init, dtype=torch.float32))
         else:
             self.bigram_hash_emb = None
             self.bigram_hash_proj = None
+            self.bigram_scale = None
             self.smear_gate = None
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -882,15 +891,20 @@ class GPT(nn.Module):
         self._init_weights()
 
     def _init_weights(self) -> None:
+        num_layers = len(self.blocks)
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         if self.bigram_hash_emb is not None:
-            nn.init.normal_(self.bigram_hash_emb.weight, mean=0.0, std=self.tied_embed_init_std)
-        if self.bigram_hash_proj is not None:
-            nn.init.normal_(self.bigram_hash_proj.weight, mean=0.0, std=self.tied_embed_init_std)
-        for module in self.modules():
-            if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
-                nn.init.zeros_(module.weight)
+            nn.init.zeros_(self.bigram_hash_emb.weight)
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Linear):
+                if getattr(module, "_zero_init", False):
+                    nn.init.zeros_(module.weight)
+                elif module.weight.ndim == 2 and min(module.weight.shape) >= 64:
+                    nn.init.orthogonal_(module.weight, gain=1.0)
+                    if ".proj" in name:
+                        with torch.no_grad():
+                            module.weight.mul_(1.0 / math.sqrt(2 * num_layers))
 
     def embed_tokens(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -900,8 +914,8 @@ class GPT(nn.Module):
             raise RuntimeError("SmearGate/BigramHash requested but not initialized")
         prev_ids = torch.cat((input_ids[:, :1], input_ids[:, :-1]), dim=1)
         prev_x = torch.cat((x[:, :1], x[:, :-1]), dim=1)
-        pair_hash = ((prev_ids.to(torch.int64) * 1031) ^ input_ids.to(torch.int64)) % self.bigram_hash_buckets
-        bigram_x = self.bigram_hash_proj(self.bigram_hash_emb(pair_hash))
+        pair_hash = (prev_ids.to(torch.int64) * 36313 ^ input_ids.to(torch.int64) * 27191) % self.bigram_hash_buckets
+        bigram_x = self.bigram_scale * self.bigram_hash_proj(self.bigram_hash_emb(pair_hash))
         gate = torch.sigmoid(self.smear_gate).to(dtype=x.dtype)[None, None, :]
         return (1.0 - gate) * (x + bigram_x) + gate * prev_x
 
@@ -1102,11 +1116,14 @@ def main() -> None:
         matrix_params.append(base_model.bigram_hash_proj.weight)
     if base_model.smear_gate is not None:
         scalar_params.append(base_model.smear_gate)
+    if base_model.bigram_scale is not None:
+        scalar_params.append(base_model.bigram_scale)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    optimizer_tok = torch.optim.Adam(
+    optimizer_tok = torch.optim.AdamW(
         [{"params": token_params, "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
+        weight_decay=args.adam_wd,
         fused=True,
     )
     optimizer_muon = Muon(
@@ -1114,13 +1131,15 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
+        weight_decay=args.muon_wd,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    optimizer_scalar = torch.optim.Adam(
+    optimizer_scalar = torch.optim.AdamW(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
+        weight_decay=args.adam_wd,
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
@@ -1151,8 +1170,10 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
+        f"muon_wd:{args.muon_wd} adam_wd:{args.adam_wd} grad_clip:{args.grad_clip_norm}"
     )
+    log0(f"swa:enabled:{int(args.swa_enabled)} every:{args.swa_every}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
@@ -1214,6 +1235,10 @@ def main() -> None:
     # -----------------------------
     # MAIN TRAINING LOOP
     # -----------------------------
+
+    # SWA: accumulate weight snapshots during warmdown, average at end.
+    swa_sum: dict[str, Tensor] | None = None
+    swa_count = 0
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
@@ -1284,6 +1309,16 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
+        # SWA: snapshot weights during warmdown phase
+        if args.swa_enabled and scale < 0.5 and (step + 1) % args.swa_every == 0:
+            sd = base_model.state_dict()
+            if swa_sum is None:
+                swa_sum = {k: v.detach().cpu().float().clone() for k, v in sd.items()}
+            else:
+                for k, v in sd.items():
+                    swa_sum[k].add_(v.detach().cpu().float())
+            swa_count += 1
+
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
@@ -1309,6 +1344,14 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+
+    # Apply SWA averaging if we collected snapshots.
+    if swa_sum is not None and swa_count > 1:
+        log0(f"swa:applying avg of {swa_count} snapshots")
+        avg_sd = {k: (v / swa_count).to(dtype=base_model.state_dict()[k].dtype) for k, v in swa_sum.items()}
+        base_model.load_state_dict(avg_sd, strict=True)
+    elif swa_count == 1 and swa_sum is not None:
+        log0("swa:only 1 snapshot, skipping averaging")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION

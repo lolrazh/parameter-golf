@@ -98,17 +98,34 @@
 - [x] `MLP_MULT=3`
 - [x] int6 per-row quant + zstd-22
 - [x] front-heavy selective precision (`front3_back1_8_middle6`)
-- [x] SmearGate + BigramHash
+- [x] SmearGate + BigramHash (improved: zero-init, learnable scale, better hash)
 - [x] sliding-window eval implementation available
-- [ ] seq2048
-- [ ] Muon weight decay
-- [ ] late QAT
-- [ ] SWA
+- [x] seq2048 (default in sota_train_gpt.py)
+- [x] Muon weight decay (muon_wd=0.02, adam_wd=0.01)
+- [x] SWA (checkpoint averaging during warmdown)
+- [x] Orthogonal init + projection scaling
+- [x] Grad clipping 0.3
+- [x] Higher LRs (matrix=0.04, scalar=0.04, embed=0.05)
+- [x] Aggressive Muon momentum (0.95, warmup from 0.85 over 500 steps)
+- [ ] late QAT (always-on STE is current approach — late activation not yet tried)
+- [ ] Flash Attention 3 (H100-only, ~10-20% throughput gain)
+- [ ] FP16 tied embedding passthrough (not yet integrated)
 - [ ] real frontier-sized 8xH100 run
 
 ## Winning PR Configs (for reference)
 
-### PR #65 (SOTA, 1.1630 BPB)
+### Best validated pending (1.1326 BPB, 3-seed mean 1.1326)
+```
+NUM_LAYERS=11, 512d, MLP_MULT=3, seq2048, batch=786K
+SmearGate + BigramHash(2048x128), OrthoInit
+MUON_WD=0.04, ADAM_WD=0.04, GRAD_CLIP=0.3
+MATRIX_LR=0.025, SCALAR_LR=0.025, TIED_EMBED_LR=0.035
+MUON_MOMENTUM=0.99 (warmup 0.92→0.99 over 1500), WARMDOWN=3000
+SWA every 200 steps during warmdown, int6+zstd-22, FA3
+sliding window stride=64, 7412 steps @ 81ms/step on 8xH100
+```
+
+### PR #65 (former SOTA, 1.1630 BPB)
 ```
 MLP_MULT=3, QAT int6, sliding window stride=64
 seq_len=1024, batch=524K, 12395 steps, ~48ms/step on 8xH100
