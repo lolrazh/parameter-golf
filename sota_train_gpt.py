@@ -90,6 +90,11 @@ class Hyperparameters:
     bigram_hash_buckets = int(os.environ.get("BIGRAM_HASH_BUCKETS", 4096))
     bigram_hash_dim = int(os.environ.get("BIGRAM_HASH_DIM", 128))
     smear_gate_init = float(os.environ.get("SMEAR_GATE_INIT", 0.0))
+    # Depth recurrence: loop through blocks multiple times for deeper virtual network.
+    # num_recurrence=1 is standard (no recurrence). num_recurrence=3 with num_layers=5
+    # gives 15 virtual layers from 5 physical blocks. lora_rank>0 adds per-virtual-layer adapters.
+    num_recurrence = int(os.environ.get("NUM_RECURRENCE", 1))
+    lora_rank = int(os.environ.get("LORA_RANK", 0))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -114,6 +119,11 @@ class Hyperparameters:
     # 0.0 = always on (current behavior), 0.7 = late activation at 70%, 1.0 = off.
     qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.0))
     fp16_embed = bool(int(os.environ.get("FP16_EMBED", "1")))
+    # TTT: test-time training adapts model on val data before scoring.
+    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
+    ttt_lr = float(os.environ.get("TTT_LR", 3e-4))
+    ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.95))
+    ttt_max_seconds = float(os.environ.get("TTT_MAX_SECONDS", 200.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -859,6 +869,18 @@ class Block(nn.Module):
         return x
 
 
+class LoRAAdapter(nn.Module):
+    """Lightweight per-virtual-layer adapter for depth recurrence."""
+    def __init__(self, dim: int, rank: int):
+        super().__init__()
+        self.down = nn.Linear(dim, rank, bias=False)
+        self.up = nn.Linear(rank, dim, bias=False)
+        nn.init.zeros_(self.up.weight)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.up(self.down(x))
+
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -877,6 +899,8 @@ class GPT(nn.Module):
         bigram_hash_buckets: int,
         bigram_hash_dim: int,
         smear_gate_init: float,
+        num_recurrence: int = 1,
+        lora_rank: int = 0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -901,8 +925,10 @@ class GPT(nn.Module):
             self.bigram_hash_proj = None
             self.bigram_scale = None
             self.smear_gate = None
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
+        self.num_recurrence = num_recurrence
+        num_virtual = num_layers * num_recurrence
+        self.num_encoder_layers = num_virtual // 2
+        self.num_decoder_layers = num_virtual - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList(
@@ -918,6 +944,9 @@ class GPT(nn.Module):
                 for i in range(num_layers)
             ]
         )
+        self.lora_adapters = None
+        if lora_rank > 0 and num_recurrence > 1:
+            self.lora_adapters = nn.ModuleList([LoRAAdapter(model_dim, lora_rank) for _ in range(num_virtual)])
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -925,7 +954,7 @@ class GPT(nn.Module):
         self._init_weights()
 
     def _init_weights(self) -> None:
-        num_layers = len(self.blocks)
+        num_layers = len(self.blocks) * self.num_recurrence
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         if self.bigram_hash_emb is not None:
@@ -953,6 +982,13 @@ class GPT(nn.Module):
         gate = torch.sigmoid(self.smear_gate).to(dtype=x.dtype)[None, None, :]
         return (1.0 - gate) * (x + bigram_x) + gate * prev_x
 
+    def _run_virtual_block(self, v: int, x: Tensor, x0: Tensor) -> Tensor:
+        block = self.blocks[v % len(self.blocks)]
+        x = block(x, x0)
+        if self.lora_adapters is not None:
+            x = x + self.lora_adapters[v](x)
+        return x
+
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.embed_tokens(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
@@ -961,12 +997,12 @@ class GPT(nn.Module):
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self._run_virtual_block(i, x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self._run_virtual_block(self.num_encoder_layers + i, x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -986,12 +1022,12 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self._run_virtual_block(i, x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self._run_virtual_block(self.num_encoder_layers + i, x, x0)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight.to(x.dtype))
@@ -1113,6 +1149,8 @@ def main() -> None:
         bigram_hash_buckets=args.bigram_hash_buckets,
         bigram_hash_dim=args.bigram_hash_dim,
         smear_gate_init=args.smear_gate_init,
+        num_recurrence=args.num_recurrence,
+        lora_rank=args.lora_rank,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1144,6 +1182,9 @@ def main() -> None:
         token_params.append(base_model.bigram_hash_emb.weight)
     if base_model.bigram_hash_proj is not None:
         matrix_params.append(base_model.bigram_hash_proj.weight)
+    if base_model.lora_adapters is not None:
+        for adapter in base_model.lora_adapters:
+            matrix_params.extend([adapter.down.weight, adapter.up.weight])
     if base_model.smear_gate is not None:
         scalar_params.append(base_model.smear_gate)
     if base_model.bigram_scale is not None:
@@ -1205,6 +1246,8 @@ def main() -> None:
     )
     log0(f"swa:enabled:{int(args.swa_enabled)} every:{args.swa_every}")
     log0(f"qat:start_frac:{args.qat_start_frac} fp16_embed:{int(args.fp16_embed)} fa3:{int(HAS_FA3)}")
+    log0(f"recurrence:{args.num_recurrence} lora_rank:{args.lora_rank} virtual_layers:{args.num_layers * args.num_recurrence}")
+    log0(f"ttt:enabled:{int(args.ttt_enabled)} lr:{args.ttt_lr} max_sec:{args.ttt_max_seconds}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
@@ -1442,6 +1485,40 @@ def main() -> None:
         quant_decompressed = zlib.decompress(quant_blob_disk)
     quant_state = torch.load(io.BytesIO(quant_decompressed), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+
+    # TTT: adapt the quantized model on validation data before scoring
+    if args.ttt_enabled:
+        log0(f"ttt:starting lr:{args.ttt_lr} momentum:{args.ttt_momentum} max_sec:{args.ttt_max_seconds}")
+        base_model.train()
+        ttt_opt = torch.optim.SGD(base_model.parameters(), lr=args.ttt_lr, momentum=args.ttt_momentum)
+        ttt_seq_len = args.train_seq_len
+        ttt_total = (val_tokens.numel() - 1) // ttt_seq_len
+        ttt_start = (ttt_total * rank) // world_size
+        ttt_end = (ttt_total * (rank + 1)) // world_size
+        ttt_batch = 16  # sequences per micro-step
+        torch.cuda.synchronize()
+        t_ttt = time.perf_counter()
+        ttt_steps = 0
+        for seq_start in range(ttt_start, ttt_end, ttt_batch):
+            if time.perf_counter() - t_ttt > args.ttt_max_seconds:
+                break
+            seq_end = min(seq_start + ttt_batch, ttt_end)
+            raw_s = seq_start * ttt_seq_len
+            raw_e = seq_end * ttt_seq_len + 1
+            local = val_tokens[raw_s:raw_e].to(device=device, dtype=torch.int64)
+            x = local[:-1].reshape(-1, ttt_seq_len)
+            y = local[1:].reshape(-1, ttt_seq_len)
+            ttt_opt.zero_grad(set_to_none=True)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                loss = base_model(x, y)
+            loss.backward()
+            ttt_opt.step()
+            ttt_steps += 1
+        torch.cuda.synchronize()
+        ttt_elapsed = time.perf_counter() - t_ttt
+        log0(f"ttt:done steps:{ttt_steps} time:{ttt_elapsed:.1f}s seqs:{ttt_end - ttt_start}")
+        base_model.eval()
+
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
