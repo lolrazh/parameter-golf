@@ -12,6 +12,7 @@ import io
 import math
 import os
 import random
+import re
 import subprocess
 import sys
 import time
@@ -425,6 +426,37 @@ INT8_FULL_RANGE_PATTERNS = tuple(
     ).split(",")
     if pattern
 )
+QUANT_PRESET = os.environ.get("QUANT_PRESET", "current").strip() or "current"
+
+def infer_num_layers_from_state_dict(state_dict: dict[str, Tensor]) -> int:
+    max_idx = -1
+    for name in state_dict.keys():
+        m = re.match(r"blocks\.(\d+)\.", name)
+        if m:
+            max_idx = max(max_idx, int(m.group(1)))
+    return max_idx + 1
+
+def resolve_int8_full_range_patterns(state_dict: dict[str, Tensor]) -> tuple[str, ...]:
+    num_layers = infer_num_layers_from_state_dict(state_dict)
+    base = tuple(dict.fromkeys(INT8_FULL_RANGE_PATTERNS))
+    if QUANT_PRESET == "current":
+        return base
+    if num_layers <= 0:
+        raise ValueError("could not infer block count from state_dict for quant preset resolution")
+
+    last = num_layers - 1
+    preset_patterns: dict[str, tuple[str, ...]] = {
+        "outer8_middle6": ("tok_emb", "blocks.0.", f"blocks.{last}."),
+        "front2_8_middle6": ("tok_emb", "blocks.0.", "blocks.1."),
+        "front2_back1_8_middle6": ("tok_emb", "blocks.0.", "blocks.1.", f"blocks.{last}."),
+        "front3_back1_8_middle6": ("tok_emb", "blocks.0.", "blocks.1.", "blocks.2.", f"blocks.{last}."),
+        "front2_back2_8_middle6": ("tok_emb", "blocks.0.", "blocks.1.", f"blocks.{last - 1}.", f"blocks.{last}."),
+        "front2_back1_attn8": ("tok_emb", "blocks.0.attn.", "blocks.1.attn.", f"blocks.{last}.attn."),
+    }
+    if QUANT_PRESET not in preset_patterns:
+        valid = ", ".join(["current", *sorted(preset_patterns)])
+        raise ValueError(f"unknown QUANT_PRESET={QUANT_PRESET!r}. Valid presets: {valid}")
+    return tuple(dict.fromkeys(preset_patterns[QUANT_PRESET]))
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -474,6 +506,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
         0,
     )
+    int8_full_range_patterns = resolve_int8_full_range_patterns(state_dict)
 
     for name, tensor in state_dict.items():
         t = tensor.detach().to("cpu").contiguous()
@@ -498,7 +531,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         stats["num_float_tensors"] += 1
         # Use int8 (127 levels) for tensors without STE fake-quant protection
         # (e.g. tok_emb), int6 (31 levels) for block weights that trained with STE.
-        use_int8 = any(pattern in name for pattern in INT8_FULL_RANGE_PATTERNS)
+        use_int8 = any(pattern in name for pattern in int8_full_range_patterns)
         qr = INT8_QUANT_RANGE if use_int8 else INT6_QUANT_RANGE
         q, s = quantize_float_tensor(t, quant_range=qr)
         if s.ndim > 0:
@@ -1236,6 +1269,8 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
+    if master_process:
+        log0(f"quant_preset:{QUANT_PRESET}")
     quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)

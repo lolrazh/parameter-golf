@@ -76,6 +76,12 @@ Local MLX experiments on M4 Air. Comparing val_loss at 200 steps (SEED=1337, SEQ
 | 53 | clean_9x512_5m_followup2 | front2_back2_8_middle6 | 1.7962 | 2.2628 | +0.4666 | 7,247,510 | better |
 | 54 | clean_9x512_5m_followup2 | front2_back1_attn8 | 1.7962 | 2.9375 | +1.1412 | 5,601,427 | bad, attention-only not enough |
 
+**Integrated end-to-end quant preset eval (1xH100, 5 min train, normal trainer final eval)**
+
+| # | Run ID | Change | prequant BPB | post-quant BPB | quant gap | total bytes | verdict |
+|---|--------|--------|--------------|----------------|-----------|-------------|---------|
+| 55 | clean_9x512_5m_front3b1_eval2 | QUANT_PRESET=front3_back1_8_middle6 | 1.4444 | 1.7629 | +0.3185 | 7,225,310 | BIG WIN |
+
 **Width ceiling search (local M4, 3× LR baseline = 6L×640d @ 3.9868)**
 
 | # | Run ID | Change | val_loss | delta | verdict | notes |
