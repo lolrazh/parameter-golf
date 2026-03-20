@@ -34,6 +34,12 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+try:
+    from flash_attn_interface import flash_attn_func as flash_attn_3_func
+    HAS_FA3 = True
+except ImportError:
+    HAS_FA3 = False
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -104,6 +110,10 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_every = int(os.environ.get("SWA_EVERY", 200))
+    # QAT: fraction of training wallclock after which STE fake-quant activates.
+    # 0.0 = always on (current behavior), 0.7 = late activation at 70%, 1.0 = off.
+    qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.0))
+    fp16_embed = bool(int(os.environ.get("FP16_EMBED", "1")))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -425,6 +435,7 @@ INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT6_QUANT_RANGE = 31  # int6: [-31, 31]
 INT8_QUANT_RANGE = 127  # int8: [-127, 127]
 INT6_CLIP_Q = 0.9999984
+QAT_ACTIVE = True  # toggled by training loop based on qat_start_frac
 
 # Tensors matching these patterns get int8 (127 levels) instead of int6 (31 levels)
 # during post-training quantization. This is for weights that DON'T have fake-quant
@@ -501,12 +512,19 @@ def quantize_float_tensor(t: Tensor, quant_range: int = INT6_QUANT_RANGE) -> tup
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
 
+FP16_PASSTHROUGH_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get("FP16_PASSTHROUGH_PATTERNS", "tok_emb" if bool(int(os.environ.get("FP16_EMBED", "1"))) else "").split(",")
+    if pattern
+)
+
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # Single supported clean-script export format:
     # - per-row int8 for 2D float tensors
     # - per-tensor int8 for other float tensors
     # - exact passthrough for non-floats
     # - passthrough for small float tensors, stored as fp16 to save bytes
+    # - fp16 passthrough for embedding-like tensors (FP16_EMBED=1)
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
     dtypes: dict[str, str] = {}
@@ -529,6 +547,14 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             stats["num_nonfloat_tensors"] += 1
             passthrough[name] = t
             stats["int8_payload_bytes"] += tensor_nbytes(t)
+            continue
+
+        # FP16 passthrough: keep embedding at fp16 instead of quantizing
+        if any(pattern in name for pattern in FP16_PASSTHROUGH_PATTERNS) and t.numel() > INT8_KEEP_FLOAT_MAX_NUMEL:
+            kept = t.to(dtype=torch.float16).contiguous()
+            passthrough[name] = kept
+            passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
+            stats["int8_payload_bytes"] += tensor_nbytes(kept)
             continue
 
         # Small float tensors are cheap enough to keep directly. We still downcast
@@ -677,9 +703,10 @@ class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     # During training, apply fake int6 quantization (STE) so the model learns to be robust
     # to the post-training quantization that will be applied for the 16MB artifact.
+    # QAT activation is controlled by the global QAT_ACTIVE flag (set by training loop).
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight.to(x.dtype)
-        if self.training and w.ndim == 2:
+        if self.training and QAT_ACTIVE and w.ndim == 2:
             # Fake int6 per-row quantization with Straight-Through Estimator:
             # Forward uses quantized weights, backward passes gradients through as-is.
             with torch.no_grad():
@@ -720,8 +747,14 @@ class Rotary(nn.Module):
         ):
             t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
             freqs = torch.outer(t, self.inv_freq.to(device))
-            self._cos_cached = freqs.cos()[None, None, :, :]
-            self._sin_cached = freqs.sin()[None, None, :, :]
+            if HAS_FA3:
+                # FA3 layout: (1, seq, 1, head_dim//2)
+                self._cos_cached = freqs.cos()[None, :, None, :]
+                self._sin_cached = freqs.sin()[None, :, None, :]
+            else:
+                # SDPA layout: (1, 1, seq, head_dim//2)
+                self._cos_cached = freqs.cos()[None, None, :, :]
+                self._sin_cached = freqs.sin()[None, None, :, :]
             self._seq_len_cached = seq_len
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
@@ -762,24 +795,25 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim)
+        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        if not HAS_FA3:  # SDPA needs (bsz, heads, seq, head_dim)
+            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
-        y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+        if HAS_FA3:
+            q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
+            y = flash_attn_3_func(q, k, v, causal=True)[0].reshape(bsz, seqlen, dim)
+        else:
+            q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+            y = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=None, is_causal=True,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
+            ).transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
 
@@ -973,7 +1007,7 @@ class GPT(nn.Module):
 # -----------------------------
 
 def main() -> None:
-    global zeropower_via_newtonschulz5
+    global zeropower_via_newtonschulz5, QAT_ACTIVE
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
@@ -1006,11 +1040,7 @@ def main() -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
-
-    enable_cudnn_sdp(False)
-    enable_flash_sdp(True)
-    enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    enable_cudnn_sdp(False); enable_flash_sdp(True); enable_mem_efficient_sdp(False); enable_math_sdp(False)
 
     logfile = None
     if master_process:
@@ -1174,6 +1204,7 @@ def main() -> None:
         f"muon_wd:{args.muon_wd} adam_wd:{args.adam_wd} grad_clip:{args.grad_clip_norm}"
     )
     log0(f"swa:enabled:{int(args.swa_enabled)} every:{args.swa_every}")
+    log0(f"qat:start_frac:{args.qat_start_frac} fp16_embed:{int(args.fp16_embed)} fa3:{int(HAS_FA3)}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
@@ -1282,6 +1313,11 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        # Late QAT: activate STE fake-quant after qat_start_frac of wallclock
+        if args.qat_start_frac < 1.0 and max_wallclock_ms is not None:
+            QAT_ACTIVE = (elapsed_ms / max_wallclock_ms) >= args.qat_start_frac
+        elif args.qat_start_frac >= 1.0:
+            QAT_ACTIVE = False
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
