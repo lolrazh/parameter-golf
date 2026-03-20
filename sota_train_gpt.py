@@ -87,9 +87,12 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     use_smeargate = bool(int(os.environ.get("USE_SMEARGATE", "1")))
-    bigram_hash_buckets = int(os.environ.get("BIGRAM_HASH_BUCKETS", 4096))
+    bigram_hash_buckets = int(os.environ.get("BIGRAM_HASH_BUCKETS", 10240))
     bigram_hash_dim = int(os.environ.get("BIGRAM_HASH_DIM", 128))
     smear_gate_init = float(os.environ.get("SMEAR_GATE_INIT", 0.0))
+    # XSA: Exclusive Self Attention — projects out self-value component in deep layers.
+    # Zero extra params, ~0.002 BPB gain. Applied to last N layers only.
+    xsa_last_n = int(os.environ.get("XSA_LAST_N", 3))
     # Depth recurrence: loop through blocks multiple times for deeper virtual network.
     # num_recurrence=1 is standard (no recurrence). num_recurrence=3 with num_layers=5
     # gives 15 virtual layers from 5 physical blocks. lora_rank>0 adds per-virtual-layer adapters.
@@ -804,6 +807,15 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.use_xsa = False  # toggled by GPT.__init__ for deep layers
+
+    def _xsa(self, y: Tensor, v: Tensor) -> Tensor:
+        """Subtract self-value projection. GQA-aware via free reshape, no repeat_interleave."""
+        B, T, H, D = y.shape
+        Hkv = v.size(-2)
+        y_g = y.reshape(B, T, Hkv, H // Hkv, D)
+        vn = F.normalize(v, dim=-1).unsqueeze(-2)
+        return (y_g - (y_g * vn).sum(dim=-1, keepdim=True) * vn).reshape(B, T, H, D)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -819,13 +831,20 @@ class CausalSelfAttention(nn.Module):
         k = apply_rotary_emb(k, cos, sin)
         if HAS_FA3:
             q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
-            y = flash_attn_3_func(q, k, v, causal=True)[0].reshape(bsz, seqlen, dim)
+            y = flash_attn_3_func(q, k, v, causal=True)[0]  # [B, T, H, D]
+            if self.use_xsa:
+                y = self._xsa(y, v)  # v already [B, T, Hkv, D]
+            y = y.reshape(bsz, seqlen, dim)
         else:
             q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
             y = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=None, is_causal=True,
                 enable_gqa=(self.num_kv_heads != self.num_heads),
-            ).transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+            ).transpose(1, 2).contiguous()  # [B, T, H, D]
+            if self.use_xsa:
+                v_xsa = v.transpose(1, 2)  # [B, H, T, D] -> [B, T, Hkv, D]
+                y = self._xsa(y, v_xsa)
+            y = y.reshape(bsz, seqlen, dim)
         return self.proj(y)
 
 
@@ -903,6 +922,7 @@ class GPT(nn.Module):
         smear_gate_init: float,
         num_recurrence: int = 1,
         lora_rank: int = 0,
+        xsa_last_n: int = 0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -949,6 +969,10 @@ class GPT(nn.Module):
         self.lora_adapters = None
         if lora_rank > 0 and num_recurrence > 1:
             self.lora_adapters = nn.ModuleList([LoRAAdapter(model_dim, lora_rank) for _ in range(num_virtual)])
+        # XSA: enable on last N physical blocks
+        if xsa_last_n > 0:
+            for i in range(max(0, num_layers - xsa_last_n), num_layers):
+                self.blocks[i].attn.use_xsa = True
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -1153,6 +1177,7 @@ def main() -> None:
         smear_gate_init=args.smear_gate_init,
         num_recurrence=args.num_recurrence,
         lora_rank=args.lora_rank,
+        xsa_last_n=args.xsa_last_n,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1249,6 +1274,8 @@ def main() -> None:
     log0(f"swa:enabled:{int(args.swa_enabled)} every:{args.swa_every}")
     log0(f"qat:start_frac:{args.qat_start_frac} fp16_embed:{int(args.fp16_embed)} fa3:{int(HAS_FA3)}")
     log0(f"recurrence:{args.num_recurrence} lora_rank:{args.lora_rank} virtual_layers:{args.num_layers * args.num_recurrence}")
+    xsa_layers = [i for i in range(args.num_layers) if i >= args.num_layers - args.xsa_last_n] if args.xsa_last_n > 0 else []
+    log0(f"xsa:last_{args.xsa_last_n} active_layers:{xsa_layers}")
     log0(f"ttt:enabled:{int(args.ttt_enabled)} lr:{args.ttt_lr} max_sec:{args.ttt_max_seconds}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
