@@ -165,7 +165,9 @@ def profile_training():
         betas=(args.beta1, args.beta2), eps=args.adam_eps,
         weight_decay=args.adam_wd, fused=True,
     )
-    T.zeropower_via_newtonschulz5 = torch.compile(T.zeropower_via_newtonschulz5)
+    if not T.MUON_USE_CUDA_GRAPH:
+        T.zeropower_via_newtonschulz5 = torch.compile(T.zeropower_via_newtonschulz5)
+        T.batched_newton_schulz = torch.compile(T.batched_newton_schulz)
     optimizer_muon = T.Muon(matrix_params, lr=args.matrix_lr,
                             momentum=args.muon_momentum,
                             backend_steps=args.muon_backend_steps,
