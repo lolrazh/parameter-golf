@@ -103,10 +103,6 @@ class Hyperparameters:
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
     qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.0))
-    # SWA: collect snapshots during the last swa_start_frac of warmdown, average at end.
-    swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "0")))
-    swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))
-    swa_every = int(os.environ.get("SWA_EVERY", 50))
     # Settled optimizer constants.
     embed_lr = 0.6
     head_lr = 0.008
@@ -1399,10 +1395,6 @@ def main() -> None:
     # MAIN TRAINING LOOP
     # -----------------------------
 
-    # SWA: collect weight snapshots during late warmdown, average at end.
-    swa_snapshots: list[dict[str, Tensor]] = []
-    swa_collecting = False
-
     training_time_ms = 0.0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
@@ -1477,16 +1469,6 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
-        # SWA: collect snapshots during the last swa_start_frac of warmdown
-        if args.swa_enabled and scale < 1.0:
-            warmdown_progress = 1.0 - scale  # 0→1 through warmdown
-            if warmdown_progress >= (1.0 - args.swa_start_frac) and not swa_collecting:
-                swa_collecting = True
-                if master_process:
-                    log0(f"swa:start_collecting step:{step}")
-            if swa_collecting and step % args.swa_every == 0:
-                swa_snapshots.append({k: v.detach().cpu().float().clone() for k, v in base_model.state_dict().items()})
-
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
@@ -1514,15 +1496,6 @@ def main() -> None:
     )
 
     # Apply SWA averaging if we collected snapshots.
-    if swa_snapshots:
-        log0(f"swa:averaging {len(swa_snapshots)} snapshots")
-        avg_sd: dict[str, Tensor] = {}
-        for key in swa_snapshots[0]:
-            avg_sd[key] = torch.stack([s[key] for s in swa_snapshots]).mean(dim=0)
-        avg_sd = {k: v.to(dtype=base_model.state_dict()[k].dtype) for k, v in avg_sd.items()}
-        base_model.load_state_dict(avg_sd, strict=True)
-        del swa_snapshots  # free memory
-
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------

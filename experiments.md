@@ -158,6 +158,13 @@ Key negative results: EMA hurt (r20: quant gap 0.155), high momentum hurt (r15),
 | a14 | algo_014 | Token-class calibration (Branch D1) | 1.3891 | — | +0.000 | No effect: per-class temps cancel in aggregate BPB |
 | a15 | algo_015 | Neural cache eval (Branch C3) | 🔄 | — | — | RUNNING on GPU |
 
+**8xH100 SXM submission runs (RunPod spot, FA3, front3_back1_8_middle6 quant)**
+
+| # | Run ID | Config | layers | steps | step_ms | prequant BPB | postquant BPB | sliding BPB | artifact MB | verdict |
+|---|--------|--------|--------|-------|---------|--------------|---------------|-------------|-------------|---------|
+| **s1** | **submission_6L_sp4096** | **sp4096, 786K batch, FA3, front3_back1 quant** | **6** | **~10200** | **59** | **1.1914** | **1.1985** | **1.1818** | **13.6** | **HUGE: +0.103 BPB vs 1xPCIe best. 2.4MB headroom.** |
+| s2 | submission_9L_sp4096 | sp4096, 786K batch, FA3, front3_back1 quant | 9 | 🔄 | ~80 | 🔄 | 🔄 | 🔄 | 🔄 | RUNNING |
+
 **Width ceiling search (local M4, 3× LR baseline = 6L×640d @ 3.9868)**
 
 | # | Run ID | Change | val_loss | delta | verdict | notes |
