@@ -96,7 +96,14 @@ class Hyperparameters:
     smear_gate_init = float(os.environ.get("SMEAR_GATE_INIT", 0.0))
     # XSA: Exclusive Self Attention — projects out self-value component in deep layers.
     # Zero extra params, ~0.002 BPB gain. Applied to last N layers only.
-    xsa_last_n = int(os.environ.get("XSA_LAST_N", 3))
+    xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
+    # Partial RoPE: only apply rotary embeddings to the first `rope_dims` of each head.
+    # Remaining dims are position-free "content" features. 0 = full RoPE (all dims).
+    # PR #315 uses 16/64 (25%). This separates positional and content information.
+    rope_dims = int(os.environ.get("ROPE_DIMS", 16))
+    # LN Scale: dampen deeper layers by 1/sqrt(layer_idx+1). Zero parameters.
+    # Stabilizes training and improves generalization. From PR #315.
+    ln_scale_enabled = bool(int(os.environ.get("LN_SCALE_ENABLED", "1")))
     # Low-rank Q: factor Q projection into two smaller projections (dim -> rank -> dim).
     # 0 = disabled (full-rank Q). Typical value: 192 for dim=512 (saves 25% Q params).
     q_low_rank = int(os.environ.get("Q_LOW_RANK", 0))
@@ -1174,9 +1181,12 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
 
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
-    def __init__(self, dim: int, base: float = 10000.0):
+    # With partial RoPE, only generates tables for rope_dims (not full head_dim).
+    def __init__(self, dim: int, base: float = 10000.0, rope_dims: int = 0):
         super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        # rope_dims=0 means full RoPE (all dims). Otherwise, only rotate first rope_dims.
+        self.rope_dims = rope_dims if rope_dims > 0 else dim
+        inv_freq = 1.0 / (base ** (torch.arange(0, self.rope_dims, 2, dtype=torch.float32) / self.rope_dims))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._seq_len_cached = 0
         self._cos_cached: Tensor | None = None
@@ -1192,11 +1202,9 @@ class Rotary(nn.Module):
             t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
             freqs = torch.outer(t, self.inv_freq.to(device))
             if HAS_FA3:
-                # FA3 layout: (1, seq, 1, head_dim//2)
                 self._cos_cached = freqs.cos()[None, :, None, :]
                 self._sin_cached = freqs.sin()[None, :, None, :]
             else:
-                # SDPA layout: (1, 1, seq, head_dim//2)
                 self._cos_cached = freqs.cos()[None, None, :, :]
                 self._sin_cached = freqs.sin()[None, None, :, :]
             self._seq_len_cached = seq_len
@@ -1204,6 +1212,16 @@ class Rotary(nn.Module):
 
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    # Partial RoPE: cos/sin may cover fewer dims than x. Only rotate those dims;
+    # the remaining dims pass through unchanged (position-free content features).
+    rope_dims = cos.size(-1) * 2  # cos covers half the rotary dims
+    if rope_dims < x.size(-1):
+        x_rope = x[..., :rope_dims]
+        x_pass = x[..., rope_dims:]
+        half = rope_dims // 2
+        x1, x2 = x_rope[..., :half], x_rope[..., half:]
+        x_rope = torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+        return torch.cat((x_rope, x_pass), dim=-1)
     half = x.size(-1) // 2
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
@@ -1218,6 +1236,7 @@ class CausalSelfAttention(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         q_low_rank: int = 0,
+        rope_dims: int = 0,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -1232,20 +1251,17 @@ class CausalSelfAttention(nn.Module):
         self.kv_dim = self.num_kv_heads * self.head_dim
         self.q_low_rank = q_low_rank
         if q_low_rank > 0:
-            # Low-rank Q factorization: separate Q path, can't fuse with K/V
             self.c_q_down = CastedLinear(dim, q_low_rank, bias=False)
             self.c_q_up = CastedLinear(q_low_rank, dim, bias=False)
             self.c_qkv = None
             self.c_kv = CastedLinear(dim, 2 * self.kv_dim, bias=False)
         else:
-            # Fused QKV: one matmul instead of three. Saves 2 weight reads from
-            # HBM per layer (~0.5MB bandwidth saved per layer at 512d, 4 KV heads).
             self.c_qkv = CastedLinear(dim, dim + 2 * self.kv_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.head_dim, base=rope_base)
-        self.use_xsa = False  # toggled by GPT.__init__ for deep layers
+        self.rotary = Rotary(self.head_dim, base=rope_base, rope_dims=rope_dims)
+        self.use_xsa = False
 
     def _xsa(self, y: Tensor, v: Tensor) -> Tensor:
         """Subtract self-value projection. GQA-aware via free reshape, no repeat_interleave."""
@@ -1322,15 +1338,19 @@ class Block(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         q_low_rank: int = 0,
+        rope_dims: int = 0,
+        ln_scale: float = 1.0,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, q_low_rank=q_low_rank)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
+                                         q_low_rank=q_low_rank, rope_dims=rope_dims)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.ln_scale = ln_scale  # fixed 1/sqrt(layer_idx+1), not learned
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
@@ -1338,6 +1358,8 @@ class Block(nn.Module):
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        if self.ln_scale != 1.0:
+            x = x * self.ln_scale
         return x
 
 
@@ -1375,6 +1397,8 @@ class GPT(nn.Module):
         lora_rank: int = 0,
         xsa_last_n: int = 0,
         q_low_rank: int = 0,
+        rope_dims: int = 0,
+        ln_scale_enabled: bool = True,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1416,6 +1440,8 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                     q_low_rank=q_low_rank,
+                    rope_dims=rope_dims,
+                    ln_scale=1.0 / math.sqrt(i + 1) if ln_scale_enabled else 1.0,
                 )
                 for i in range(num_layers)
             ]
@@ -1663,6 +1689,8 @@ def main() -> None:
         lora_rank=args.lora_rank,
         xsa_last_n=args.xsa_last_n,
         q_low_rank=args.q_low_rank,
+        rope_dims=args.rope_dims,
+        ln_scale_enabled=args.ln_scale_enabled,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1768,6 +1796,8 @@ def main() -> None:
     log0(f"recurrence:{args.num_recurrence} lora_rank:{args.lora_rank} virtual_layers:{args.num_layers * args.num_recurrence}")
     xsa_layers = [i for i in range(args.num_layers) if i >= args.num_layers - args.xsa_last_n] if args.xsa_last_n > 0 else []
     log0(f"xsa:last_{args.xsa_last_n} active_layers:{xsa_layers}")
+    log0(f"partial_rope:dims:{args.rope_dims} head_dim:{args.model_dim // args.num_heads}")
+    log0(f"ln_scale:enabled:{int(args.ln_scale_enabled)}")
     log0(f"ttt:enabled:{int(args.ttt_enabled)} lr:{args.ttt_lr} max_sec:{args.ttt_max_seconds}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
