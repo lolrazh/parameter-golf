@@ -1085,7 +1085,7 @@ class CausalSelfAttention(nn.Module):
         k = apply_rotary_emb(k, cos, sin)
         if HAS_FA3:
             q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
-            y = flash_attn_3_func(q, k, v, causal=True)[0]  # [B, T, H, D]
+            y = flash_attn_3_func(q, k, v, causal=True)  # [B, T, H, D]
             if self.use_xsa:
                 y = self._xsa(y, v)  # v already [B, T, Hkv, D]
             y = y.reshape(bsz, seqlen, dim)
