@@ -1168,7 +1168,6 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        use_smeargate: bool,
         bigram_hash_buckets: int,
         bigram_hash_dim: int,
         smear_gate_init: float,
@@ -1229,10 +1228,6 @@ class GPT(nn.Module):
 
     def embed_tokens(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
-        if not self.use_smeargate:
-            return x
-        if self.bigram_hash_emb is None or self.bigram_hash_proj is None or self.smear_gate is None:
-            raise RuntimeError("SmearGate/BigramHash requested but not initialized")
         prev_ids = torch.cat((input_ids[:, :1], input_ids[:, :-1]), dim=1)
         prev_x = torch.cat((x[:, :1], x[:, :-1]), dim=1)
         pair_hash = (prev_ids.to(torch.int64) * 36313 ^ input_ids.to(torch.int64) * 27191) % self.bigram_hash_buckets
@@ -1403,7 +1398,6 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        use_smeargate=args.use_smeargate,
         bigram_hash_buckets=args.bigram_hash_buckets,
         bigram_hash_dim=args.bigram_hash_dim,
         smear_gate_init=args.smear_gate_init,
@@ -1495,11 +1489,7 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
-    log0(
-        f"smeargate:enabled:{int(args.use_smeargate)} "
-        f"bigram_hash_buckets:{args.bigram_hash_buckets if args.use_smeargate else 0} "
-        f"bigram_hash_dim:{args.bigram_hash_dim if args.use_smeargate else 0}"
-    )
+    log0(f"smeargate:enabled bigram_hash_buckets:{args.bigram_hash_buckets} bigram_hash_dim:{args.bigram_hash_dim}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
