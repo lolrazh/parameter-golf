@@ -1441,7 +1441,8 @@ def main() -> None:
     restore_low_dim_params_to_fp32(base_model)
     use_compile = bool(int(os.environ.get("TORCH_COMPILE", "1")))
     compile_mode = os.environ.get("COMPILE_MODE", "default")
-    compiled_model = torch.compile(base_model, dynamic=False, mode=compile_mode) if use_compile else base_model
+    compile_dynamic = bool(int(os.environ.get("COMPILE_DYNAMIC", "0")))
+    compiled_model = torch.compile(base_model, dynamic=compile_dynamic, mode=compile_mode) if use_compile else base_model
     if master_process:
         log0(f"torch_compile:{int(use_compile)}")
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
