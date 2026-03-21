@@ -118,6 +118,9 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_every = int(os.environ.get("SWA_EVERY", 200))
+    # EMA: exponential moving average of weights, applied every step.
+    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "0")))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
     # QAT: fraction of training wallclock after which STE fake-quant activates.
     # 0.0 = always on (current behavior), 0.7 = late activation at 70%, 1.0 = off.
     qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.0))
@@ -1287,6 +1290,7 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log0(f"ema:enabled:{int(args.ema_enabled)} decay:{args.ema_decay}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1346,6 +1350,11 @@ def main() -> None:
     # SWA: accumulate weight snapshots during warmdown, average at end.
     swa_sum: dict[str, Tensor] | None = None
     swa_count = 0
+
+    # EMA: exponential moving average of weights, updated every step.
+    ema_state: dict[str, Tensor] | None = None
+    if args.ema_enabled:
+        ema_state = {k: v.detach().cpu().float().clone() for k, v in base_model.state_dict().items()}
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
@@ -1431,6 +1440,12 @@ def main() -> None:
                     swa_sum[k].add_(v.detach().cpu().float())
             swa_count += 1
 
+        # EMA: update running average of weights every step
+        if ema_state is not None:
+            d = args.ema_decay
+            for k, v in base_model.state_dict().items():
+                ema_state[k].mul_(d).add_(v.detach().cpu().float(), alpha=1.0 - d)
+
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
@@ -1464,6 +1479,12 @@ def main() -> None:
         base_model.load_state_dict(avg_sd, strict=True)
     elif swa_count == 1 and swa_sum is not None:
         log0("swa:only 1 snapshot, skipping averaging")
+
+    # Apply EMA weights if enabled (overrides SWA if both active).
+    if ema_state is not None:
+        log0(f"ema:applying decay={args.ema_decay}")
+        ema_sd = {k: v.to(dtype=base_model.state_dict()[k].dtype) for k, v in ema_state.items()}
+        base_model.load_state_dict(ema_sd, strict=True)
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION

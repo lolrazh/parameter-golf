@@ -22,3 +22,4 @@ ralph_016	1125	1.4445	1.4476	14941407	160.03	2026-03-21T01:30:00	BATCH=65536, 11
 ralph_017	710	1.4221	1.4294	12631210	253.84	2026-03-21T01:36:00	USE_SMEARGATE=0, pre-quant same but post slightly worse, smaller artifact
 ralph_018	607	1.4425	1.4521	12888219	296.64	2026-03-21T01:42:00	QAT_START_FRAC=0.3 regression, QAT always-on better for short runs
 ralph_019	698	1.4253	1.4300	14714809	257.97	2026-03-21T01:48:00	MUON_MOMENTUM_WARMUP_STEPS=100, marginal regression (default 500 is fine)
+ralph_020	664	1.4283	1.5830	11736177	271.14	2026-03-21T01:54:00	EMA decay=0.997 DISASTER, initial weights 12% of EMA, quant gap 0.155
