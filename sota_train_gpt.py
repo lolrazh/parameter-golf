@@ -230,9 +230,13 @@ class Muon(torch.optim.Optimizer):
         for i, p in enumerate(params):
             shape_map[tuple(p.shape)].append(i)
         self._shape_to_indices = dict(shape_map)
-        for shape in self._shape_to_indices:
+        # Reverse mapping: param index → (shape, position within shape group) for O(1) lookup
+        self._param_to_group_idx: dict[int, tuple[tuple[int, ...], int]] = {}
+        for shape, indices in self._shape_to_indices.items():
             rows, cols = shape
             self._scale_corrections[shape] = max(1, rows / cols) ** 0.5
+            for j, idx in enumerate(indices):
+                self._param_to_group_idx[idx] = (shape, j)
         self._shape_groups_built = True
 
     def _batched_step(self, params, group):
@@ -364,8 +368,7 @@ class Muon(torch.optim.Optimizer):
         curr = 0
         for i, p in enumerate(params):
             if i % world_size == rank:
-                shape = tuple(p.shape)
-                idx_in_group = self._shape_to_indices[shape].index(i)
+                shape, idx_in_group = self._param_to_group_idx[i]
                 g = self._static_ns_outputs[shape][idx_in_group]
                 g = g * self._scale_corrections[shape]
                 self._static_updates_flat[curr:curr + p.numel()] = g.reshape(-1)
@@ -400,17 +403,21 @@ class Muon(torch.optim.Optimizer):
 
             self._step_count += 1
 
-            if self._step_count <= 2:
+            # Step 1: normal batched step (warmup, lets shapes stabilize)
+            if self._step_count <= 1:
                 self._batched_step(params, group)
-                if self._step_count == 2:
-                    self._pre_allocate_graph_buffers(params, group)
-                    self._graph = torch.cuda.CUDAGraph()
-                    s = torch.cuda.Stream()
-                    s.wait_stream(torch.cuda.current_stream())
-                    with torch.cuda.stream(s):
-                        with torch.cuda.graph(self._graph, stream=s):
-                            self._graph_step_impl(params, group)
-                    torch.cuda.current_stream().wait_stream(s)
+                return loss
+
+            # Step 2: capture CUDA graph (the capture itself IS the step — don't also run _batched_step)
+            if self._graph is None:
+                self._pre_allocate_graph_buffers(params, group)
+                self._graph = torch.cuda.CUDAGraph()
+                s = torch.cuda.Stream()
+                s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(s):
+                    with torch.cuda.graph(self._graph, stream=s):
+                        self._graph_step_impl(params, group)
+                torch.cuda.current_stream().wait_stream(s)
                 return loss
 
             # Update dynamic scalars before replay
@@ -1016,15 +1023,18 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
-        kv_dim = self.num_kv_heads * self.head_dim
+        self.kv_dim = self.num_kv_heads * self.head_dim
+        self.q_low_rank = q_low_rank
         if q_low_rank > 0:
+            # Low-rank Q factorization: separate Q path, can't fuse with K/V
             self.c_q_down = CastedLinear(dim, q_low_rank, bias=False)
             self.c_q_up = CastedLinear(q_low_rank, dim, bias=False)
-            self.c_q = None
+            self.c_qkv = None
+            self.c_kv = CastedLinear(dim, 2 * self.kv_dim, bias=False)
         else:
-            self.c_q = CastedLinear(dim, dim, bias=False)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
+            # Fused QKV: one matmul instead of three. Saves 2 weight reads from
+            # HBM per layer (~0.5MB bandwidth saved per layer at 512d, 4 KV heads).
+            self.c_qkv = CastedLinear(dim, dim + 2 * self.kv_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
@@ -1041,12 +1051,18 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
-        if self.c_q is not None:
-            q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim)
+        if self.c_qkv is not None:
+            # Fused QKV: single matmul, then split
+            qkv = self.c_qkv(x)
+            q = qkv[:, :, :dim].reshape(bsz, seqlen, self.num_heads, self.head_dim)
+            k = qkv[:, :, dim:dim + self.kv_dim].reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+            v = qkv[:, :, dim + self.kv_dim:].reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         else:
+            # Low-rank Q path
             q = self.c_q_up(self.c_q_down(x)).reshape(bsz, seqlen, self.num_heads, self.head_dim)
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+            kv = self.c_kv(x)
+            k = kv[:, :, :self.kv_dim].reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+            v = kv[:, :, self.kv_dim:].reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         if not HAS_FA3:  # SDPA needs (bsz, heads, seq, head_dim)
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
@@ -1303,7 +1319,7 @@ class GPT(nn.Module):
 # -----------------------------
 
 def main() -> None:
-    global zeropower_via_newtonschulz5, QAT_ACTIVE
+    global zeropower_via_newtonschulz5, batched_newton_schulz, QAT_ACTIVE
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
