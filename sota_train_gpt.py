@@ -456,10 +456,14 @@ INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 
+INT5_QUANT_RANGE = 15  # int5: [-15, 15]
 INT6_QUANT_RANGE = 31  # int6: [-31, 31]
 INT8_QUANT_RANGE = 127  # int8: [-127, 127]
 INT6_CLIP_Q = 0.9999984
 QAT_ACTIVE = True  # toggled by training loop based on qat_start_frac
+# Mixed int5/int6: quantize MLP weights at int5 (saves ~1.86MB artifact via better zstd).
+INT5_MLP_ENABLED = bool(int(os.environ.get("INT5_MLP_ENABLED", "0")))
+INT5_MLP_PATTERNS = ("mlp.fc.", "mlp.proj.")
 
 # Tensors matching these patterns get int8 (127 levels) instead of int6 (31 levels)
 # during post-training quantization. This is for weights that DON'T have fake-quant
@@ -591,9 +595,10 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
 
         stats["num_float_tensors"] += 1
         # Use int8 (127 levels) for tensors without STE fake-quant protection
-        # (e.g. tok_emb), int6 (31 levels) for block weights that trained with STE.
+        # (e.g. tok_emb), int5 (15 levels) for MLP if enabled, int6 (31 levels) otherwise.
         use_int8 = any(pattern in name for pattern in int8_full_range_patterns)
-        qr = INT8_QUANT_RANGE if use_int8 else INT6_QUANT_RANGE
+        use_int5 = INT5_MLP_ENABLED and any(pattern in name for pattern in INT5_MLP_PATTERNS)
+        qr = INT8_QUANT_RANGE if use_int8 else (INT5_QUANT_RANGE if use_int5 else INT6_QUANT_RANGE)
         q, s = quantize_float_tensor(t, quant_range=qr)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
@@ -731,12 +736,14 @@ class CastedLinear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight.to(x.dtype)
         if self.training and QAT_ACTIVE and w.ndim == 2:
-            # Fake int6 per-row quantization with Straight-Through Estimator:
+            # Fake per-row quantization with Straight-Through Estimator:
             # Forward uses quantized weights, backward passes gradients through as-is.
+            # Use int5 range for MLP layers if INT5_MLP_ENABLED.
+            qr = INT5_QUANT_RANGE if getattr(self, '_int5_quant', False) else INT6_QUANT_RANGE
             with torch.no_grad():
                 w32 = w.float()
                 clip_abs = torch.quantile(w32.abs(), INT6_CLIP_Q, dim=1).clamp_min(1e-8)
-                scale = clip_abs / INT6_QUANT_RANGE
+                scale = clip_abs / qr
                 w_clipped = torch.clamp(w32, -clip_abs[:, None], clip_abs[:, None])
                 w_q = (torch.round(w_clipped / scale[:, None]) * scale[:, None]).to(x.dtype)
             w = w + (w_q - w).detach()  # STE: value of w_q, gradient of w
@@ -865,6 +872,9 @@ class MLP(nn.Module):
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
+        if INT5_MLP_ENABLED:
+            self.fc._int5_quant = True
+            self.proj._int5_quant = True
 
     def forward(self, x: Tensor) -> Tensor:
         x = torch.relu(self.fc(x))
