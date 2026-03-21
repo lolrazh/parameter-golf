@@ -2,7 +2,7 @@
 
 **Date:** 2026-03-21
 **Agent:** Claude Opus 4.6 (1M context)
-**Status:** 🔄 Ongoing — algo_015 (neural cache) running on GPU
+**Status:** ⚠️ Partial — neural cache too slow, needs vectorization
 **Building on:** `2026-03-21_0400_algorithmic-experiments.md`
 
 ## User Intention
@@ -12,7 +12,8 @@ User wanted to execute the structured experiment queue from `gpu_queue_overlooke
 - ✅ **Preset-aligned QAT (Branch A1)** — STE fake-quant now matches export quant levels per-layer. 12 CastedLinear layers marked int8 for boundary blocks. Result: -0.0014 BPB improvement (1.3895 → 1.3881). Transferable.
 - ✅ **Batched Muon bug fixes** — Fixed CUDA graph double-update NaN bug (graph capture step ran _batched_step AND _graph_step_impl). Fixed `batched_newton_schulz` global scope error. Batched Muon without CUDA graph works: 133ms vs 136ms baseline.
 - ✅ **Token-class calibration (Branch D1)** — Implemented and tested. Found per-class temp differences (1-byte: T=0.90, 3+ byte: T=1.06) but no overall BPB improvement. Per-class signals cancel when weighted by byte contribution.
-- ✅ **Neural cache implementation** — `eval_val_with_cache()` and `forward_hidden_and_logits()` added. Running as algo_015 on GPU now.
+- ⚠️ **Neural cache implementation** — `eval_val_with_cache()` and `forward_hidden_and_logits()` added. Code works (checkpoint loads, model runs) but eval is impractical: per-token sequential loop over 62M val tokens is too slow. Also hit nohup output buffering issues (zero-byte output files). Needs vectorized implementation to be usable.
+- ✅ **Eval-only script** — `eval_cache.py` created for running eval experiments without retraining. Loads quantized checkpoint directly.
 - ✅ **Dynamic compile support** — Added `COMPILE_DYNAMIC` env var for `torch.compile(dynamic=True)`. Tested with seq curriculum: 219ms/step (too slow vs 133ms static).
 - ❌ **CUDA graph Muon** — Still produces NaN. Double-update fix wasn't sufficient; deeper capture issue remains. Disabled by default (`MUON_USE_CUDA_GRAPH=0`).
 - ❌ **Seq curriculum (3 attempts)** — Dead. torch.compile recompilation (48s), no-compile too slow (298ms), dynamic compile overhead (219ms). All three paths fail.
@@ -56,14 +57,19 @@ User wanted to execute the structured experiment queue from `gpu_queue_overlooke
 - **Neural cache processes sequences one-by-one** — Necessary because cache is built incrementally within each sequence. Slow but eval-only, acceptable.
 - **Per-class temps not applied in final eval** — Calibration was diagnostic only. Would need per-token logit modification in eval_val to actually apply, but the signal is too weak to justify.
 
+## Bugs & Issues (addendum)
+5. **nohup output buffering** — `nohup python3 script.py > file.out 2>&1 &` produces 0-byte output files because Python buffers stdout. Fix: use `PYTHONUNBUFFERED=1` or `python3 -u`.
+6. **Neural cache too slow** — Per-token sequential loop over 62M val tokens (30K sequences × 2048 positions, each doing dot-product against all previous positions) is O(T^2) per sequence. Needs vectorization: pre-compute all hidden states, then use `torch.tril(H @ H.T)` for all-pairs similarity in one shot.
+
 ## Ready for Next Session
-- 🔄 **algo_015 (neural cache)** — Running on GPU at 69.19.136.6:32581, check `~/parameter-golf/logs/algo_015_neural_cache.txt`
-- ✅ **Preset-aligned QAT** — Working, integrated, confirmed improvement
-- ✅ **Neural cache code** — Implemented, needs results
-- 🔧 **PPM-C mixing** — Not yet implemented (byte-level, more complex than neural cache)
+- ✅ **Preset-aligned QAT** — Working, integrated, confirmed -0.0014 BPB
+- ✅ **Eval-only script** — `eval_cache.py` loads checkpoints without retraining
+- 🔧 **Neural cache** — Code exists but needs vectorized implementation (O(T^2) → batched matmul)
+- 🔧 **PPM-C mixing** — Not yet implemented (byte-level, complex)
 - 🔧 **Trigram expert (C1)** — Not yet implemented
-- 🔧 **CUDA graph Muon** — Still broken, low priority vs batched approach
+- 🔧 **CUDA graph Muon** — Still broken, low priority
 - 🔧 **Line count** — Script at 2149 lines, needs trimming to 1500 for submission
+- ✅ **GPU instance** — 69.19.136.6:32581, checkpoint `final_model.int6.ptz` saved from best run
 
 ## Context for Future
-The structured experiment queue from `gpu_queue_overlooked.md` is proving valuable — Branch A1 (preset-aligned QAT) gave a real win. Branch D1 (token-class calibration) was a clean negative. Branch C3 (neural cache) is in flight. Next priorities: check neural cache results, then implement C1 (trigram expert) or PPM-C. The key constraint remains: all techniques must transfer to 8xH100 competition hardware.
+Branch A1 (preset-aligned QAT) is the only confirmed algorithmic win so far (-0.0014 BPB). Branch D1 (token-class calib) negative. Branch C3 (neural cache) blocked by implementation speed. Next: either vectorize neural cache, implement trigram expert (C1), or move to 8xH100 submission run with current best stack. The eval-only script (`eval_cache.py`) enables fast iteration on eval-time ideas without retraining.
