@@ -136,6 +136,10 @@ class Hyperparameters:
     temp_scale_enabled = bool(int(os.environ.get("TEMP_SCALE_ENABLED", "0")))
     # Token-class calibration: per-byte-length temperature at eval time.
     token_class_calib_enabled = bool(int(os.environ.get("TOKEN_CLASS_CALIB_ENABLED", "0")))
+    # Neural cache: blend model probs with nearest-neighbor cache at eval time.
+    neural_cache_enabled = bool(int(os.environ.get("NEURAL_CACHE_ENABLED", "0")))
+    neural_cache_lambda = float(os.environ.get("NEURAL_CACHE_LAMBDA", 0.05))
+    neural_cache_theta = float(os.environ.get("NEURAL_CACHE_THETA", 1.0))
     # TTT: test-time training adapts model on val data before scoring.
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
     ttt_lr = float(os.environ.get("TTT_LR", 3e-4))
@@ -707,6 +711,94 @@ def calibrate_token_class_temps(
             log_fn(f"  token_class_calib: byte_class={cls} best_T={best_t:.2f} bpb={best_bpb:.4f} n_tokens={int(mask.sum())}")
 
     return best_temps
+
+
+def eval_val_with_cache(
+    args: Hyperparameters,
+    base_model: nn.Module,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    cache_lambda: float = 0.05,
+    cache_theta: float = 1.0,
+    log_fn=None,
+) -> tuple[float, float]:
+    """Eval with neural cache: blend model probs with nearest-neighbor cache probs.
+
+    For each token position, we compare the current hidden state to all previous
+    hidden states in the sequence. Tokens whose hidden states are similar get
+    boosted probability. This captures burstiness — if a word appeared recently,
+    it's likely to appear again.
+    """
+    seq_len = args.train_seq_len
+    total_seqs = (val_tokens.numel() - 1) // seq_len
+    vocab_size = args.vocab_size
+
+    val_loss_sum = 0.0
+    val_byte_count = 0.0
+    val_token_count = 0
+
+    base_model.eval()
+    with torch.inference_mode():
+        for seq_idx in range(total_seqs):
+            raw_s = seq_idx * seq_len
+            raw_e = raw_s + seq_len + 1
+            local = val_tokens[raw_s:raw_e].to(device=device, dtype=torch.int64)
+            x = local[:-1].unsqueeze(0)  # [1, T]
+            y = local[1:]  # [T]
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                hidden, logits = base_model.forward_hidden_and_logits(x)
+            # hidden: [1, T, D], logits: [1, T, V]
+            hidden = hidden.squeeze(0).float()  # [T, D]
+            logits = logits.squeeze(0).float()  # [T, V]
+
+            # Normalize hidden states for cosine similarity
+            hidden_norm = F.normalize(hidden, dim=-1)  # [T, D]
+
+            # Model probabilities
+            model_probs = F.softmax(logits, dim=-1)  # [T, V]
+
+            # Build cache distribution incrementally
+            blended_loss = torch.zeros(seq_len, device=device)
+            for t in range(seq_len):
+                if t < 2:
+                    # Not enough cache, use model only
+                    blended_loss[t] = F.cross_entropy(logits[t:t+1], y[t:t+1], reduction="mean")
+                    continue
+
+                # Cache: similarity between current hidden and all previous
+                sim = hidden_norm[t] @ hidden_norm[:t].T  # [t]
+                cache_weights = torch.softmax(sim * cache_theta, dim=0)  # [t]
+
+                # Cache distribution: weighted sum of one-hot targets
+                cache_probs = torch.zeros(vocab_size, device=device)
+                cache_probs.scatter_add_(0, y[:t], cache_weights)
+
+                # Blend
+                p_blend = (1 - cache_lambda) * model_probs[t] + cache_lambda * cache_probs
+                p_blend = p_blend.clamp_min(1e-10)
+                blended_loss[t] = -torch.log(p_blend[y[t]])
+
+            # BPB calculation
+            prev_ids = local[:-1]
+            tgt_ids = y
+            token_bytes = base_bytes_lut[tgt_ids].to(torch.float64)
+            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(torch.float64)
+
+            val_loss_sum += blended_loss.sum().item()
+            val_byte_count += token_bytes.sum().item()
+            val_token_count += seq_len
+
+            if log_fn and (seq_idx + 1) % 500 == 0:
+                log_fn(f"  cache_eval: {seq_idx + 1}/{total_seqs} seqs processed")
+
+    val_loss = val_loss_sum / val_token_count
+    bits_per_token = val_loss / math.log(2.0)
+    tokens_per_byte = val_token_count / val_byte_count
+    return val_loss, bits_per_token * tokens_per_byte
 
 
 # -----------------------------
@@ -1426,6 +1518,29 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
+    def forward_hidden_and_logits(self, input_ids: Tensor) -> tuple[Tensor, Tensor]:
+        """Return (hidden_states, logits) for neural cache eval."""
+        x = self.embed_tokens(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x0 = x
+        skips: list[Tensor] = []
+        for i in range(self.num_encoder_layers):
+            x = self._run_virtual_block(i, x, x0)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = self._run_virtual_block(self.num_encoder_layers + i, x, x0)
+        h = self.final_norm(x)  # [B, T, D] — hidden states before projection
+        if self.tie_embeddings:
+            logits_proj = F.linear(h, self.tok_emb.weight.to(h.dtype))
+        else:
+            if self.lm_head is None:
+                raise RuntimeError("lm_head is required when tie_embeddings=False")
+            logits_proj = self.lm_head(h)
+        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        return h, logits
 
 
 # -----------------------------
