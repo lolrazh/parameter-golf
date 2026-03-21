@@ -163,7 +163,8 @@ Key negative results: EMA hurt (r20: quant gap 0.155), high momentum hurt (r15),
 | # | Run ID | Config | layers | steps | step_ms | prequant BPB | postquant BPB | sliding BPB | artifact MB | verdict |
 |---|--------|--------|--------|-------|---------|--------------|---------------|-------------|-------------|---------|
 | **s1** | **submission_6L_sp4096** | **sp4096, 786K batch, FA3, front3_back1 quant** | **6** | **~10200** | **59** | **1.1914** | **1.1985** | **1.1818** | **13.6** | **HUGE: +0.103 BPB vs 1xPCIe best. 2.4MB headroom.** |
-| s2 | submission_9L_sp4096 | sp4096, 786K batch, FA3, front3_back1 quant | 9 | 🔄 | ~80 | 🔄 | 🔄 | 🔄 | 🔄 | RUNNING |
+| **s2** | **submission_9L_sp4096** | **sp4096, 786K batch, FA3, front3_back1 quant** | **9** | **7249** | **82** | **—** | **1.1654** | **1.1484** | **17.3 (OVER)** | **0.0056 from SOTA! But 1.3MB over 16MB. Needs int5 MLP + zstd.** |
+| s3 | sub_10L_sp4096_int5_swa | sp4096, int5 MLP, SWA, warmdown=3000, zstd | 10 | 🔄 | ~85 | 🔄 | 🔄 | 🔄 | 🔄 | RUNNING — the SOTA attempt |
 
 **Width ceiling search (local M4, 3× LR baseline = 6L×640d @ 3.9868)**
 
