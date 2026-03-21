@@ -40,10 +40,15 @@ User wanted to beat SOTA (1.1248 BPB) in the parameter-golf competition. Session
 
 ### Validation Runs
 - ✅ **10-min 6L control** — 4,537 steps @ 132ms. Pre-quant 1.3019, post-quant sliding **1.2851 BPB**. Best result on 1xH100 PCIe. Already beats baseline 8xH100 submission (1.2244). Quant gap +0.006 (tiny). Loss still dropping at step 4537 — not plateaued.
-- 🔄 **10-min 11L full stack** — Partial RoPE + LN Scale + EMA. Running now (~2,900 steps expected).
+- ✅ **10-min 11L full stack** — 2,378 steps @ 252ms. Pre-quant 1.3278, post-quant sliding **1.3141 BPB**. 6L wins by 0.029 — not enough steps for 11L on proxy hardware. Artifact 15.0 MB (tight).
 
 ### Data Preparation
-- ✅ **sp4096 tokenizer + data downloaded** — `fineweb_4096_bpe.model` + 5 train shards + val on GPU machine. Ready for vocab experiment.
+- ✅ **sp4096 tokenizer + data downloaded** — `fineweb_4096_bpe.model` + 5 train shards + val on GPU machine.
+
+### Big Swing Experiments (5-min proxy)
+- ❌ **MoE (4 experts)** — Crashed: DDP `find_unused_parameters` not set. One-line fix needed.
+- ✅ **Vocab 4096** — **1.3054 sliding BPB in 5 min** (vs sp1024's 1.2851 in 10 min). Half the time, competitive BPB. 3.34 bytes/token = 35% more BPB credit per prediction. Artifact 11.7 MB with 4.3 MB headroom. Quant gap only +0.004. **Biggest discovery of the session.**
+- ❌ **Ensemble** — OOM: two torch.compiled models exceed 80GB VRAM. Would need to disable compile or reduce sizes.
 
 ## Technical Implementation
 
