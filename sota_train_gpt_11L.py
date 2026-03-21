@@ -520,6 +520,12 @@ def eval_val(
 
 DOC_ISOLATED_EVAL = bool(int(os.environ.get("DOC_ISOLATED_EVAL", "1")))
 BOS_TOKEN_ID = 1  # SentencePiece BOS marks document start in FineWeb
+# Stride-OGD: online gradient descent on a vocab-sized bias vector during eval.
+# After each stride of scored tokens, update a bias that corrects systematic
+# token frequency errors. Near-zero cost, ~0.001-0.003 BPB improvement.
+STRIDE_OGD_ENABLED = bool(int(os.environ.get("STRIDE_OGD", "1")))
+STRIDE_OGD_LR = float(os.environ.get("STRIDE_OGD_LR", 0.05))
+STRIDE_OGD_MOMENTUM = float(os.environ.get("STRIDE_OGD_MOMENTUM", 0.9))
 
 
 def eval_val_sliding_window(
@@ -564,6 +570,14 @@ def eval_val_sliding_window(
     if doc_isolated:
         # Boolean mask: True where val_tokens == BOS
         bos_mask_cpu = (val_tokens == BOS_TOKEN_ID)
+
+    # Stride-OGD: learnable vocab bias updated online during eval
+    vocab_size = base_bytes_lut.size(0)
+    ogd_bias: Tensor | None = None
+    ogd_momentum_buf: Tensor | None = None
+    if STRIDE_OGD_ENABLED:
+        ogd_bias = torch.zeros(vocab_size, device=device, dtype=torch.float32)
+        ogd_momentum_buf = torch.zeros(vocab_size, device=device, dtype=torch.float32)
 
     # Compile forward_logits for faster eval (separate from training compile)
     compiled_logits = torch.compile(base_model.forward_logits, dynamic=False)
@@ -1139,8 +1153,22 @@ class CausalSelfAttention(nn.Module):
         vn = F.normalize(v, dim=-1).unsqueeze(-2)
         return (y_g - (y_g * vn).sum(dim=-1, keepdim=True) * vn).reshape(B, T, H, D)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, kv_cache: tuple[Tensor, Tensor] | None = None,
+                pos_offset: int = 0) -> Tensor | tuple[Tensor, tuple[Tensor, Tensor]]:
+        """Forward pass with optional KV cache for cross-window eval.
+
+        Args:
+            kv_cache: (cached_k, cached_v) from previous windows, already RoPE-encoded.
+                      Shape: [B, T_cached, num_kv_heads, head_dim] each.
+            pos_offset: RoPE position offset for the current input tokens.
+                        Should be len(cached) so positions continue correctly.
+
+        Returns:
+            If kv_cache is None: attention output tensor (training mode).
+            If kv_cache is provided: (output, (new_k, new_v)) for cache update.
+        """
         bsz, seqlen, dim = x.shape
+        return_cache = kv_cache is not None
         qkv = self.c_qkv(x)
         q = qkv[:, :, :dim].reshape(bsz, seqlen, self.num_heads, self.head_dim)
         k = qkv[:, :, dim:dim + self.kv_dim].reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
@@ -1149,30 +1177,54 @@ class CausalSelfAttention(nn.Module):
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
-        cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+        # RoPE with position offset for cross-window cache continuity
+        total_len = pos_offset + seqlen
+        cos, sin = self.rotary(total_len, x.device, q.dtype)
         if HAS_FA3:
+            # FA3 layout: [1, T, 1, rope_dims//2]
+            q = apply_rotary_emb(q, cos[:, pos_offset:, :, :], sin[:, pos_offset:, :, :])
+            k = apply_rotary_emb(k, cos[:, pos_offset:, :, :], sin[:, pos_offset:, :, :])
+        else:
+            # SDPA layout: [1, 1, T, rope_dims//2]
+            q = apply_rotary_emb(q, cos[:, :, pos_offset:, :], sin[:, :, pos_offset:, :])
+            k = apply_rotary_emb(k, cos[:, :, pos_offset:, :], sin[:, :, pos_offset:, :])
+
+        if HAS_FA3:
+            # Prepend cached K/V if provided
+            if kv_cache is not None:
+                cached_k, cached_v = kv_cache
+                k_full = torch.cat([cached_k, k], dim=1)  # [B, T_cached+T, Hkv, D]
+                v_full = torch.cat([cached_v, v], dim=1)
+            else:
+                k_full, v_full = k, v
             q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
-            y = flash_attn_3_func(q, k, v, causal=True)  # [B, T, H, D]
+            # FA3 supports seqlen_k > seqlen_q natively (causal still works)
+            y = flash_attn_3_func(q, k_full, v_full, causal=True)  # [B, T, H, D]
             if self.use_xsa:
-                y = self._xsa(y, v)  # v already [B, T, Hkv, D]
-            # Gated Attention: per-head sigmoid gate
+                y = self._xsa(y, v)  # XSA uses current-window v only
             y = y * torch.sigmoid(self.attn_gate).to(dtype=y.dtype)[None, None, :, None]
             y = y.reshape(bsz, seqlen, dim)
         else:
+            if kv_cache is not None:
+                cached_k, cached_v = kv_cache  # [B, Hkv, T_cached, D]
+                k_full = torch.cat([cached_k, k], dim=2)
+                v_full = torch.cat([cached_v, v], dim=2)
+            else:
+                k_full, v_full = k, v
             q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
             y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=None, is_causal=True,
+                q, k_full, v_full, attn_mask=None, is_causal=True,
                 enable_gqa=(self.num_kv_heads != self.num_heads),
             ).transpose(1, 2).contiguous()  # [B, T, H, D]
             if self.use_xsa:
-                v_xsa = v.transpose(1, 2)  # [B, H, T, D] -> [B, T, Hkv, D]
+                v_xsa = v.transpose(1, 2)
                 y = self._xsa(y, v_xsa)
-            # Gated Attention: per-head sigmoid gate
             y = y * torch.sigmoid(self.attn_gate).to(dtype=y.dtype)[None, None, :, None]
             y = y.reshape(bsz, seqlen, dim)
-        return self.proj(y)
+        out = self.proj(y)
+        if return_cache:
+            return out, (k, v)  # return current window's K/V for caching
+        return out
 
 
 class MLP(nn.Module):
@@ -1222,15 +1274,23 @@ class Block(nn.Module):
         self._prores_threshold = 0.3 * (layer_idx / max(num_layers - 1, 1))
         self._prores_scale = 1.0  # set by training loop via model._set_prores_progress()
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor, kv_cache: tuple[Tensor, Tensor] | None = None,
+                pos_offset: int = 0) -> Tensor | tuple[Tensor, tuple[Tensor, Tensor]]:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        attn_result = self.attn(self.attn_norm(x), kv_cache=kv_cache, pos_offset=pos_offset)
+        if kv_cache is not None:
+            attn_out, new_kv = attn_result
+        else:
+            attn_out = attn_result
+            new_kv = None
         prores = self._prores_scale
         x = x + prores * self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + prores * self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         if self.ln_scale != 1.0:
             x = x * self.ln_scale
+        if new_kv is not None:
+            return x, new_kv
         return x
 
 
@@ -1379,6 +1439,56 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
+    def forward_logits_with_kv_cache(
+        self, input_ids: Tensor,
+        kv_caches: list[tuple[Tensor, Tensor]] | None = None,
+        pos_offset: int = 0,
+    ) -> tuple[Tensor, list[tuple[Tensor, Tensor]]]:
+        """Forward returning logits + updated KV caches for cross-window eval.
+
+        Args:
+            input_ids: [B, T] current window tokens
+            kv_caches: list of (cached_k, cached_v) per block, or None for first window
+            pos_offset: RoPE position offset (= total cached tokens so far)
+
+        Returns:
+            (logits, new_kv_caches) where new_kv_caches includes current window K/V
+        """
+        num_blocks = len(self.blocks)
+        x = self.embed_tokens(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x0 = x
+        skips: list[Tensor] = []
+        new_kv_caches: list[tuple[Tensor, Tensor]] = []
+        use_cache = kv_caches is not None
+
+        for i in range(self.num_encoder_layers):
+            cache_i = kv_caches[i] if use_cache else None
+            result = self.blocks[i](x, x0, kv_cache=cache_i, pos_offset=pos_offset)
+            if use_cache:
+                x, new_kv = result
+                new_kv_caches.append(new_kv)
+            else:
+                x = result
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            block_idx = self.num_encoder_layers + i
+            cache_i = kv_caches[block_idx] if use_cache else None
+            result = self.blocks[block_idx](x, x0, kv_cache=cache_i, pos_offset=pos_offset)
+            if use_cache:
+                x, new_kv = result
+                new_kv_caches.append(new_kv)
+            else:
+                x = result
+        x = self.final_norm(x)
+        if self.tie_embeddings:
+            logits_proj = F.linear(x, self.tok_emb.weight.to(x.dtype))
+        else:
+            logits_proj = self.lm_head(x)
+        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        return logits, new_kv_caches
 
 
 # -----------------------------
