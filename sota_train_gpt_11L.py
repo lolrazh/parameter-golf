@@ -1168,22 +1168,9 @@ class CausalSelfAttention(nn.Module):
         vn = F.normalize(v, dim=-1).unsqueeze(-2)
         return (y_g - (y_g * vn).sum(dim=-1, keepdim=True) * vn).reshape(B, T, H, D)
 
-    def forward(self, x: Tensor, kv_cache: tuple[Tensor, Tensor] | None = None,
-                pos_offset: int = 0) -> Tensor | tuple[Tensor, tuple[Tensor, Tensor]]:
-        """Forward pass with optional KV cache for cross-window eval.
-
-        Args:
-            kv_cache: (cached_k, cached_v) from previous windows, already RoPE-encoded.
-                      Shape: [B, T_cached, num_kv_heads, head_dim] each.
-            pos_offset: RoPE position offset for the current input tokens.
-                        Should be len(cached) so positions continue correctly.
-
-        Returns:
-            If kv_cache is None: attention output tensor (training mode).
-            If kv_cache is provided: (output, (new_k, new_v)) for cache update.
-        """
+    def forward(self, x: Tensor) -> Tensor:
+        """Training forward — clean path, no conditionals, fully compilable."""
         bsz, seqlen, dim = x.shape
-        return_cache = kv_cache is not None
         qkv = self.c_qkv(x)
         q = qkv[:, :, :dim].reshape(bsz, seqlen, self.num_heads, self.head_dim)
         k = qkv[:, :, dim:dim + self.kv_dim].reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
@@ -1192,54 +1179,71 @@ class CausalSelfAttention(nn.Module):
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
-        # RoPE with position offset for cross-window cache continuity
-        total_len = pos_offset + seqlen
-        cos, sin = self.rotary(total_len, x.device, q.dtype)
+        cos, sin = self.rotary(seqlen, x.device, q.dtype)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
         if HAS_FA3:
-            # FA3 layout: [1, T, 1, rope_dims//2]
-            q = apply_rotary_emb(q, cos[:, pos_offset:, :, :], sin[:, pos_offset:, :, :])
-            k = apply_rotary_emb(k, cos[:, pos_offset:, :, :], sin[:, pos_offset:, :, :])
-        else:
-            # SDPA layout: [1, 1, T, rope_dims//2]
-            q = apply_rotary_emb(q, cos[:, :, pos_offset:, :], sin[:, :, pos_offset:, :])
-            k = apply_rotary_emb(k, cos[:, :, pos_offset:, :], sin[:, :, pos_offset:, :])
-
-        if HAS_FA3:
-            # Prepend cached K/V if provided
-            if kv_cache is not None:
-                cached_k, cached_v = kv_cache
-                k_full = torch.cat([cached_k, k], dim=1)  # [B, T_cached+T, Hkv, D]
-                v_full = torch.cat([cached_v, v], dim=1)
-            else:
-                k_full, v_full = k, v
             q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
-            # FA3 supports seqlen_k > seqlen_q natively (causal still works)
-            y = flash_attn_3_func(q, k_full, v_full, causal=True)  # [B, T, H, D]
+            y = flash_attn_3_func(q, k, v, causal=True)  # [B, T, H, D]
             if self.use_xsa:
-                y = self._xsa(y, v)  # XSA uses current-window v only
+                y = self._xsa(y, v)  # v already [B, T, Hkv, D]
             y = y * torch.sigmoid(self.attn_gate).to(dtype=y.dtype)[None, None, :, None]
             y = y.reshape(bsz, seqlen, dim)
         else:
-            if kv_cache is not None:
-                cached_k, cached_v = kv_cache  # [B, Hkv, T_cached, D]
-                k_full = torch.cat([cached_k, k], dim=2)
-                v_full = torch.cat([cached_v, v], dim=2)
-            else:
-                k_full, v_full = k, v
+            q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+            y = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=None, is_causal=True,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
+            ).transpose(1, 2).contiguous()  # [B, T, H, D]
+            if self.use_xsa:
+                v_xsa = v.transpose(1, 2)  # [B, H, T, D] -> [B, T, Hkv, D]
+                y = self._xsa(y, v_xsa)
+            y = y * torch.sigmoid(self.attn_gate).to(dtype=y.dtype)[None, None, :, None]
+            y = y.reshape(bsz, seqlen, dim)
+        return self.proj(y)
+
+    def forward_with_kv_cache(self, x: Tensor, kv_cache: tuple[Tensor, Tensor],
+                              pos_offset: int) -> tuple[Tensor, tuple[Tensor, Tensor]]:
+        """Eval-only forward with KV cache. NOT compiled — used for cross-window eval."""
+        bsz, seqlen, dim = x.shape
+        qkv = self.c_qkv(x)
+        q = qkv[:, :, :dim].reshape(bsz, seqlen, self.num_heads, self.head_dim)
+        k = qkv[:, :, dim:dim + self.kv_dim].reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        v = qkv[:, :, dim + self.kv_dim:].reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
+        total_len = pos_offset + seqlen
+        cos, sin = self.rotary(total_len, x.device, q.dtype)
+        if HAS_FA3:
+            q = apply_rotary_emb(q, cos[:, pos_offset:, :, :], sin[:, pos_offset:, :, :])
+            k = apply_rotary_emb(k, cos[:, pos_offset:, :, :], sin[:, pos_offset:, :, :])
+            cached_k, cached_v = kv_cache
+            k_full = torch.cat([cached_k, k], dim=1)
+            v_full = torch.cat([cached_v, v], dim=1)
+            q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
+            y = flash_attn_3_func(q, k_full, v_full, causal=True)
+            if self.use_xsa:
+                y = self._xsa(y, v)
+            y = y * torch.sigmoid(self.attn_gate).to(dtype=y.dtype)[None, None, :, None]
+            y = y.reshape(bsz, seqlen, dim)
+        else:
+            q, k, v_sdpa = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            cos_s, sin_s = self.rotary(total_len, x.device, q.dtype)
+            q = apply_rotary_emb(q, cos_s[:, :, pos_offset:, :], sin_s[:, :, pos_offset:, :])
+            k = apply_rotary_emb(k, cos_s[:, :, pos_offset:, :], sin_s[:, :, pos_offset:, :])
+            cached_k, cached_v = kv_cache
+            k_full = torch.cat([cached_k, k], dim=2)
+            v_full = torch.cat([cached_v, v_sdpa], dim=2)
             q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
             y = F.scaled_dot_product_attention(
                 q, k_full, v_full, attn_mask=None, is_causal=True,
                 enable_gqa=(self.num_kv_heads != self.num_heads),
-            ).transpose(1, 2).contiguous()  # [B, T, H, D]
+            ).transpose(1, 2).contiguous()
             if self.use_xsa:
-                v_xsa = v.transpose(1, 2)
-                y = self._xsa(y, v_xsa)
+                y = self._xsa(y, v.transpose(1, 2))
             y = y * torch.sigmoid(self.attn_gate).to(dtype=y.dtype)[None, None, :, None]
             y = y.reshape(bsz, seqlen, dim)
-        out = self.proj(y)
-        if return_cache:
-            return out, (k, v)  # return current window's K/V for caching
-        return out
+        return self.proj(y), (k, v)
 
 
 class MLP(nn.Module):
@@ -1291,24 +1295,30 @@ class Block(nn.Module):
         # guard failures and recompilation on every change.
         self.register_buffer("_prores_scale", torch.tensor(1.0), persistent=False)
 
-    def forward(self, x: Tensor, x0: Tensor, kv_cache: tuple[Tensor, Tensor] | None = None,
-                pos_offset: int = 0) -> Tensor | tuple[Tensor, tuple[Tensor, Tensor]]:
+    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+        """Training forward — clean, no conditionals."""
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_result = self.attn(self.attn_norm(x), kv_cache=kv_cache, pos_offset=pos_offset)
-        if kv_cache is not None:
-            attn_out, new_kv = attn_result
-        else:
-            attn_out = attn_result
-            new_kv = None
+        attn_out = self.attn(self.attn_norm(x))
         prores = self._prores_scale.to(dtype=x.dtype)
         x = x + prores * self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + prores * self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         if self.ln_scale != 1.0:
             x = x * self.ln_scale
-        if new_kv is not None:
-            return x, new_kv
         return x
+
+    def forward_with_kv_cache(self, x: Tensor, x0: Tensor, kv_cache: tuple[Tensor, Tensor],
+                              pos_offset: int) -> tuple[Tensor, tuple[Tensor, Tensor]]:
+        """Eval-only forward with KV cache."""
+        mix = self.resid_mix.to(dtype=x.dtype)
+        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        attn_out, new_kv = self.attn.forward_with_kv_cache(self.attn_norm(x), kv_cache, pos_offset)
+        prores = self._prores_scale.to(dtype=x.dtype)
+        x = x + prores * self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = x + prores * self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        if self.ln_scale != 1.0:
+            x = x * self.ln_scale
+        return x, new_kv
 
 
 
@@ -1472,34 +1482,34 @@ class GPT(nn.Module):
         Returns:
             (logits, new_kv_caches) where new_kv_caches includes current window K/V
         """
-        num_blocks = len(self.blocks)
         x = self.embed_tokens(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
         new_kv_caches: list[tuple[Tensor, Tensor]] = []
-        use_cache = kv_caches is not None
 
         for i in range(self.num_encoder_layers):
-            cache_i = kv_caches[i] if use_cache else None
-            result = self.blocks[i](x, x0, kv_cache=cache_i, pos_offset=pos_offset)
-            if use_cache:
-                x, new_kv = result
-                new_kv_caches.append(new_kv)
+            cache_i = kv_caches[i] if kv_caches is not None else None
+            if cache_i is not None:
+                x, new_kv = self.blocks[i].forward_with_kv_cache(x, x0, cache_i, pos_offset)
             else:
-                x = result
+                x = self.blocks[i](x, x0)
+                new_kv = None
+            if new_kv is not None:
+                new_kv_caches.append(new_kv)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             block_idx = self.num_encoder_layers + i
-            cache_i = kv_caches[block_idx] if use_cache else None
-            result = self.blocks[block_idx](x, x0, kv_cache=cache_i, pos_offset=pos_offset)
-            if use_cache:
-                x, new_kv = result
-                new_kv_caches.append(new_kv)
+            cache_i = kv_caches[block_idx] if kv_caches is not None else None
+            if cache_i is not None:
+                x, new_kv = self.blocks[block_idx].forward_with_kv_cache(x, x0, cache_i, pos_offset)
             else:
-                x = result
+                x = self.blocks[block_idx](x, x0)
+                new_kv = None
+            if new_kv is not None:
+                new_kv_caches.append(new_kv)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight.to(x.dtype))
