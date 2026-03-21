@@ -40,3 +40,4 @@ algo_003	1325	1.3869	1.3967	10012006	135.89	2026-03-21T03:30:00	ALGO: int5 MLP, 
 algo_004	1261	1.3883	1.3915	10232067	142.85	2026-03-21T03:40:00	ALGO: low-rank Q (192), neutral (+0.002 BPB, 5% slower due to QAT overhead)
 algo_005	605	1.4903	1.5219	8820921	297.98	2026-03-21T03:50:00	ALGO: seq curriculum no-compile, compile essential for speed, can't test fairly
 algo_006	1323	1.3862	1.3666	10511113	136.15	2026-03-21T04:00:00	ALGO: sliding window eval stride=64, -0.022 BPB FREE (competition metric)
+algo_007	646	1.4322	1.4535	11969210	278.89	2026-03-21T04:30:00	ALGO: int5 MLP + 12L, artifact 12MB (fits!), needs 8xH100 to validate
