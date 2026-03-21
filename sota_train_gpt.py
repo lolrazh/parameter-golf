@@ -73,6 +73,10 @@ class Hyperparameters:
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
+    # Sequence curriculum: start with short sequences, switch to full length partway through.
+    seq_curriculum_enabled = bool(int(os.environ.get("SEQ_CURRICULUM_ENABLED", "0")))
+    seq_curriculum_start = int(os.environ.get("SEQ_CURRICULUM_START", 512))
+    seq_curriculum_switch_frac = float(os.environ.get("SEQ_CURRICULUM_SWITCH_FRAC", 0.3))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -125,6 +129,8 @@ class Hyperparameters:
     # 0.0 = always on (current behavior), 0.7 = late activation at 70%, 1.0 = off.
     qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.0))
     fp16_embed = bool(int(os.environ.get("FP16_EMBED", "1")))
+    # Temperature scaling: optimize scalar T at eval time to recalibrate logits.
+    temp_scale_enabled = bool(int(os.environ.get("TEMP_SCALE_ENABLED", "0")))
     # TTT: test-time training adapts model on val data before scoring.
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
     ttt_lr = float(os.environ.get("TTT_LR", 3e-4))
@@ -933,6 +939,7 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.eval_temperature = 1.0  # set >0 at eval time for temperature scaling
         self.use_smeargate = use_smeargate
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram_hash_buckets = bigram_hash_buckets if use_smeargate else 0
@@ -1042,6 +1049,8 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        if not self.training and self.eval_temperature != 1.0:
+            logits = logits / self.eval_temperature
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
@@ -1405,10 +1414,15 @@ def main() -> None:
             QAT_ACTIVE = False
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
+        # Sequence curriculum: use short sequences early, full length later
+        cur_seq_len = args.train_seq_len
+        if args.seq_curriculum_enabled and max_wallclock_ms is not None:
+            if elapsed_ms / max_wallclock_ms < args.seq_curriculum_switch_frac:
+                cur_seq_len = args.seq_curriculum_start
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            x, y = train_loader.next_batch(args.train_batch_tokens, cur_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
@@ -1572,6 +1586,22 @@ def main() -> None:
         ttt_elapsed = time.perf_counter() - t_ttt
         log0(f"ttt:done steps:{ttt_steps} time:{ttt_elapsed:.1f}s seqs:{ttt_end - ttt_start}")
         base_model.eval()
+
+    # Temperature scaling: grid search for optimal eval temperature
+    if args.temp_scale_enabled:
+        log0("temp_scale:searching...")
+        best_t, best_bpb = 1.0, float("inf")
+        for t_val in [0.85, 0.90, 0.92, 0.94, 0.96, 0.98, 1.00, 1.02, 1.04, 1.06, 1.08, 1.10, 1.15]:
+            base_model.eval_temperature = t_val
+            _, t_bpb = eval_val(
+                args, model, rank, world_size, device, grad_accum_steps,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            )
+            log0(f"  temp={t_val:.2f} val_bpb={t_bpb:.6f}")
+            if t_bpb < best_bpb:
+                best_t, best_bpb = t_val, t_bpb
+        base_model.eval_temperature = best_t
+        log0(f"temp_scale:best T={best_t:.2f} val_bpb={best_bpb:.6f}")
 
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
