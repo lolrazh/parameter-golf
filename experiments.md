@@ -133,6 +133,12 @@ Key negative results: EMA hurt (r20: quant gap 0.155), high momentum hurt (r15),
 | a05 | algo_005 | Seq curriculum (no compile) | 1.5219 | — | +0.133 | FAILED: compile essential for speed |
 | a06 | algo_006 | Sliding window eval (stride=64) | 1.3887 | 1.3666 | -0.022 | FREE WIN: competition metric |
 | a07 | algo_007 | Int5 MLP + 12L (extra depth from int5 savings) | 1.4535 | — | +0.064 | Artifact 12MB (fits!), needs 8xH100 to validate (proxy undertrained at 646 steps) |
+| a08 | algo_008 | Batched Muon + CUDA graph | nan | — | — | NaN: double-update bug during graph capture |
+| a10 | algo_010 | Batched Muon (no CUDA graph) | 1.3895 | — | +0.000 | Works! 133ms vs 136ms, +33 steps, numerically identical |
+| a12 | algo_012 | Dynamic compile + seq curriculum | 1.5764 | — | +0.187 | FAILED: dynamic compile 219ms/step overhead |
+| **a13** | **algo_013** | **Preset-aligned QAT (Branch A1)** | **1.3881** | — | **-0.001** | **WIN: STE matches export quant levels, best postquant** |
+| a14 | algo_014 | Token-class calibration (Branch D1) | 1.3891 | — | +0.000 | No effect: per-class temps cancel in aggregate BPB |
+| a15 | algo_015 | Neural cache eval (Branch C3) | 🔄 | — | — | RUNNING on GPU |
 
 **Width ceiling search (local M4, 3× LR baseline = 6L×640d @ 3.9868)**
 
