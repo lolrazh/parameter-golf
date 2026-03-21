@@ -715,6 +715,44 @@ def resolve_int8_full_range_patterns(state_dict: dict[str, Tensor]) -> tuple[str
         raise ValueError(f"unknown QUANT_PRESET={QUANT_PRESET!r}. Valid presets: {valid}")
     return tuple(dict.fromkeys(preset_patterns[QUANT_PRESET]))
 
+def apply_qat_preset_alignment(model: nn.Module, num_layers: int) -> None:
+    """Align training-time fake-quant ranges with the export quant preset.
+
+    Without this, all block weights train with int6 STE even if the export
+    gives them int8 (boundary blocks). Preset-aligned QAT means the model
+    focuses its robustness budget on the layers that actually get int6.
+    """
+    if QUANT_PRESET == "current":
+        return  # "current" uses uniform int8 for tok_emb only, no block-level alignment needed
+
+    # Resolve which block prefixes get int8 at export
+    # (reuse the same preset map as resolve_int8_full_range_patterns)
+    last = num_layers - 1
+    preset_patterns: dict[str, tuple[str, ...]] = {
+        "outer8_middle6": (f"blocks.0.", f"blocks.{last}."),
+        "front2_8_middle6": ("blocks.0.", "blocks.1."),
+        "front2_back1_8_middle6": ("blocks.0.", "blocks.1.", f"blocks.{last}."),
+        "front3_back1_8_middle6": ("blocks.0.", "blocks.1.", "blocks.2.", f"blocks.{last}."),
+        "front2_back2_8_middle6": ("blocks.0.", "blocks.1.", f"blocks.{last - 1}.", f"blocks.{last}."),
+        "front2_back1_attn8": ("blocks.0.attn.", "blocks.1.attn.", f"blocks.{last}.attn."),
+    }
+    if QUANT_PRESET not in preset_patterns:
+        return
+    int8_prefixes = preset_patterns[QUANT_PRESET]
+
+    count = 0
+    for name, module in model.named_modules():
+        if not isinstance(module, CastedLinear):
+            continue
+        if any(prefix in name for prefix in int8_prefixes):
+            module._qat_range = INT8_QUANT_RANGE
+            count += 1
+        elif getattr(module, '_int5_quant', False):
+            module._qat_range = INT5_QUANT_RANGE
+        else:
+            module._qat_range = INT6_QUANT_RANGE
+
+
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
 
@@ -937,16 +975,18 @@ class RMSNorm(nn.Module):
 
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
-    # During training, apply fake int6 quantization (STE) so the model learns to be robust
-    # to the post-training quantization that will be applied for the 16MB artifact.
-    # QAT activation is controlled by the global QAT_ACTIVE flag (set by training loop).
+    # During training, apply fake quantization (STE) so the model learns to be robust
+    # to the post-training quantization. QAT range matches the export preset:
+    # - _qat_range=127 for layers that export at int8 (boundary blocks)
+    # - _qat_range=31 for layers that export at int6 (middle blocks)
+    # - _qat_range=15 for MLP layers when INT5_MLP_ENABLED
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight.to(x.dtype)
         if self.training and QAT_ACTIVE and w.ndim == 2:
             # Fake per-row quantization with Straight-Through Estimator:
             # Forward uses quantized weights, backward passes gradients through as-is.
-            # Use int5 range for MLP layers if INT5_MLP_ENABLED.
-            qr = INT5_QUANT_RANGE if getattr(self, '_int5_quant', False) else INT6_QUANT_RANGE
+            # _qat_range is set by apply_qat_preset_alignment() after model construction.
+            qr = getattr(self, '_qat_range', INT6_QUANT_RANGE)
             with torch.no_grad():
                 w32 = w.float()
                 clip_abs = torch.quantile(w32.abs(), INT6_CLIP_Q, dim=1).clamp_min(1e-8)
@@ -1439,6 +1479,7 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    apply_qat_preset_alignment(base_model, args.num_layers)
     use_compile = bool(int(os.environ.get("TORCH_COMPILE", "1")))
     compile_mode = os.environ.get("COMPILE_MODE", "default")
     compile_dynamic = bool(int(os.environ.get("COMPILE_DYNAMIC", "0")))
@@ -1533,7 +1574,8 @@ def main() -> None:
         f"muon_wd:{args.muon_wd} adam_wd:{args.adam_wd} grad_clip:{args.grad_clip_norm}"
     )
     log0(f"swa:enabled:{int(args.swa_enabled)} every:{args.swa_every}")
-    log0(f"qat:start_frac:{args.qat_start_frac} fp16_embed:{int(args.fp16_embed)} fa3:{int(HAS_FA3)}")
+    qat_int8_count = sum(1 for m in base_model.modules() if isinstance(m, CastedLinear) and getattr(m, '_qat_range', INT6_QUANT_RANGE) == INT8_QUANT_RANGE)
+    log0(f"qat:start_frac:{args.qat_start_frac} preset_aligned:{QUANT_PRESET} int8_layers:{qat_int8_count} fp16_embed:{int(args.fp16_embed)} fa3:{int(HAS_FA3)}")
     log0(f"recurrence:{args.num_recurrence} lora_rank:{args.lora_rank} virtual_layers:{args.num_layers * args.num_recurrence}")
     xsa_layers = [i for i in range(args.num_layers) if i >= args.num_layers - args.xsa_last_n] if args.xsa_last_n > 0 else []
     log0(f"xsa:last_{args.xsa_last_n} active_layers:{xsa_layers}")
