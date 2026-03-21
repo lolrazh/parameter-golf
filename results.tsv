@@ -37,3 +37,6 @@ algo_baseline	694	1.4239	1.4302	13976367	259.40	2026-03-21T03:00:00	11L baseline
 algo_001	1323	1.3862	1.3896	10502190	136.15	2026-03-21T03:10:00	ALGO: temp scaling T=1.00 optimal, no improvement (softcap already calibrates)
 algo_002	918	1.4200	1.5642	10502190	196.13	2026-03-21T03:20:00	ALGO: seq curriculum 512→2048, FAILED (compile overhead + short/long mismatch)
 algo_003	1325	1.3869	1.3967	10012006	135.89	2026-03-21T03:30:00	ALGO: int5 MLP, -550KB artifact but +0.008 BPB (trade-off, not free win)
+algo_004	1261	1.3883	1.3915	10232067	142.85	2026-03-21T03:40:00	ALGO: low-rank Q (192), neutral (+0.002 BPB, 5% slower due to QAT overhead)
+algo_005	605	1.4903	1.5219	8820921	297.98	2026-03-21T03:50:00	ALGO: seq curriculum no-compile, compile essential for speed, can't test fairly
+algo_006	1323	1.3862	1.3666	10511113	136.15	2026-03-21T04:00:00	ALGO: sliding window eval stride=64, -0.022 BPB FREE (competition metric)

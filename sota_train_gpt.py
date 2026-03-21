@@ -97,6 +97,9 @@ class Hyperparameters:
     # XSA: Exclusive Self Attention — projects out self-value component in deep layers.
     # Zero extra params, ~0.002 BPB gain. Applied to last N layers only.
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 3))
+    # Low-rank Q: factor Q projection into two smaller projections (dim -> rank -> dim).
+    # 0 = disabled (full-rank Q). Typical value: 192 for dim=512 (saves 25% Q params).
+    q_low_rank = int(os.environ.get("Q_LOW_RANK", 0))
     # Depth recurrence: loop through blocks multiple times for deeper virtual network.
     # num_recurrence=1 is standard (no recurrence). num_recurrence=3 with num_layers=5
     # gives 15 virtual layers from 5 physical blocks. lora_rank>0 adds per-virtual-layer adapters.
@@ -804,6 +807,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        q_low_rank: int = 0,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -816,7 +820,12 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim, bias=False)
+        if q_low_rank > 0:
+            self.c_q_down = CastedLinear(dim, q_low_rank, bias=False)
+            self.c_q_up = CastedLinear(q_low_rank, dim, bias=False)
+            self.c_q = None
+        else:
+            self.c_q = CastedLinear(dim, dim, bias=False)
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
         self.c_v = CastedLinear(dim, kv_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
@@ -835,7 +844,10 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim)
+        if self.c_q is not None:
+            q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim)
+        else:
+            q = self.c_q_up(self.c_q_down(x)).reshape(bsz, seqlen, self.num_heads, self.head_dim)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         if not HAS_FA3:  # SDPA needs (bsz, heads, seq, head_dim)
@@ -890,11 +902,12 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        q_low_rank: int = 0,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, q_low_rank=q_low_rank)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -942,6 +955,7 @@ class GPT(nn.Module):
         num_recurrence: int = 1,
         lora_rank: int = 0,
         xsa_last_n: int = 0,
+        q_low_rank: int = 0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -982,6 +996,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    q_low_rank=q_low_rank,
                 )
                 for i in range(num_layers)
             ]
@@ -1200,6 +1215,7 @@ def main() -> None:
         num_recurrence=args.num_recurrence,
         lora_rank=args.lora_rank,
         xsa_last_n=args.xsa_last_n,
+        q_low_rank=args.q_low_rank,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
