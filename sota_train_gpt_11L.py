@@ -1287,7 +1287,9 @@ class Block(nn.Module):
         # _prores_threshold = fraction of training that must pass before this layer is fully active.
         # Layer 0 → 0.0 (always full), layer L-1 → ~0.3 (reaches full at 30% of training).
         self._prores_threshold = 0.3 * (layer_idx / max(num_layers - 1, 1))
-        self._prores_scale = 1.0  # set by training loop via model._set_prores_progress()
+        # Use a buffer (tensor) not a Python float — Python floats cause torch.compile
+        # guard failures and recompilation on every change.
+        self.register_buffer("_prores_scale", torch.tensor(1.0), persistent=False)
 
     def forward(self, x: Tensor, x0: Tensor, kv_cache: tuple[Tensor, Tensor] | None = None,
                 pos_offset: int = 0) -> Tensor | tuple[Tensor, tuple[Tensor, Tensor]]:
@@ -1299,7 +1301,7 @@ class Block(nn.Module):
         else:
             attn_out = attn_result
             new_kv = None
-        prores = self._prores_scale
+        prores = self._prores_scale.to(dtype=x.dtype)
         x = x + prores * self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + prores * self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         if self.ln_scale != 1.0:
@@ -1372,13 +1374,14 @@ class GPT(nn.Module):
         """Set ProRes warmup progress (0.0=start, 1.0=fully trained).
         Each block's residual contribution scales from 0→1 based on its depth.
         Shallow layers reach full strength first; deep layers ramp up later.
-        At eval time (progress=1.0), all blocks are at full strength."""
+        At eval time (progress=1.0), all blocks are at full strength.
+        Uses .fill_() on buffer tensors to avoid torch.compile guard failures."""
         for block in self.blocks:
             t = block._prores_threshold
             if t <= 0:
-                block._prores_scale = 1.0
+                block._prores_scale.fill_(1.0)
             else:
-                block._prores_scale = min(progress / t, 1.0)
+                block._prores_scale.fill_(min(progress / t, 1.0))
 
     def _init_weights(self) -> None:
         num_layers = len(self.blocks)
