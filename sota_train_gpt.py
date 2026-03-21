@@ -134,6 +134,8 @@ class Hyperparameters:
     fp16_embed = bool(int(os.environ.get("FP16_EMBED", "1")))
     # Temperature scaling: optimize scalar T at eval time to recalibrate logits.
     temp_scale_enabled = bool(int(os.environ.get("TEMP_SCALE_ENABLED", "0")))
+    # Token-class calibration: per-byte-length temperature at eval time.
+    token_class_calib_enabled = bool(int(os.environ.get("TOKEN_CLASS_CALIB_ENABLED", "0")))
     # TTT: test-time training adapts model on val data before scoring.
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
     ttt_lr = float(os.environ.get("TTT_LR", 3e-4))
@@ -634,6 +636,78 @@ def eval_val_sliding_window(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     base_model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+def calibrate_token_class_temps(
+    args: Hyperparameters,
+    base_model: nn.Module,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    log_fn=None,
+) -> dict[int, float]:
+    """Find per-byte-length temperature that minimizes BPB.
+
+    Groups tokens by byte_length (0=boundary, 1, 2, 3+) and optimizes
+    a temperature for each group independently. Zero training cost.
+    """
+    seq_len = args.train_seq_len
+    total_seqs = (val_tokens.numel() - 1) // seq_len
+    # Use a subset for speed (up to 256 sequences)
+    num_seqs = min(total_seqs, 256)
+
+    base_model.eval()
+    all_logits_list, all_targets_list, all_byte_lens_list = [], [], []
+    with torch.inference_mode():
+        for batch_start in range(0, num_seqs, 32):
+            batch_end = min(batch_start + 32, num_seqs)
+            raw_s = batch_start * seq_len
+            raw_e = batch_end * seq_len + 1
+            local = val_tokens[raw_s:raw_e].to(device=device, dtype=torch.int64)
+            x = local[:-1].reshape(-1, seq_len)
+            y = local[1:].reshape(-1, seq_len)
+            prev = x.reshape(-1)
+            tgt = y.reshape(-1)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                logits = base_model.forward_logits(x)  # [B, T, V]
+            logits = logits.reshape(-1, logits.size(-1)).float()  # [B*T, V]
+            # Byte lengths per token
+            blen = base_bytes_lut[tgt].to(torch.int32)
+            blen += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.int32)
+            all_logits_list.append(logits.cpu())
+            all_targets_list.append(tgt.cpu())
+            all_byte_lens_list.append(blen.cpu())
+
+    all_logits = torch.cat(all_logits_list)
+    all_targets = torch.cat(all_targets_list)
+    all_byte_lens = torch.cat(all_byte_lens_list)
+
+    # Group into classes: 0 (boundary), 1, 2, 3+ bytes
+    classes = all_byte_lens.clone()
+    classes[classes >= 3] = 3
+    unique_classes = classes.unique().tolist()
+
+    best_temps: dict[int, float] = {}
+    for cls in sorted(unique_classes):
+        mask = classes == cls
+        cls_logits = all_logits[mask]
+        cls_targets = all_targets[mask]
+        cls_bytes = all_byte_lens[mask].float()
+        best_t, best_bpb = 1.0, float("inf")
+        for t in [0.90, 0.92, 0.94, 0.96, 0.98, 1.00, 1.02, 1.04, 1.06, 1.08, 1.10]:
+            loss = F.cross_entropy(cls_logits / t, cls_targets, reduction="none")
+            # BPB contribution: (loss / ln2) * (1 / bytes_per_token)
+            bits = loss / math.log(2.0)
+            bpb = bits.sum() / cls_bytes.sum() if cls_bytes.sum() > 0 else float("inf")
+            if bpb < best_bpb:
+                best_t, best_bpb = t, float(bpb.item())
+        best_temps[cls] = best_t
+        if log_fn:
+            log_fn(f"  token_class_calib: byte_class={cls} best_T={best_t:.2f} bpb={best_bpb:.4f} n_tokens={int(mask.sum())}")
+
+    return best_temps
+
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -1892,6 +1966,17 @@ def main() -> None:
                 best_t, best_bpb = t_val, t_bpb
         base_model.eval_temperature = best_t
         log0(f"temp_scale:best T={best_t:.2f} val_bpb={best_bpb:.6f}")
+
+    # Token-class calibration: per-byte-length temperature optimization
+    token_class_temps: dict[int, float] | None = None
+    if args.token_class_calib_enabled:
+        log0("token_class_calib:searching...")
+        token_class_temps = calibrate_token_class_temps(
+            args, base_model, device, val_tokens,
+            base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            log_fn=log0,
+        )
+        log0(f"token_class_calib:result {token_class_temps}")
 
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
