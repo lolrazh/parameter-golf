@@ -69,9 +69,10 @@ class Hyperparameters:
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", 0.35))  # ratio-based: 35% of training
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 0))  # 0 = use warmdown_frac instead
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
@@ -110,10 +111,10 @@ class Hyperparameters:
     # Settled optimizer constants.
     embed_lr = 0.6
     head_lr = 0.008
-    muon_momentum = 0.95
+    muon_momentum = 0.99
     muon_backend_steps = 5
-    muon_momentum_warmup_start = 0.85
-    muon_momentum_warmup_steps = 500
+    muon_momentum_warmup_start = 0.92
+    muon_momentum_warmup_steps = 1500
     beta1 = 0.9
     beta2 = 0.95
     adam_eps = 1e-8
@@ -517,6 +518,10 @@ def eval_val(
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
 
+DOC_ISOLATED_EVAL = bool(int(os.environ.get("DOC_ISOLATED_EVAL", "1")))
+BOS_TOKEN_ID = 1  # SentencePiece BOS marks document start in FineWeb
+
+
 def eval_val_sliding_window(
     args: Hyperparameters,
     base_model: nn.Module,
@@ -529,12 +534,12 @@ def eval_val_sliding_window(
     is_boundary_token_lut: Tensor,
     stride: int = 64,
 ) -> tuple[float, float]:
-    """Sliding window evaluation: each scored token gets (seq_len - stride) context.
+    """Sliding window evaluation with optional document isolation.
 
-    Instead of chopping validation into non-overlapping 1024-token blocks (where
-    the first token in each block gets zero context), we slide a 1024-token window
-    by `stride` tokens at a time and only score the last `stride` tokens per window.
-    Every scored token sees 960+ tokens of context, dramatically improving BPB.
+    Base: slide a window by `stride` tokens, score only the last `stride`.
+    Document isolation: for each scored position, mask out (don't score) tokens
+    whose context window spans a document boundary (BOS token). This prevents
+    the model from using irrelevant cross-document context.
     """
     seq_len = args.train_seq_len
     total_tokens = val_tokens.numel() - 1  # need 1 extra for final target
@@ -552,6 +557,13 @@ def eval_val_sliding_window(
 
     # Eval batch: how many windows per forward pass. Tune for memory.
     eval_batch = int(os.environ.get("SW_EVAL_BATCH", 64))
+
+    # Pre-compute BOS positions for document isolation
+    doc_isolated = DOC_ISOLATED_EVAL
+    bos_mask_cpu: Tensor | None = None
+    if doc_isolated:
+        # Boolean mask: True where val_tokens == BOS
+        bos_mask_cpu = (val_tokens == BOS_TOKEN_ID)
 
     # Compile forward_logits for faster eval (separate from training compile)
     compiled_logits = torch.compile(base_model.forward_logits, dynamic=False)
@@ -573,20 +585,72 @@ def eval_val_sliding_window(
                 logits = compiled_logits(inputs)  # [B, seq_len, vocab]
 
             # Score only the last `stride` positions per window.
-            # logits[:, j, :] predicts the token AFTER position j in the input.
-            # So logits[:, -stride:, :] predicts tokens at input positions
-            # [seq_len - stride + 1, seq_len + 1) — which are the targets.
             scored_logits = logits[:, -stride:, :].reshape(-1, logits.size(-1))  # [B*stride, vocab]
 
-            # Build targets: for window w, targets are val_tokens[w*stride + seq_len - stride + 1 : w*stride + seq_len + 1]
+            # Build targets
             targets = torch.stack([
                 val_tokens[w * stride + seq_len - stride + 1 : w * stride + seq_len + 1]
                 for w in batch_wins
             ]).to(device=device, dtype=torch.int64).reshape(-1)  # [B*stride]
 
-            loss = F.cross_entropy(scored_logits.float(), targets, reduction="sum")
-            val_loss_sum += loss.to(torch.float64)
-            val_token_count += float(targets.numel())
+            # Document isolation: mask out scored tokens whose context spans a doc boundary.
+            # For each scored position, check if there's a BOS in the CONTEXT portion
+            # (not the scored portion itself). If BOS is in context, the context is
+            # contaminated by a different document — only score if the nearest BOS
+            # to the left of the scored position is within the context window.
+            if doc_isolated and bos_mask_cpu is not None:
+                # For each window w, scored positions are at global indices:
+                #   w*stride + (seq_len - stride) ... w*stride + seq_len - 1
+                # The context for each scored position starts at w*stride.
+                # A scored position is valid if there's NO BOS between the context
+                # start and the scored position (meaning entire context is same doc).
+                # Equivalently: the last BOS at or before the scored position must be
+                # at or before the context start (w*stride).
+                score_mask_list = []
+                for w in batch_wins:
+                    ctx_start = w * stride
+                    score_start = ctx_start + seq_len - stride
+                    score_end = ctx_start + seq_len
+                    # Check for any BOS in the context portion (between ctx_start+1 and score_end)
+                    # +1 because a BOS at ctx_start itself is fine (it's the doc start)
+                    window_bos = bos_mask_cpu[ctx_start + 1 : score_end]
+                    # For each scored position j (0..stride-1), it's valid if no BOS
+                    # exists in ctx_start+1 .. score_start+j (the context up to that point)
+                    # Simpler approximation: if ANY BOS is in the context portion
+                    # (ctx_start+1 .. score_start), ALL scored positions are invalid.
+                    # If BOS is only in the scored portion, positions before it are valid.
+                    ctx_has_bos = window_bos[:seq_len - stride].any().item()
+                    if ctx_has_bos:
+                        # Context spans a doc boundary — skip all scored positions
+                        score_mask_list.append(torch.zeros(stride, dtype=torch.bool))
+                    else:
+                        # Check if BOS appears within the scored portion
+                        scored_bos = window_bos[seq_len - stride:]
+                        if not scored_bos.any().item():
+                            score_mask_list.append(torch.ones(stride, dtype=torch.bool))
+                        else:
+                            # BOS in scored region: only score positions BEFORE the first BOS
+                            first_bos = scored_bos.nonzero(as_tuple=False)[0].item()
+                            mask = torch.zeros(stride, dtype=torch.bool)
+                            mask[:first_bos] = True
+                            score_mask_list.append(mask)
+                score_mask = torch.cat(score_mask_list).to(device=device)  # [B*stride]
+                if not score_mask.any():
+                    continue  # skip this batch entirely
+            else:
+                score_mask = None
+
+            # Compute per-token loss
+            per_token_loss = F.cross_entropy(scored_logits.float(), targets, reduction="none")  # [B*stride]
+
+            if score_mask is not None:
+                per_token_loss = per_token_loss * score_mask.float()
+                valid_count = float(score_mask.sum().item())
+            else:
+                valid_count = float(targets.numel())
+
+            val_loss_sum += per_token_loss.to(torch.float64).sum()
+            val_token_count += valid_count
 
             # BPB: prev_ids are the input tokens at each scored position
             prev_ids = torch.stack([
@@ -597,10 +661,13 @@ def eval_val_sliding_window(
             tgt_ids = targets
             token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
             token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+            if score_mask is not None:
+                token_bytes = token_bytes * score_mask.to(dtype=torch.int16)
             val_byte_count += token_bytes.to(torch.float64).sum()
 
             if rank == 0 and (batch_idx + 1) % 100 == 0:
-                print(f"  sw_eval batch {batch_idx + 1}/{num_batches}", flush=True)
+                pct_valid = val_token_count.item() / max((batch_idx + 1) * eval_batch * stride, 1) * 100
+                print(f"  sw_eval batch {batch_idx + 1}/{num_batches} valid:{pct_valid:.1f}%", flush=True)
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
@@ -626,7 +693,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear_gate,bigram_scale",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,attn_gate,skip_weight,skip_weights,smear_gate,bigram_scale",
     ).split(",")
     if pattern
 )
@@ -1059,6 +1126,8 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        # Gated Attention (NeurIPS 2025): per-head sigmoid gate eliminates attention sinks.
+        self.attn_gate = nn.Parameter(torch.ones(num_heads, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base, rope_dims=rope_dims)
         self.use_xsa = False
 
@@ -1088,6 +1157,8 @@ class CausalSelfAttention(nn.Module):
             y = flash_attn_3_func(q, k, v, causal=True)  # [B, T, H, D]
             if self.use_xsa:
                 y = self._xsa(y, v)  # v already [B, T, Hkv, D]
+            # Gated Attention: per-head sigmoid gate
+            y = y * torch.sigmoid(self.attn_gate).to(dtype=y.dtype)[None, None, :, None]
             y = y.reshape(bsz, seqlen, dim)
         else:
             q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
@@ -1098,6 +1169,8 @@ class CausalSelfAttention(nn.Module):
             if self.use_xsa:
                 v_xsa = v.transpose(1, 2)  # [B, H, T, D] -> [B, T, Hkv, D]
                 y = self._xsa(y, v_xsa)
+            # Gated Attention: per-head sigmoid gate
+            y = y * torch.sigmoid(self.attn_gate).to(dtype=y.dtype)[None, None, :, None]
             y = y.reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -1130,6 +1203,8 @@ class Block(nn.Module):
         qk_gain_init: float,
         rope_dims: int = 0,
         ln_scale: float = 1.0,
+        layer_idx: int = 0,
+        num_layers: int = 1,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -1141,13 +1216,19 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         self.ln_scale = ln_scale  # fixed 1/sqrt(layer_idx+1), not learned
+        # ProRes: progressive residual warmup. Deeper layers take longer to reach full strength.
+        # _prores_threshold = fraction of training that must pass before this layer is fully active.
+        # Layer 0 → 0.0 (always full), layer L-1 → ~0.3 (reaches full at 30% of training).
+        self._prores_threshold = 0.3 * (layer_idx / max(num_layers - 1, 1))
+        self._prores_scale = 1.0  # set by training loop via model._set_prores_progress()
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        prores = self._prores_scale
+        x = x + prores * self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = x + prores * self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         if self.ln_scale != 1.0:
             x = x * self.ln_scale
         return x
@@ -1197,6 +1278,8 @@ class GPT(nn.Module):
                     model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
                     rope_dims=rope_dims,
                     ln_scale=1.0 / math.sqrt(i + 1) if ln_scale_enabled else 1.0,
+                    layer_idx=i,
+                    num_layers=num_layers,
                 )
                 for i in range(num_layers)
             ]
@@ -1209,6 +1292,18 @@ class GPT(nn.Module):
         if self.lm_head is not None:
             self.lm_head._zero_init = True
         self._init_weights()
+
+    def set_prores_progress(self, progress: float) -> None:
+        """Set ProRes warmup progress (0.0=start, 1.0=fully trained).
+        Each block's residual contribution scales from 0→1 based on its depth.
+        Shallow layers reach full strength first; deep layers ramp up later.
+        At eval time (progress=1.0), all blocks are at full strength."""
+        for block in self.blocks:
+            t = block._prores_threshold
+            if t <= 0:
+                block._prores_scale = 1.0
+            else:
+                block._prores_scale = min(progress / t, 1.0)
 
     def _init_weights(self) -> None:
         num_layers = len(self.blocks)
@@ -1509,7 +1604,11 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    log0(f"ema:enabled:{int(args.ema_enabled)} decay:{args.ema_decay}")
+    log0(f"ema:enabled:{int(args.ema_enabled)} decay:{args.ema_decay} device:gpu")
+    log0(f"warmdown:frac:{args.warmdown_frac} iters_override:{args.warmdown_iters}")
+    log0(f"muon:momentum:{args.muon_momentum} warmup_start:{args.muon_momentum_warmup_start} warmup_steps:{args.muon_momentum_warmup_steps}")
+    log0(f"gated_attention:enabled attn_gate_per_head:8")
+    log0(f"prores:enabled threshold_deepest:0.3")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1527,13 +1626,21 @@ def main() -> None:
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
-        if args.warmdown_iters <= 0:
-            return 1.0
+        # Ratio-based warmdown: use warmdown_frac of total training time.
+        # Falls back to absolute warmdown_iters if set (>0).
         if max_wallclock_ms is None:
-            warmdown_start = max(args.iterations - args.warmdown_iters, 0)
-            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
+            wd_iters = args.warmdown_iters if args.warmdown_iters > 0 else int(args.iterations * args.warmdown_frac)
+            if wd_iters <= 0:
+                return 1.0
+            warmdown_start = max(args.iterations - wd_iters, 0)
+            return max((args.iterations - step) / max(wd_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
         step_ms = elapsed_ms / max(step, 1)
-        warmdown_ms = args.warmdown_iters * step_ms
+        # Estimate total steps, then compute warmdown iters from fraction
+        est_total_steps = max_wallclock_ms / max(step_ms, 1e-9)
+        wd_iters = args.warmdown_iters if args.warmdown_iters > 0 else int(est_total_steps * args.warmdown_frac)
+        if wd_iters <= 0:
+            return 1.0
+        warmdown_ms = wd_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
@@ -1569,11 +1676,11 @@ def main() -> None:
     # MAIN TRAINING LOOP
     # -----------------------------
 
-    # SWA: accumulate weight snapshots during warmdown, average at end.
     # EMA: exponential moving average of weights, updated every step.
+    # Kept on GPU (float32) to avoid costly GPU→CPU transfer each step.
     ema_state: dict[str, Tensor] | None = None
     if args.ema_enabled:
-        ema_state = {k: v.detach().cpu().float().clone() for k, v in base_model.state_dict().items()}
+        ema_state = {k: v.detach().float().clone() for k, v in base_model.state_dict().items()}
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
@@ -1617,6 +1724,9 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        # ProRes: update progressive residual warmup based on wallclock progress
+        if max_wallclock_ms is not None and max_wallclock_ms > 0:
+            base_model.set_prores_progress(min(elapsed_ms / max_wallclock_ms, 1.0))
         # Late QAT: activate STE fake-quant after qat_start_frac of wallclock
         if args.qat_start_frac < 1.0 and max_wallclock_ms is not None:
             QAT_ACTIVE = (elapsed_ms / max_wallclock_ms) >= args.qat_start_frac
@@ -1649,11 +1759,11 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
-        # EMA: update running average of weights every step
+        # EMA: update running average of weights every step (GPU-side, no CPU transfer)
         if ema_state is not None:
             d = args.ema_decay
             for k, v in base_model.state_dict().items():
-                ema_state[k].mul_(d).add_(v.detach().cpu().float(), alpha=1.0 - d)
+                ema_state[k].mul_(d).add_(v.detach().float(), alpha=1.0 - d)
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
@@ -1681,7 +1791,9 @@ def main() -> None:
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
 
-    # Apply SWA averaging if we collected snapshots.
+    # Ensure ProRes is fully open for eval/serialization
+    base_model.set_prores_progress(1.0)
+
     # Apply EMA weights if enabled.
     if ema_state is not None:
         log0(f"ema:applying decay={args.ema_decay}")
