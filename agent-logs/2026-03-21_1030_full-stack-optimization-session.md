@@ -38,9 +38,12 @@ User wanted to beat SOTA (1.1248 BPB) in the parameter-golf competition. Session
 - ✅ **Ensemble experiment** — `experiment_ensemble.py` (823 lines). Two smaller models (6L+4L) in one 16MB artifact. Geometric mean blending. Alpha sweep.
 - ✅ **Vocab 4096 experiment** — `experiment_vocab4096.py`. 8192 is dead (too big) but 4096 is the sweet spot: 35% more bytes/token, fits 11L in ~14MB with int8 embed. Pre-built data from `sproos/parameter-golf-tokenizers`. sp4096 data downloading on GPU machine. One-line change to un-hardcode `vocab_size` in sota_train_gpt.py.
 
-### Validation Runs (in progress)
-- 🔄 **10-min 6L control** — ralph_030 recipe at 10-min budget. Running now.
-- 🔄 **10-min 11L full stack** — Partial RoPE + LN Scale + EMA + all new features. Queued after 6L.
+### Validation Runs
+- ✅ **10-min 6L control** — 4,537 steps @ 132ms. Pre-quant 1.3019, post-quant sliding **1.2851 BPB**. Best result on 1xH100 PCIe. Already beats baseline 8xH100 submission (1.2244). Quant gap +0.006 (tiny). Loss still dropping at step 4537 — not plateaued.
+- 🔄 **10-min 11L full stack** — Partial RoPE + LN Scale + EMA. Running now (~2,900 steps expected).
+
+### Data Preparation
+- ✅ **sp4096 tokenizer + data downloaded** — `fineweb_4096_bpe.model` + 5 train shards + val on GPU machine. Ready for vocab experiment.
 
 ## Technical Implementation
 

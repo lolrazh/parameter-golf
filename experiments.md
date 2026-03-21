@@ -137,6 +137,16 @@ Key negative results: EMA hurt (r20: quant gap 0.155), high momentum hurt (r15),
 | a10 | algo_010 | Batched Muon (no CUDA graph) | 1.3895 | — | +0.000 | Works! 133ms vs 136ms, +33 steps, numerically identical |
 | a12 | algo_012 | Dynamic compile + seq curriculum | 1.5764 | — | +0.187 | FAILED: dynamic compile 219ms/step overhead |
 | **a13** | **algo_013** | **Preset-aligned QAT (Branch A1)** | **1.3881** | — | **-0.001** | **WIN: STE matches export quant levels, best postquant** |
+
+**Infrastructure + architecture experiments (1xH100 PCIe Thunder)**
+
+| # | Run ID | Change | layers | steps | step_ms | prequant BPB | postquant BPB | sliding BPB | quant gap | verdict |
+|---|--------|--------|--------|-------|---------|--------------|---------------|-------------|-----------|---------|
+| a10 | algo_010 | Batched Muon (no CUDA graph) | 6 | 1356 | 133 | 1.3861 | 1.3895 | — | +0.003 | +33 steps over baseline, identical BPB |
+| a11 | algo_011 | + Partial RoPE 16/64 + LN Scale + EMA + fused QKV | 6 | 1291 | 140 | 1.3974 | 1.4276 | 1.4039 | +0.030 | WORSE at 6L: new features hurt shallow models |
+| v2-9L | fullstack_v2 | Same as a11 but 9L | 9 | 872 | 206 | 1.4313 | 1.4975 | — | +0.066 | WORSE: too few steps for 9L on proxy |
+| **v2-6L-10m** | **tenmin_6L_control_v2** | **ralph_030 recipe, 10 min** | **6** | **4537** | **132** | **1.3019** | **1.3077** | **1.2851** | **+0.006** | **BEST: 1.2851 sliding on 1xH100 PCIe** |
+| v2-11L-10m | tenmin_11L_fullstack_v2 | Partial RoPE + LN Scale + EMA, 10 min | 11 | ~2900 | ~206 | — | — | — | — | RUNNING |
 | a14 | algo_014 | Token-class calibration (Branch D1) | 1.3891 | — | +0.000 | No effect: per-class temps cancel in aggregate BPB |
 | a15 | algo_015 | Neural cache eval (Branch C3) | 🔄 | — | — | RUNNING on GPU |
 
