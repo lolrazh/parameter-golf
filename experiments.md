@@ -102,6 +102,37 @@ Local MLX experiments on M4 Air. Comparing val_loss at 200 steps (SEED=1337, SEQ
 | 59 | fullstack_11L_ttt_v2 | same + SWA(5 snap) + TTT(1811 steps) on Thunder H100 PCIe | 1.6839 | 1.8948 | 1.8966 | +0.2109 | 258 | 8,460,774 | PCIe ~50% slower; TTT didn't help (model too undertrained); SWA worked |
 | 60 | fullstack_11L_10m | 10 min train, no TTT, SWA(10 snap), Thunder H100 PCIe | 1.4038 | 1.6234 | (killed) | +0.2196 | 515 | 10,646,376 | best prequant yet; sliding eval killed by SSH drop |
 
+**Ralph Loop: Autonomous hyperparameter sweep (1xH100 PCIe Thunder, 3 min)**
+
+**WARNING**: These are proxy-hardware results. Hyperparameter VALUES don't transfer to 8xH100 10-min, but qualitative insights do. See `agent-logs/2026-03-21_0010_ralph-loop-autoresearch.md`.
+
+Best proxy config found: 6L×512d, WARMDOWN_ITERS=500, BATCH=131K, WD=0.04, XSA=2, ROPE=50K
+
+| # | Run ID | Change | steps | prequant BPB | postquant BPB | step_avg_ms | verdict |
+|---|--------|--------|-------|--------------|---------------|-------------|---------|
+| r01 | ralph_001 | baseline 11L (broken warmdown) | 153 | 2.0488 | 2.9142 | 1181 | LR at 12.7% entire run |
+| r02 | ralph_002 | WARMDOWN_ITERS=50 | 153 | 1.6551 | 1.6854 | 1180 | MASSIVE fix: +1.23 BPB |
+| r04 | ralph_004 | BATCH=262K | 409 | 1.4626 | 1.4707 | 440 | crossed 1.50 target |
+| r09 | ralph_009 | BATCH=131K | 707 | 1.4559 | 1.4599 | 255 | sweet spot |
+| r12 | ralph_012 | WARMDOWN=250 | 701 | 1.4271 | 1.4333 | 257 | optimal warmdown |
+| r14 | ralph_014 | ROPE_BASE=50K | 698 | 1.4220 | 1.4281 | 258 | best 11L proxy |
+| r25 | ralph_025 | 9L | 865 | 1.4099 | 1.4128 | 208 | fewer layers = more steps |
+| r27 | ralph_027 | 7L | 1123 | 1.3895 | 1.3928 | 160 | throughput > capacity |
+| r30 | ralph_030 | 6L | 1321 | 1.3861 | 1.3892 | 136 | best proxy config |
+
+Key negative results: EMA hurt (r20: quant gap 0.155), high momentum hurt (r15), lower LRs hurt postquant (r08), small batch too noisy (r16), SmearGate off marginal (r17), delayed QAT hurt (r18).
+
+**Algorithmic experiments (1xH100 PCIe Thunder, 3 min, TRANSFERABLE)**
+
+| # | Run ID | Algorithmic Change | postquant BPB | sliding BPB | delta vs baseline | verdict |
+|---|--------|--------------------|---------------|-------------|-------------------|---------|
+| a01 | algo_001 | Temperature scaling (grid search T) | 1.3896 | — | 0.000 | No effect: softcap = built-in temp |
+| a02 | algo_002 | Seq curriculum 512→2048 (compiled) | 1.5642 | — | +0.175 | FAILED: 96s compile overhead |
+| a03 | algo_003 | Mixed int5 MLP / int6 attn | 1.3967 | — | +0.008 | Trade-off: -550KB artifact, +0.008 BPB |
+| a04 | algo_004 | Low-rank Q (512→192→512) | 1.3915 | — | +0.002 | Neutral: QAT overhead > matmul savings |
+| a05 | algo_005 | Seq curriculum (no compile) | 1.5219 | — | +0.133 | FAILED: compile essential for speed |
+| a06 | algo_006 | Sliding window eval (stride=64) | 1.3887 | 1.3666 | -0.022 | FREE WIN: competition metric |
+
 **Width ceiling search (local M4, 3× LR baseline = 6L×640d @ 3.9868)**
 
 | # | Run ID | Change | val_loss | delta | verdict | notes |

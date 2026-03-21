@@ -64,115 +64,151 @@
   - Don't let attention leak across document boundaries
   - PR #77 showed this
 
-## Phase 3: Missed Frontier Ideas (from live issue #140)
+## Phase 3: Frontier Ideas — Status & Remaining
 
-- [ ] **Muon weight decay**
-  - Repeatedly cited as part of the official merged leader lineage
-  - Distinct from our current Muon settings; still not in the fork
-- [ ] **SWA / checkpoint averaging**
-  - Top SmearGate submissions use SWA-like averaging late in training
-  - Cheap enough to matter, not yet tried here
-- [ ] **Seq2048 on the current stack**
-  - Real frontier consensus now leans `2048` as the honest next long-context baseline
-  - Should be tested with: current quant preset + SmearGate + sliding eval
-- [ ] **Overtone init + residual-mix init**
-  - Early official leader lineage used this as a real foundation, not a random trick
-  - We have not implemented it in the SOTA fork
-- [ ] **NorMuon**
-  - Appears in several strong PRs
-  - Especially relevant if we revisit larger vocabs or longer context
-- [ ] **Vocab 4096 / 8192 + SmearGate**
-  - Larger vocab submissions have not been combined with our current stack here
-- [ ] **Late-K selective precision**
-  - Keep `c_k` in the last layers higher precision
-  - Related to our front-heavy preset, but not the same idea
-- [ ] **MTP (multi-token prediction)**
-  - Auxiliary heads only during training
-  - Potential sample-efficiency win without inference artifact cost
-- [ ] **TTT on top of the real stack**
-  - Expensive and not first priority, but still one of the few ideas with large upside left
+### Confirmed / Implemented
+- [x] **Muon weight decay 0.04** — confirmed improvement, in our stack
+- [x] **SWA / checkpoint averaging** — implemented, but only helps with enough warmdown steps
+- [x] **Seq2048** — default, confirmed
+- [x] **XSA (last 3-4 layers)** — confirmed ~0.002 BPB gain
+- [x] **RoPE base 50K** — confirmed improvement from PR #290
+
+### Tested Negative / Neutral
+- [x] **Temperature scaling** — no effect (softcap handles calibration). CONFIRMED.
+- [x] **Low-rank Q (512→192→512)** — neutral: QAT overhead cancels matmul savings. CONFIRMED.
+- [x] **Seq curriculum (512→2048)** — broken by torch.compile shape recompilation. BLOCKED.
+- [x] **EMA (any decay)** — hurts at <1000 steps (CPU overhead + dampens learning). CONFIRMED for short runs.
+- [x] **Late QAT (START_FRAC>0)** — worse than always-on. CONFIRMED.
+- [x] **NorMuon** — 110ms/step overhead not justified under 600s (from leaderboard intel). SKIP.
+- [x] **MTP (multi-token prediction)** — no BPB improvement (PR #212 ablation). SKIP.
+- [x] **SwiGLU** — worse than relu² at this scale. CONFIRMED locally.
+- [x] **Depth recurrence** — 2x compute, same params, not competitive (PR #103). CONFIRMED locally.
+
+### Untried — High Value (in the bag)
+- [ ] **PPM-C context mixing at eval** — blend classical byte-level model with neural probs
+  - PR #283 showed ~0.015 BPB on baseline
+  - Complex to implement but eval-time only, 100% transferable
+  - Neural + classical make different errors → ensemble helps
+- [ ] **OptRot pre-quant rotation** (arXiv:2512.24124) — rotate weights before quantizing
+  - Redistributes outliers across dims, 30-50% less quant gap
+  - Fuses into adjacent layers at eval → zero artifact cost
+  - Our quant gap is already tiny (0.003), so expected gain is small
+- [ ] **Differential Attention** (arXiv:2410.05258) — attention as difference of two softmaxes
+  - 65% fewer params for same quality, reduces activation outliers
+  - Requires significant architecture change
+  - Estimated -0.005 to -0.015 BPB but high implementation effort
+- [ ] **Entropy-regularized QAT** — compression penalty in loss
+  - Cluster weights around fewer distinct values for better zstd
+  - Simple loss term addition, 100% transferable
+  - Estimated savings: 0.5-1.5 MB artifact
+- [ ] **Int5 MLP + extra layer** — use int5 savings (~1.86MB) to fund 12th layer
+  - Proven trade: int5 costs +0.008 BPB per layer, extra layer gains more
+  - Merged SOTA (#180) does exactly this
+  - Ready to test: INT5_MLP_ENABLED=1 + NUM_LAYERS=12
+- [ ] **Mousse optimizer** (arXiv:2603.09697) — curvature-aware Muon
+  - 12% more effective training at 3% overhead
+  - Estimated -0.003 to -0.008 BPB
+  - Significant code change (optimizer replacement)
+- [ ] **Vocab 4096/8192 + SmearGate** — larger vocab for better compression
+  - Sacrifice 1 layer to fit embedding
+  - PR #78 has custom tokenizer at huggingface
+  - Needs re-downloading tokenized data
+- [ ] **TTT with optimized hyperparams** — cosine LR, per-layer LRs, freeze first 2 blocks
+  - PR #290 config: 3-epoch full-model SGD, lr=0.002, momentum=0.9
+  - Our prior TTT test was on undertrained model, retry on properly trained one
+- [ ] **Seq curriculum via torch.compile(dynamic=True)** — retry with dynamic shapes
+  - The idea is sound, implementation was blocked by compile
+  - Need to test if dynamic=True performance is acceptable
+- [ ] **Lattice vector quantization** (arXiv:2603.11021) — Leech lattice for groups of 24 weights
+  - 15-32% less bitstring waste, saves 2-4 MB
+  - Requires custom dequant kernels — high implementation effort
 
 ## Current Implemented Stack
 
 - [x] 11L×512d, MLP 3x, GQA (8h/4kv), RoPE, relu², U-Net skips
 - [x] SmearGate + BigramHash(10240×128) — zero-init, learnable scale, improved hash
-- [x] XSA (Exclusive Self Attention) on last 3 layers — zero-param eval gain
-- [x] int6 per-row quant + zstd-22 + front-heavy preset (`front3_back1_8_middle6`)
+- [x] XSA (Exclusive Self Attention) on last 3-4 layers — zero-param eval gain
+- [x] int6 per-row quant + zstd-22 + front-heavy preset (`front2_back1_8_middle6`)
 - [x] FP16 tied embedding passthrough (FP16_EMBED=1)
 - [x] Sliding window eval (stride=64, compiled forward_logits, batch=64)
-- [x] seq2048 training, batch 786K tokens/step
-- [x] Muon WD=0.02, AdamW WD=0.01, grad clip 0.3
+- [x] seq2048 training, batch 786K tokens/step (or 131K for proxy)
+- [x] Muon WD=0.04, AdamW WD=0.04, grad clip 0.3
 - [x] Orthogonal init + 1/sqrt(2L) projection scaling
-- [x] SWA (checkpoint averaging during warmdown, SWA_EVERY=50)
+- [x] SWA (checkpoint averaging during warmdown, SWA_EVERY=200)
 - [x] Higher LRs (matrix=0.04, scalar=0.04, embed=0.05)
-- [x] Late QAT toggle (QAT_START_FRAC, default 0.0 = always-on STE)
+- [x] QAT always-on (QAT_START_FRAC=0.0 — late QAT hurts, confirmed)
 - [x] Flash Attention 3 (conditional import, SDPA fallback)
 - [x] TTT (test-time training, full-model SGD on val data)
 - [x] Depth recurrence (NUM_RECURRENCE × blocks + optional LoRA adapters)
-- [ ] FA3 package installed on cloud (compiling on A6000)
-- [ ] Mixed int5/int6 quant (int5 MLP, int6 attn — merged SOTA uses this)
+- [x] EMA weight averaging (implemented, but only helps at 7000+ steps)
+- [x] Temperature scaling search (implemented, but T=1.0 optimal due to softcap)
+- [x] Mixed int5/int6 quant (INT5_MLP_ENABLED — trade-off: -550KB, +0.008 BPB)
+- [x] Low-rank Q factorization (Q_LOW_RANK — neutral on proxy, QAT overhead issue)
+- [x] Seq length curriculum (SEQ_CURRICULUM_ENABLED — broken by torch.compile shape change)
+- [x] ROPE_BASE=50000 (from PR #290, confirmed improvement)
+- [ ] FA3 package installed on cloud
 - [ ] Larger vocab (4096/8192)
 - [ ] Real 8xH100 SXM submission run (RunPod)
 
-## Competition State (as of 2026-03-21)
+## Competition State (as of 2026-03-21, updated with research agent intel)
 
 **Merged SOTA**: 1.1428 BPB (thwu1 — 10L, mixed int5/int6, BigramHash(10240), SWA, Muon WD)
-**Best pending**: 1.1303 BPB (PR #254 — TTT + full meta stack, 3-seed validated)
+**Best pending**: 1.1271 BPB (PR #287 — jfprincz, 11L, XSA(4), EMA(0.997), WD=0.04, FA3, 3-seed)
+**Best TTT pending**: 1.1354 BPB (PR #290 — XSA + TTT + BatchOpt + RoPE 50K)
 **Paid prefix banned**: Organizers ruled it out-of-scope
 
 ### The Meta Stack (every top submission uses all of these)
 - 11L×512d, MLP 3x, GQA, SmearGate + BigramHash, OrthoInit
 - Int6 (or mixed int5/int6) + zstd-22 + FP16 embedding
-- Muon WD 0.03-0.04, SWA, sliding window stride=64, FA3
+- Muon WD 0.04, SWA or EMA, sliding window stride=64, FA3
+- QAT always-on (late QAT confirmed worse by PR #76 and our testing)
 
 ### Frontier Differentiators (what separates top from pack)
-- **TTT (full-weight SGD)** — ~0.01 BPB eval-time gain (PR #254)
-- **XSA (last 3 layers)** — ~0.002 BPB, zero params (PR #265)
-- **Mixed int5/int6** — int5 MLP + int6 attn, fits more layers (merged SOTA)
-- **BigramHash(10240)** — larger hash table (merged SOTA)
-- **Depth recurrence** — 5 unique blocks looped for 11 effective depth (PR #268, pending)
-- **EMA weight averaging** — untapped by most submissions (PR #274)
+- **XSA (last 4 layers)** — ~0.002-0.005 BPB, zero params (PR #265, #287)
+- **EMA (decay=0.997)** — replaces SWA, smoother averaging (PR #287, needs 7000+ steps)
+- **TTT (full-model SGD, freeze first 2 blocks)** — ~0.01 BPB eval gain (PR #254, #290)
+- **Mixed int5/int6** — int5 MLP + int6 attn, saves 1.86MB for more capacity (merged SOTA)
+- **RoPE base 50K** — extended positional range (PR #290, confirmed by our testing)
+- **Batch 524K** — 22% more gradient updates vs 786K (PR #236)
+- **BigramHash(10240)** — larger hash (merged SOTA, confirmed better than 2048 by our testing)
 
 ## Cloud Experiment Plan
 
-**Budget**: ~$10 Modal remaining, considering Latitude/ThunderCompute for dedicated GPU.
+**Current GPU**: Thunder Compute H100 PCIe at 69.19.136.6:32581
+**Launch prefix**: `RANK=0 LOCAL_RANK=0 WORLD_SIZE=1 MASTER_ADDR=127.0.0.1 MASTER_PORT=29501`
 
-**Run queue** (ordered):
+### Next algorithmic experiments (transferable, on proxy)
 
-**Platform**: Thunder Compute A100 production ($1.79/hr). Final submission on RunPod 8xH100 SXM.
-**Launch**: `RANK=0 LOCAL_RANK=0 WORLD_SIZE=1 MASTER_ADDR=127.0.0.1 MASTER_PORT=29501`
-
-### 1. Full-stack 5-min baseline with XSA + BigramHash(10240)
+#### 1. Int5 MLP + extra layer (12L instead of 11L)
 ```bash
-RUN_ID=xsa_bigram10k_5m NUM_LAYERS=11 EVAL_STRIDE=64 \
-QUANT_PRESET=front3_back1_8_middle6 TTT_ENABLED=0 SWA_EVERY=50 \
-MAX_WALLCLOCK_SECONDS=300 python3 sota_train_gpt.py
+RUN_ID=algo_int5_12L NUM_LAYERS=12 INT5_MLP_ENABLED=1 \
+EVAL_STRIDE=64 MUON_WD=0.04 ADAM_WD=0.04 XSA_LAST_N=4 ROPE_BASE=50000 \
+MAX_WALLCLOCK_SECONDS=180 python3 sota_train_gpt.py
 ```
 
-### 2. Depth recurrence: 5 blocks × 3 loops = 15 virtual layers
+#### 2. PPM-C context mixing (requires implementation)
+- Implement classical PPM-C model alongside neural model
+- Blend probabilities at eval time
+
+#### 3. Entropy-regularized QAT
 ```bash
-RUN_ID=recur_5x3_lora8 NUM_LAYERS=5 NUM_RECURRENCE=3 LORA_RANK=8 \
-EVAL_STRIDE=64 QUANT_PRESET=front3_back1_8_middle6 SWA_EVERY=50 \
-MAX_WALLCLOCK_SECONDS=300 python3 sota_train_gpt.py
+# Add L_entropy = -lambda * sum(softmax(w/T) * log(softmax(w/T))) to loss
+# Clusters weights for better zstd compression
 ```
 
-### 3. Late QAT (70% activation) vs always-on
+#### 4. Seq curriculum with dynamic compile
 ```bash
-RUN_ID=lateqat_70_5m NUM_LAYERS=11 QAT_START_FRAC=0.7 \
-EVAL_STRIDE=64 QUANT_PRESET=front3_back1_8_middle6 SWA_EVERY=50 \
-MAX_WALLCLOCK_SECONDS=300 python3 sota_train_gpt.py
+RUN_ID=algo_seqcurr_dynamic COMPILE_MODE=reduce-overhead \
+SEQ_CURRICULUM_ENABLED=1 SEQ_CURRICULUM_START=512 \
+# Needs code change: torch.compile(dynamic=True)
 ```
 
-### 4. TTT on properly trained model (10-min train first)
+### Final submission pipeline (RunPod 8xH100 SXM)
 ```bash
-RUN_ID=ttt_tuned_10m NUM_LAYERS=11 EVAL_STRIDE=64 \
-QUANT_PRESET=front3_back1_8_middle6 TTT_ENABLED=1 TTT_LR=3e-4 \
-TTT_MAX_SECONDS=200 SWA_EVERY=50 MAX_WALLCLOCK_SECONDS=600 \
-python3 sota_train_gpt.py
-```
-
-### 5. Final submission (RunPod 8xH100 SXM)
-```bash
+# Best SOTA config with all confirmed improvements:
+NUM_LAYERS=11 MUON_WD=0.04 ADAM_WD=0.04 XSA_LAST_N=4 \
+ROPE_BASE=50000 EVAL_STRIDE=64 \
+QUANT_PRESET=front2_back1_8_middle6 \
+MAX_WALLCLOCK_SECONDS=600 \
 torchrun --standalone --nproc_per_node=8 sota_train_gpt.py
-# Best config from experiments above
 ```
