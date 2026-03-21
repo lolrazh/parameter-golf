@@ -654,8 +654,23 @@ def eval_val_sliding_window(
             else:
                 score_mask = None
 
+            # Stride-OGD: add learned bias to logits before scoring
+            if ogd_bias is not None:
+                scored_logits = scored_logits + ogd_bias[None, :]
+
             # Compute per-token loss
             per_token_loss = F.cross_entropy(scored_logits.float(), targets, reduction="none")  # [B*stride]
+
+            # Stride-OGD: update bias with exact gradient (no backprop needed)
+            # grad = mean(softmax(logits) - one_hot(target)) over this batch
+            if ogd_bias is not None:
+                with torch.no_grad():
+                    probs = F.softmax(scored_logits.float(), dim=-1)  # [B*stride, V]
+                    one_hot = torch.zeros_like(probs)
+                    one_hot.scatter_(1, targets.unsqueeze(1), 1.0)
+                    grad = (probs - one_hot).mean(dim=0)  # [V]
+                    ogd_momentum_buf.mul_(STRIDE_OGD_MOMENTUM).add_(grad)
+                    ogd_bias.sub_(ogd_momentum_buf, alpha=STRIDE_OGD_LR)
 
             if score_mask is not None:
                 per_token_loss = per_token_loss * score_mask.float()
