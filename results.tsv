@@ -43,3 +43,4 @@ algo_006	1323	1.3862	1.3666	10511113	136.15	2026-03-21T04:00:00	ALGO: sliding wi
 algo_007	646	1.4322	1.4535	11969210	278.89	2026-03-21T04:30:00	ALGO: int5 MLP + 12L, artifact 12MB (fits!), needs 8xH100 to validate
 algo_008	1414	nan	nan	91040	127.35	2026-03-21T04:40:00	ALGO: batched Muon + CUDA graph, NaN (double-update bug during capture)
 algo_010	1356	1.3861	1.3895	10735362	132.81	2026-03-21T05:00:00	ALGO: batched Muon NO graph, works! 133ms vs 136ms baseline, +33 steps
+algo_013	1359	1.3845	1.3881	10533044	132.48	2026-03-21T05:30:00	ALGO: preset-aligned QAT, -0.0014 BPB! STE matches export quant levels
