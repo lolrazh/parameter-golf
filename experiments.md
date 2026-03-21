@@ -146,7 +146,15 @@ Key negative results: EMA hurt (r20: quant gap 0.155), high momentum hurt (r15),
 | a11 | algo_011 | + Partial RoPE 16/64 + LN Scale + EMA + fused QKV | 6 | 1291 | 140 | 1.3974 | 1.4276 | 1.4039 | +0.030 | WORSE at 6L: new features hurt shallow models |
 | v2-9L | fullstack_v2 | Same as a11 but 9L | 9 | 872 | 206 | 1.4313 | 1.4975 | — | +0.066 | WORSE: too few steps for 9L on proxy |
 | **v2-6L-10m** | **tenmin_6L_control_v2** | **ralph_030 recipe, 10 min** | **6** | **4537** | **132** | **1.3019** | **1.3077** | **1.2851** | **+0.006** | **BEST: 1.2851 sliding on 1xH100 PCIe** |
-| v2-11L-10m | tenmin_11L_fullstack_v2 | Partial RoPE + LN Scale + EMA, 10 min | 11 | ~2900 | ~206 | — | — | — | — | RUNNING |
+| v2-11L-10m | tenmin_11L_fullstack_v2 | Partial RoPE + LN Scale + EMA, 10 min | 11 | 2378 | 252 | 1.3278 | 1.3382 | 1.3141 | +0.010 | 6L wins by 0.029 BPB — not enough steps for 11L depth to help on 1xPCIe |
+
+**Big swing experiments (1xH100 PCIe Thunder, 5 min)**
+
+| # | Run ID | Experiment | layers | steps | step_ms | prequant BPB | postquant BPB | sliding BPB | artifact MB | verdict |
+|---|--------|-----------|--------|-------|---------|--------------|---------------|-------------|-------------|---------|
+| moe | moe_6L_5m | MoE 4 experts × 384 hidden, top-2 routing | 6 | — | — | — | — | — | — | CRASHED: DDP unused params (need find_unused_parameters=True) |
+| **vocab** | **vocab4096_6L_5m** | **sp4096 tokenizer, int8 embed, 3.34 bytes/tok** | **6** | **2169** | **138** | **1.3178** | **1.3219** | **1.3054** | **11.7** | **BIG WIN: 1.3054 in 5 min vs sp1024's 1.2851 in 10 min. Half the time, similar BPB. 4.3MB headroom.** |
+| ens | ensemble_test | Two models (6L+4L) in one artifact | — | — | — | — | — | — | — | CRASHED: OOM — two compiled models exceed 80GB |
 | a14 | algo_014 | Token-class calibration (Branch D1) | 1.3891 | — | +0.000 | No effect: per-class temps cancel in aggregate BPB |
 | a15 | algo_015 | Neural cache eval (Branch C3) | 🔄 | — | — | RUNNING on GPU |
 

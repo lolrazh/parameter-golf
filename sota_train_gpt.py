@@ -86,7 +86,7 @@ class Hyperparameters:
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale_enabled = bool(int(os.environ.get("LN_SCALE_ENABLED", "1")))
     # Settled constants (not configurable).
-    vocab_size = 1024
+    vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     tie_embeddings = True
     logit_softcap = 30.0
     qk_gain_init = 1.5
