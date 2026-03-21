@@ -171,7 +171,7 @@ def batched_newton_schulz(G_batch: Tensor, steps: int = 5, eps: float = 1e-7) ->
 _zeropower_orig = zeropower_via_newtonschulz5
 _batched_ns_orig = batched_newton_schulz
 
-MUON_USE_CUDA_GRAPH = bool(int(os.environ.get("MUON_USE_CUDA_GRAPH", "1")))
+MUON_USE_CUDA_GRAPH = bool(int(os.environ.get("MUON_USE_CUDA_GRAPH", "0")))
 
 
 class Muon(torch.optim.Optimizer):
