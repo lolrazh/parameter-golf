@@ -132,6 +132,7 @@ Key negative results: EMA hurt (r20: quant gap 0.155), high momentum hurt (r15),
 | a04 | algo_004 | Low-rank Q (512→192→512) | 1.3915 | — | +0.002 | Neutral: QAT overhead > matmul savings |
 | a05 | algo_005 | Seq curriculum (no compile) | 1.5219 | — | +0.133 | FAILED: compile essential for speed |
 | a06 | algo_006 | Sliding window eval (stride=64) | 1.3887 | 1.3666 | -0.022 | FREE WIN: competition metric |
+| a07 | algo_007 | Int5 MLP + 12L (extra depth from int5 savings) | 1.4535 | — | +0.064 | Artifact 12MB (fits!), needs 8xH100 to validate (proxy undertrained at 646 steps) |
 
 **Width ceiling search (local M4, 3× LR baseline = 6L×640d @ 3.9868)**
 
