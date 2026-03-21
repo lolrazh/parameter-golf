@@ -36,7 +36,7 @@ User wanted to beat SOTA (1.1248 BPB) in the parameter-golf competition. Session
 ### Big Swing Research (3 parallel agents)
 - ✅ **MoE experiment** — `experiment_moe.py` (1052 lines). 4 experts × 384 hidden = param-neutral to current 1×1536 MLP. Top-2 routing, Switch Transformer load balancing.
 - ✅ **Ensemble experiment** — `experiment_ensemble.py` (823 lines). Two smaller models (6L+4L) in one 16MB artifact. Geometric mean blending. Alpha sweep.
-- ⚠️ **Vocab 8192 experiment** — Agent still running. But analysis shows 8192 vocab eats too much artifact (8MB on embeddings alone). Likely dead idea. User killed it.
+- ✅ **Vocab 4096 experiment** — `experiment_vocab4096.py`. 8192 is dead (too big) but 4096 is the sweet spot: 35% more bytes/token, fits 11L in ~14MB with int8 embed. Pre-built data from `sproos/parameter-golf-tokenizers`. sp4096 data downloading on GPU machine. One-line change to un-hardcode `vocab_size` in sota_train_gpt.py.
 
 ### Validation Runs (in progress)
 - 🔄 **10-min 6L control** — ralph_030 recipe at 10-min budget. Running now.
@@ -89,7 +89,8 @@ Block.forward:  if self.ln_scale != 1.0: x = x * self.ln_scale
 - **Partial RoPE and LN Scale hurt at 6 layers.** algo_011 (6L + new features) was WORSE than ralph_030 (6L baseline). Pre-quant 1.3974 vs 1.3861. These features need depth (11L+) to shine — they reduce per-layer capacity in exchange for better signal routing that only deep models can exploit.
 - **TTT conflicts with XSA+EMA.** PR #303 proved stacking them is 0.016 BPB worse. Choose one path. PR #315 (XSA+EMA, no TTT) beats PR #254 (TTT, no XSA).
 - **Late QAT threshold matters.** Our test at 70% found "always-on better." PR #315 uses lr_scale < 0.1 (final ~4% of training). Very different thresholds, possibly different conclusions. Worth retesting.
-- **8192 vocab is a trap.** Embedding table eats 8MB+ of 16MB artifact budget. PR #293 only got 1.2827. Dead idea.
+- **8192 vocab is a trap.** Embedding table eats 8MB+ of 16MB artifact budget at fp16. Dead idea.
+- **4096 vocab is the sweet spot.** 3.34 bytes/token (vs 2.47 for sp1024) = 35% more BPB "credit" per prediction. At int8 embedding (not fp16), 11L+sp4096 fits in ~14MB with 2MB headroom. Pre-built tokenizer + data available from `sproos/parameter-golf-tokenizers` on HuggingFace. sp4096 data downloading on GPU machine.
 - **Refactoring before runs is risky.** The debloat broke SmearGate and cost a wasted 10-min run. Do refactors AFTER validation.
 - **EMA needs thousands of steps.** At 0.997 decay, effective window is ~333 steps. At 1291 steps (3-min proxy), initial weights are 2% of average — barely converged. At 13,000 steps (competition), initial weights are 0% — clean signal.
 - **Proxy hardware cannot validate depth-dependent features.** 6L wins on 1xH100/3min because more steps > more depth at short budget. 11L only wins when you have enough steps for depth to help (8xH100/10min).
