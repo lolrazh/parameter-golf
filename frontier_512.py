@@ -32,7 +32,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 try:
     from flash_attn_interface import flash_attn_func as flash_attn_3_func
-    HAS_FA3 = True
+    HAS_FA3 = not bool(int(os.environ.get("FORCE_SDPA", "0")))
 except ImportError:
     HAS_FA3 = False
     flash_attn_3_func = None
