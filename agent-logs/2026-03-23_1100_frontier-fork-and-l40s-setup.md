@@ -16,7 +16,11 @@ Shift from incremental technique-stacking to a frontier-fork approach: use PR #5
 - ✅ **Head-to-head comparison: PROTEUS vs s3** — 10 min each, same hardware
 - ✅ **Cleaned up repo** — removed 27+ old experimental scripts, committed
 - ✅ **Updated NOTES.plan** — hardened frontier checklist with DeltaNet context
-- ⚠️ **PROTEUS checkpoint deleted by mistake** — retraining in progress (~10 min)
+- ✅ **PROTEUS checkpoint retrained** — deleted by mistake, retrained, saved properly
+- ✅ **Both checkpoints downloaded locally** — safe from spot preemption
+- ✅ **Standalone run_ttt.py script** — loads exported checkpoint, runs LoRA TTT, reports BPB
+- ✅ **PROTEUS TTT calibration** — post-TTT BPB: 1.2870 (TTT gain: -0.115)
+- 🔄 **s3 TTT running** — in progress on L40S
 
 ## Baseline Results (L40S, 1xGPU, 10 min, 131K batch)
 
@@ -31,6 +35,22 @@ Shift from incremental technique-stacking to a frontier-fork approach: use PR #5
 | Params | 26.8M | 26.0M | s3 |
 
 Key finding: s3 (10L sp4096) beats PROTEUS (11L sp1024) by 0.034 BPB post-quant. sp4096's 35% more bytes/token advantage is real and transfers to proxy hardware.
+
+## TTT Calibration Results (L40S, LoRA rank-8, 2 epochs per doc)
+
+| Metric | PROTEUS 11L sp1024 | s3 10L sp4096 |
+|---|---|---|
+| Post-quant BPB | 1.4022 | 1.3626 |
+| **Post-TTT BPB** | **1.2870** | 🔄 running |
+| **TTT gain** | **-0.1151** | 🔄 running |
+| TTT time | 1846s (31 min) | ~20 min est |
+| Short/long docs | 31585 / 18415 | 37673 / 12327 |
+
+Notes:
+- TTT takes ~31 min on 1xL40S vs ~6 min on 8xH100 (8× parallelism + 3.9× bandwidth)
+- PROTEUS on 8xH100 gets -0.224 BPB TTT gain. L40S proxy sees -0.115 (~half) because model trained ~1900 steps vs ~7000
+- sp4096 has fewer long docs (12K vs 18K) because tokens cover more bytes → documents are shorter in token space
+- Spot preemption killed the first TTT attempt at batch 1135/1151. Restarted on same pod, completed second time.
 
 ## L40S Hardware Profile
 
