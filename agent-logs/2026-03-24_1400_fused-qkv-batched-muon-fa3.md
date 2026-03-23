@@ -94,14 +94,65 @@ BATCH_MUON=0  # Disable batched Muon (use per-param Newton-Schulz)
 - 🔧 **GPU smoke test needed** — Changes are CUDA-only, can't verify locally on M4
 - 🔧 **8xH100 submission run** — Full s3 config: 10L sp4096, 786K batch, FA3, warmdown=2000, 3ep TTT
 
+## GPU Benchmark Results (1xH100 PCIe, Thunder Compute)
+
+Tested all optimizations on 10L sp1024, 131K batch, 30 steps:
+
+| Run | Config | Stable step_ms | Step avg | Speedup |
+|---|---|---|---|---|
+| Baseline | Separate QKV + Unbatched Muon + SDPA | ~187ms | 189.4ms | — |
+| Optimized | Fused QKV + Batched Muon + SDPA | ~170ms | 172.6ms | 9.0% |
+| **Full** | **Fused QKV + Batched Muon + FA3** | **~153ms** | **154.3ms** | **18.5%** |
+
+- All runs trained correctly (loss decreasing, no NaN)
+- FA3 now FASTER than SDPA on 1xH100 (previously slower with old separate-QKV code)
+- Memory dropped with FA3: 3815→3669 MiB (FA3 more memory efficient)
+- Extrapolated 8xH100: 85ms * 0.815 = ~69ms/step → ~8,695 steps in 10 min (vs SOTA's ~8,945)
+
+## Hyperparameter Analysis (1xGPU vs 8xGPU)
+
+**No LR changes needed.** frontier_512.py defaults already match SOTA/8xH100 values:
+- `MATRIX_LR=0.02` (old sota_train_gpt.py used 0.04)
+- `MUON_MOMENTUM=0.99` (old used 0.95)
+- `TRAIN_BATCH_TOKENS=786,432` (correct for 8xH100)
+- `grad_accum_steps = 8 // world_size` → 1 on 8xH100 (no accumulation)
+
+Only need to override: NUM_LAYERS, VOCAB_SIZE, data paths, WARMDOWN_ITERS, TTT_EPOCHS, TTT_MIN_DOC_LEN.
+
 ## Submission Run Config (Ready to Execute)
+
+### Pod setup (~3 min)
 ```bash
-# 8xH100 SXM submission run
-torchrun --standalone --nproc_per_node=8 frontier_512.py
-# Env vars: NUM_LAYERS=10 VOCAB_SIZE=4096 TRAIN_BATCH_TOKENS=786432
-# WARMDOWN_ITERS=2000 MAX_WALLCLOCK_SECONDS=600
-# TTT_EPOCHS=3 TTT_MIN_DOC_LEN=256
+git clone https://github.com/lolrazh/parameter-golf.git && cd parameter-golf
+pip install --break-system-packages flash_attn_3 \
+  --find-links https://windreamer.github.io/flash-attention3-wheels/cu128_torch291 \
+  zstandard sentencepiece huggingface_hub
+python3 data/cached_challenge_fineweb.py --variant sp4096 --train-shards 80
 ```
+
+### Training + TTT eval
+```bash
+NUM_LAYERS=10 VOCAB_SIZE=4096 \
+DATA_PATH=./data/datasets/fineweb10B_sp4096 \
+TOKENIZER_PATH=./data/tokenizers/fineweb_4096_bpe.model \
+WARMDOWN_ITERS=2000 TTT_EPOCHS=3 TTT_MIN_DOC_LEN=256 \
+torchrun --standalone --nproc_per_node=8 frontier_512.py
+```
+
+### What uses defaults (already correct)
+- TRAIN_BATCH_TOKENS=786432, MATRIX_LR=0.02, MUON_MOMENTUM=0.99
+- FUSE_QKV=1, BATCH_MUON=1, FA3=auto
+- MAX_WALLCLOCK_SECONDS=600, ITERATIONS=20000
+- TTT_LORA_RANK=8, TTT_LORA_LR=0.01, TTT_CHUNK_SIZE=256
+
+## TTT Legitimacy Validation
+
+Confirmed our TTT is **Case 3** (per-document, independent) per GitHub issue #402:
+- LoRA reset per document (`lora.reset()` + `_reset_ttt_optimizer()`)
+- Score-then-train per chunk within each document
+- No cross-document information leakage
+- DDP parallelism across documents (efficiency only)
+- Organizer (@0hq) approved even the more permissive Case 2 (token-stream)
 
 ## s2/s3 Run Summary (For Reference)
 
@@ -114,4 +165,4 @@ torchrun --standalone --nproc_per_node=8 frontier_512.py
 | PROTEUS 11L (L40S) | 11L sp4096, frontier_512.py | **1.0984** post-TTT | 12.5 MB | Best proxy result (0.0027 from s3, possibly noise) |
 
 ## Context for Future
-The frontier_512.py script now has all performance optimizations from sota_train_gpt.py (fused QKV, batched Muon) plus FA3 support and TTT — making it the single script for the SOTA submission attempt. The estimated speedup is ~12.6% more steps in 10 minutes. Combined with sp4096's tokenizer advantage and 3-epoch TTT, the projected post-TTT BPB should comfortably beat SOTA (1.1428). The next step is a GPU smoke test followed by the full 8xH100 run. SOTA is 1.1428 BPB — s2 was already 1.1484 without TTT or the new optimizations. With everything together, we should crush it.
+frontier_512.py is now the single script for the SOTA submission: fused QKV + batched Muon + FA3 + SmearGate + BigramHash + TTT, all validated on 1xH100 with 18.5% step time improvement. On 8xH100 with 786K batch, estimated ~69ms/step → ~8,695 steps in 10 min. Combined with sp4096 tokenizer advantage and 3-epoch per-document TTT (validated as Case 3 / legitimate), the projected post-TTT BPB should beat SOTA (1.1428). Previous s2 was already 1.1484 without TTT or our new optimizations — with everything together, we should crush it.
