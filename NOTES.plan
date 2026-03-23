@@ -19,16 +19,70 @@ Newey found downforce in the underfloor while everyone polished
 the bodywork. We find BPB in the eval budget while everyone
 polishes the training loop.
 
+DEPENDENCY GRAPH
+
+BPB = prediction_quality × tokenizer_efficiency  (MULTIPLICATIVE)
+
+prediction_quality
+├── model_knowledge (weights after training)
+│   ├── architecture_efficiency ← FREE VARIABLE (highest leverage)
+│   ├── tokens_seen = 600s / step_latency × batch_tokens
+│   │   └── step_latency ← DERIVED from architecture + hardware bandwidth
+│   ├── learning_per_token ← near-optimal (Muon, 100+ PRs)
+│   └── loss_function ← UNDEREXPLORED (everyone uses standard CE)
+├── quant_gap ← DERIVED from architecture's weight distribution
+└── eval_adaptation
+    ├── TTT_delta ← DERIVED from architecture's loss landscape geometry
+    ├── neural_cache (non-parametric, zero grad, stacks with TTT)
+    └── stride-OGD (already implemented)
+
+tokenizer_efficiency ← FREE VARIABLE (sp4096 = 1.35× multiplier)
+
+Architecture is the single free variable that feeds the MOST derived
+variables: raw capacity, quant gap, TTT delta, step latency, artifact
+size. This is why architecture search is highest leverage.
+
+NOVEL INTERVENTIONS (each attacks a different node)
+
+1. Multi-Token Prediction (loss_function node)
+   Train with 2 heads: predict t+1 AND t+2. Discard head 2 at eval.
+   Zero artifact cost. <5% training overhead. Better representations.
+   Forces backbone to encode structure, not just local patterns.
+   ~20 lines of code. Free lunch.
+
+2. Depth Recurrence (architecture_efficiency node)
+   Store 6 blocks, loop 2x = 12 effective layers.
+   Reinvest savings: 640d + MLP 4x. Per-loop LoRA for specialization.
+   PR #499 "Frugendorff" validates at 1.1478 BPB (no TTT!).
+   TTT compound: adapting 6 shared blocks = 2x leverage per param
+   (each adapted weight used twice in forward pass).
+
+3. Neural Cache (eval_adaptation node, orthogonal to TTT)
+   Cache (hidden_state, next_token) during eval. Similarity lookup.
+   p(y|x) = (1-λ)*p_model + λ*p_cache
+   Zero params, zero gradients, captures local repetition.
+   Literature: ~10% perplexity gain. Stacks with TTT.
+
+4. Online TTT / Dynamic Eval (eval_adaptation node)
+   Adapt per-window during sliding eval. Single-pass, causal.
+   DeepMind 2024: middle layers most effective to adapt.
+   Different from batch TTT — more document-specific.
+
+DEAD ENDS (researched, ruled out)
+- SAM: 2x compute overhead, disqualifying in 10-min race.
+  EMA/SWA gets similar flat-minima benefits for free.
+- kNN-LM: 400GB datastore. Completely infeasible for 16MB artifact.
+- Full MTP beyond k=2: diminishing returns, not worth overhead.
+
 MOVES
 
 1. Get AdamW TTT into train_gpt.py. Can't race without an engine.
-2. GEPA-style search on L40S ($0.26/hr). Metric = TTT DELTA.
-   Not "best raw BPB" but "most adaptable architecture."
-3. sp4096 x TTT compound. 35% more bytes/token = 1.35x multiplier
-   on every per-token TTT gain. Nobody has tested this.
-4. Budget split: what if 7min train + 3min pre-adapt? Use late
-   training time for SAM/MAML/LoRA-init instead of more SGD.
-5. Final 8xH100 submission with winning recipe.
+2. Add MTP (k=2) to training. Free lunch, ~20 lines.
+3. GEPA-style search on L40S ($0.26/hr). Metric = TTT DELTA.
+   Search space includes depth recurrence as an architecture axis.
+4. sp4096 x winner compound. 1.35x multiplier on all gains.
+5. Add neural cache to eval pipeline. Stacks with TTT for free.
+6. Final 8xH100 submission with winning recipe.
 
 RULES
 
@@ -80,22 +134,24 @@ Establish baselines. Answer: what's our TTT delta? Does sp4096 amplify it?
 
 Decision gate: if sp4096 TTT delta > sp1024, lock in sp4096 for later waves.
 
---- Wave 2: Architecture families (6 runs, ~$0.50) ---
+--- Wave 2: Architecture families (8 runs, ~$0.65) ---
 
-All 11L sp1024 (controlled). Vary one architecture axis per run.
+All sp1024 (controlled). Vary one architecture axis per run.
+Every run includes MTP k=2 (free lunch, always on after Wave 1).
 Measure adaptation_uplift + full diagnostics for each.
 
-  E: +SwiGLU (replace relu^2 with silu(x)*linear(x))
-  F: +learned sigmoid gating on U-Net skips
-     gate = sigmoid(skip_gates[i])
-     x = gate*x + (1-gate)*(skip_weights[i]*skip)
-  G: +Value Residual (cache V from layer 0, blend into all layers)
-  H: +SwiGLU + learned gating combined (PR #462 recipe)
-  I: +Gated Attention (per-head sigmoid gate on attn output)
-  J: +full MHA (8 KV heads, no GQA)
+  E: 11L + SwiGLU (replace relu^2)
+  F: 11L + learned sigmoid gating on U-Net skips
+  G: 11L + Value Residual (cache V from layer 0, blend all layers)
+  H: 11L + SwiGLU + learned gating combined (PR #462 recipe)
+  I: 11L + Gated Attention (per-head sigmoid gate)
+  J: 6Lx2 recurrence, 640d, MLP 4x, per-loop LoRA (Frugendorff-style)
+  K: 6Lx2 recurrence + SwiGLU
+  L: 6Lx2 recurrence + SwiGLU + learned gating
 
 Rank all by adaptation_uplift. The winner isn't the best raw BPB.
 It's the biggest TTT delta.
+The recurrence runs (J-L) test the 2x TTT leverage hypothesis.
 
 --- Wave 3: Compound (3-4 runs, ~$0.30) ---
 
@@ -111,13 +167,20 @@ Apply winning architecture family to sp4096 tokenizer.
 Measure compound: does tokenizer multiplier stack with arch amplifier?
 If yes, this is our submission recipe.
 
---- Wave 5: 8xH100 (1-2 runs, ~$7) ---
+--- Wave 5: Eval stack (2-3 runs, ~$0.20) ---
+
+On winning architecture from Wave 3/4:
+  M: +neural cache (interpolation weight λ sweep: 0.05, 0.1, 0.2)
+  N: +online TTT per-window (middle layers only, per DeepMind 2024)
+  O: neural cache + batch TTT together (do they stack?)
+
+--- Wave 6: 8xH100 (1-2 runs, ~$7) ---
 
 Full 10-min train. Real batch (786K), real FA3, real DDP.
 Tune warmdown/LR HERE, not before.
-LoRA TTT 30ep (PROTEUS-style) in remaining eval budget.
+Full eval stack: LoRA TTT + neural cache + stride-OGD.
 
-Total: ~$5 research + ~$7 submission = ~$12
+Total: ~$6 research + ~$7 submission = ~$13
 
 TTT RECIPE (from PR #462, our starting point)
 
@@ -144,12 +207,41 @@ GEPA LOOP (manual, Claude as reflection LM)
 Each cycle: one L40S run (~15 min) + 5 min analysis = 20 min.
 3 cycles/hr. 15 cycles in an afternoon = $2.
 
+THE NOVEL STACK (our bet)
+
+  depth recurrence (6x2) + MTP (k=2) + sp4096 + AdamW TTT + neural cache
+
+Each component attacks a different node in the dependency graph.
+They don't compete — they compound:
+  recurrence → artifact-efficient depth + 2x TTT leverage
+  MTP → better representations → smoother landscape → more TTT gain
+  sp4096 → 1.35x multiplier on every per-token improvement
+  TTT → eval-time adaptation (amplified by recurrence)
+  neural cache → non-parametric local patterns (stacks with TTT)
+
+Nobody has combined these. This is our differentiated play.
+
+PARAMETRIC VS NON-PARAMETRIC MEMORY
+
+Model = 15M params × ~2.6 bits (int6) ≈ 40M bits of storage.
+FineWeb val = ~620M bits of entropy. Model is 15x too small to memorize.
+It MUST generalize.
+
+TTT = parametric memorization (gradient-based, lossy, into weights).
+Neural cache = non-parametric memorization (exact lookup, local, zero cost).
+Stride-OGD = lightweight parametric (vocab bias vector only).
+These address different failure modes and stack additively.
+
 THINGS TO REMEMBER
 
 - We're not forking PROTEUS or PR #462. We're finding our own underfloor.
 - sp4096 is our unique angle. Nobody else has submitted it + TTT.
 - The architecture that trains best is NOT the architecture that adapts best.
-- Flat minima = good TTT. SwiGLU and learned gating may create them.
-- MAML (move 4) is high-risk: train to minimize post-TTT loss.
-  Needs second-order grads or FOMAML approximation. Expensive.
-  Only attempt after Waves 1-4 validate the direction.
+- Flat minima = good TTT. EMA/SWA for free, SwiGLU and learned gating help.
+- Depth recurrence: PR #499 validates at 1.1478 BPB. TTT on shared
+  weights is 2x leverage — completely unexplored compound.
+- MTP k=2: zero artifact cost, <5% overhead, better representations.
+  Always-on after validation. Free lunch.
+- Neural cache: zero params, zero grads, ~10% perplexity in literature.
+  Captures exactly what the model can't: local repetition patterns.
+- MAML is high-risk: only after Waves 1-4 validate the direction.
