@@ -30,6 +30,16 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+try:
+    from flash_attn_interface import flash_attn_func as flash_attn_3_func
+    HAS_FA3 = True
+except ImportError:
+    HAS_FA3 = False
+    flash_attn_3_func = None
+
+FUSE_QKV = bool(int(os.environ.get("FUSE_QKV", "1")))
+BATCH_MUON = bool(int(os.environ.get("BATCH_MUON", "1")))
+
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
@@ -212,6 +222,47 @@ class Muon(torch.optim.Optimizer):
             p.add_(g, alpha=-lr)
             curr += p.numel()
 
+    def _unbatched_step(self, params, group):
+        lr = group["lr"]
+        momentum = group["momentum"]
+        backend_steps = group["backend_steps"]
+        nesterov = group["nesterov"]
+        wd = group.get("weight_decay", 0.0)
+
+        distributed = dist.is_available() and dist.is_initialized()
+        world_size = dist.get_world_size() if distributed else 1
+        rank = dist.get_rank() if distributed else 0
+
+        total_params = sum(int(p.numel()) for p in params)
+        updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
+
+        curr = 0
+        for i, p in enumerate(params):
+            if i % world_size == rank and p.grad is not None:
+                g = p.grad
+                state = self.state[p]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(g)
+                buf = state["momentum_buffer"]
+                buf.mul_(momentum).add_(g)
+                if nesterov:
+                    g = g.add(buf, alpha=momentum)
+                g = zeropower_via_newtonschulz5(g, steps=backend_steps)
+                g *= max(1, g.size(0) / g.size(1)) ** 0.5
+                updates_flat[curr : curr + p.numel()] = g.reshape(-1)
+            curr += p.numel()
+
+        if distributed:
+            dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+
+        curr = 0
+        for p in params:
+            if wd > 0:
+                p.data.mul_(1.0 - wd * lr)
+            g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
+            p.add_(g, alpha=-lr)
+            curr += p.numel()
+
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
@@ -222,7 +273,10 @@ class Muon(torch.optim.Optimizer):
             params = group["params"]
             if not params:
                 continue
-            self._batched_step(params, group)
+            if BATCH_MUON:
+                self._batched_step(params, group)
+            else:
+                self._unbatched_step(params, group)
         return loss
 
 def build_sentencepiece_luts(
@@ -559,8 +613,12 @@ class Rotary(nn.Module):
                 inv_freq = self.inv_freq.to(device)
             t = torch.arange(seq_len, device=device, dtype=inv_freq.dtype)
             freqs = torch.outer(t, inv_freq)
-            self._cos_cached = freqs.cos()[None, None, :, :]
-            self._sin_cached = freqs.sin()[None, None, :, :]
+            if HAS_FA3:
+                self._cos_cached = freqs.cos()[None, :, None, :]
+                self._sin_cached = freqs.sin()[None, :, None, :]
+            else:
+                self._cos_cached = freqs.cos()[None, None, :, :]
+                self._sin_cached = freqs.sin()[None, None, :, :]
             self._seq_len_cached = seq_len
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
@@ -582,7 +640,12 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         self.kv_dim = self.num_kv_heads * self.head_dim
-        self.c_qkv = CastedLinear(dim, dim + 2 * self.kv_dim, bias=False)
+        if FUSE_QKV:
+            self.c_qkv = CastedLinear(dim, dim + 2 * self.kv_dim, bias=False)
+        else:
+            self.c_q = CastedLinear(dim, dim, bias=False)
+            self.c_k = CastedLinear(dim, self.kv_dim, bias=False)
+            self.c_v = CastedLinear(dim, self.kv_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
@@ -590,23 +653,35 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: Tensor, q_delta=None, v_delta=None) -> Tensor:
         bsz, seqlen, dim = x.shape
-        qkv = self.c_qkv(x)
-        q = qkv[:, :, :dim] + (q_delta if q_delta is not None else 0)
-        k = qkv[:, :, dim:dim + self.kv_dim]
-        v = qkv[:, :, dim + self.kv_dim:] + (v_delta if v_delta is not None else 0)
-        q = q.reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        if FUSE_QKV:
+            qkv = self.c_qkv(x)
+            q = qkv[:, :, :dim] + (q_delta if q_delta is not None else 0)
+            k = qkv[:, :, dim:dim + self.kv_dim]
+            v = qkv[:, :, dim + self.kv_dim:] + (v_delta if v_delta is not None else 0)
+        else:
+            q = self.c_q(x) + (q_delta if q_delta is not None else 0)
+            k = self.c_k(x)
+            v = self.c_v(x) + (v_delta if v_delta is not None else 0)
+        q = q.reshape(bsz, seqlen, self.num_heads, self.head_dim)
+        k = k.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        if not HAS_FA3:
+            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=None, is_causal=True, enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
-        y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+        if HAS_FA3:
+            q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
+            y = flash_attn_3_func(q, k, v, causal=True)
+        else:
+            q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+            y = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=None, is_causal=True, enable_gqa=(self.num_kv_heads != self.num_heads),
+            )
+            y = y.transpose(1, 2).contiguous()
+        y = y.reshape(bsz, seqlen, dim)
         return self.proj(y)
 
 class SmearGate(nn.Module):
@@ -1210,6 +1285,7 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params} world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
+    log0(f"optimizations: fuse_qkv:{FUSE_QKV} batch_muon:{BATCH_MUON} fa3:{HAS_FA3}")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}")
     log0(f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} iterations:{args.iterations} warmup_steps:{args.warmup_steps} max_wallclock_seconds:{args.max_wallclock_seconds:.3f}")
