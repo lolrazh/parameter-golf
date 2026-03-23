@@ -237,6 +237,24 @@ For Phase 2, use VAL_TOKENS_LIMIT=1048576 so each TTT test takes ~15-20s instead
 - `/workspace/parameter-golf/data/datasets/fineweb10B_sp1024/` — 10 shards + val
 - `/workspace/parameter-golf/data/datasets/fineweb10B_sp4096/` — 10 shards + val
 
+## Final Three-Way Comparison (L40S, 2M val subset, 3ep + min_doc 256 TTT)
+
+| Config | Pre-quant | Post-quant | Post-TTT | TTT gain | Artifact |
+|---|---|---|---|---|---|
+| PROTEUS 11L sp1024 | 1.3455 | 1.3968 | (2ep only: 1.2870) | -0.110 | 10.1 MB |
+| s3 10L sp4096 | 1.3143 | 1.3626 | 1.1011 | -0.262 | 11.8 MB |
+| **PROTEUS 11L sp4096** | **1.3158** | **1.3741** | **1.0984** | **-0.276** | **12.5 MB** |
+
+Key findings:
+- sp4096 is the dominant factor: both sp4096 configs crush sp1024 by ~0.17+ BPB post-TTT
+- 11L slightly beats 10L post-TTT (1.0984 vs 1.1011) — extra depth helps marginally
+- PROTEUS 11L sp4096 gets the biggest TTT gain (-0.276) — more adaptable
+- 12.5 MB artifact leaves 3.5 MB headroom in the 16 MB budget
+- Winner: PROTEUS 11L sp4096
+
+Note: PROTEUS 11L sp4096 checkpoint was NOT downloaded before pod termination.
+Will need to retrain on next GPU session. s3 and PROTEUS sp1024 checkpoints are safe locally.
+
 ## Ready for Next Session
 - ✅ **s3 checkpoint saved** — frozen trunk for TTT experiments
 - ✅ **PROTEUS checkpoint retraining** — completed
@@ -244,6 +262,8 @@ For Phase 2, use VAL_TOKENS_LIMIT=1048576 so each TTT test takes ~15-20s instead
 - ✅ **Both tokenizer datasets on L40S** — sp1024 and sp4096 ready
 - ✅ **Fast TTT loop working** — 2M token val, ~2 min per variant
 - 🔄 **10-variant TTT sweep running** — results in ~20 min
+- ❌ **PROTEUS 11L sp4096 checkpoint lost** — pod terminated before download. Need to retrain (~10 min).
+- ✅ **Submission recipe identified** — PROTEUS 11L sp4096 + 3ep LoRA TTT + min_doc 256
 
 ## Context for Future
 The architecture race is commoditized — everyone converges on 11L/512d/GQA/SmearGate/BigramHash/relu²/MLP3x. The frontier is TTT pipeline engineering. PROTEUS gets 0.224 BPB from TTT alone. Our s3 trunk already beats PROTEUS pre-TTT by 0.034 BPB. The next step is replicating PROTEUS's TTT on our trunk, then sweeping TTT variants to find something better. A standalone TTT eval script is critical for fast iteration (~$0.03 per test vs ~$0.04 per full training run).

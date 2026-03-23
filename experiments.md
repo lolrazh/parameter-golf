@@ -204,6 +204,9 @@ Key negative results: EMA hurt (r20: quant gap 0.155), high momentum hurt (r15),
 |---|--------|--------|-------|---------|--------------|---------------|--------------|-------------|---------|
 | L40S-proteus | L40S_proteus | 11L sp1024, frontier_512.py | 1887 | 318 | 1.3455 | 1.3968 | 1.2870 | 10.1 | PROTEUS control on L40S |
 | L40S-s3 | L40S_s3 | 10L sp4096, frontier_512.py | 1988 | 302 | 1.3143 | 1.3626 | 1.2515 | 11.8 | s3 wins by 0.036 post-TTT |
+| L40S-11L-sp4096 | L40S_proteus_11L_sp4096 | 11L sp4096, frontier_512.py | 1847 | 325 | 1.3158 | 1.3741 | 1.0984 | 12.5 | WINNER — best post-TTT BPB, checkpoint LOST |
+| ttt-3ep-md256 | ttt_3ep_md256 | 3ep + min_doc 256, s3 checkpoint | — | — | — | — | 1.1011 | — | realistic 8xH100 config |
+| ttt-11L-3ep-md256 | ttt_11L_3ep_md256 | 3ep + min_doc 256, PROTEUS 11L sp4096 | — | — | — | — | 1.0984 | — | best TTT result |
 
 **TTT sweep (1xL40S, 2M token val subset, frozen s3 checkpoint)**
 
