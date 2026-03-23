@@ -79,17 +79,30 @@ SKIP_POSTQUANT_EVAL=1
 | # | Variant | BPB | vs v1 baseline | Time |
 |---|---------|-----|----------------|------|
 | v1 | baseline (r8, 2ep, const lr) | 1.2645 | — | 120s |
-| v2 | rank 4 | 1.2721 | +0.0077 (worse) | 121s |
-| v3 | rank 16 | 1.2687 | +0.0043 (worse) | 121s |
-| v4 | 5 epochs | **1.0331** | **-0.2314** | 277s |
-| v5 | 10 epochs | pending | | |
-| v6 | chunk 128 | pending | | |
-| v7 | chunk 512 | pending | | |
-| v8 | context 512 | pending | | |
-| v9 | min_doc 256 | pending | | |
-| v10 | min_doc 2048 | pending | | |
+| v2 | rank 4 | 1.2721 | +0.008 (worse) | 121s |
+| v3 | rank 16 | 1.2687 | +0.004 (worse) | 121s |
+| v4 | 5 epochs | **1.0331** | **-0.231** | 277s |
+| v5 | 10 epochs | **0.8386** | **-0.426** | 539s |
+| v6 | chunk 128 | 1.2610 | -0.003 | 222s |
+| v7 | chunk 512 | 1.2837 | +0.019 (worse) | 42s |
+| v8 | context 512 | 1.2641 | -0.000 | 45s |
+| v9 | min_doc 256 | **1.2394** | **-0.025** | 72s |
+| v10 | min_doc 2048 | 1.3028 | +0.038 (worse) | 60s |
 
-**Key finding so far**: Rank barely matters (r4/r8/r16 all within 0.008). Epochs is the dominant lever — 5ep gave -0.23 BPB over 2ep.
+**Epochs dominate everything.** 2→5ep = -0.231, 5→10ep = -0.195. Rank barely matters (r4/r8/r16 within 0.008). Chunk/context are noise. min_doc 256 gives a free -0.025 by adapting shorter docs. 10ep numbers likely overfit on 2M subset — cosine decay sweep running to test anti-overfitting.
+
+## Cosine Decay Sweep (in progress)
+
+Testing whether cosine LR decay prevents per-document overfitting at high epoch counts.
+Added `TTT_COSINE=1` env var to frontier_512.py — applies per-document cosine LR schedule.
+
+| # | Variant | BPB | vs v1 | Time |
+|---|---------|-----|-------|------|
+| c1 | 5ep + cosine | pending | | |
+| c2 | 10ep + cosine | pending | | |
+| c3 | 20ep + cosine | pending | | |
+| c4 | 10ep + cosine + min_doc 256 | pending | | |
+| c5 | 5ep + min_doc 256 (no cosine) | pending | | |
 
 **Skipped (H100-sensitive, don't transfer from proxy)**:
 - LR sweep (proxy LR ≠ 8xH100 LR)
