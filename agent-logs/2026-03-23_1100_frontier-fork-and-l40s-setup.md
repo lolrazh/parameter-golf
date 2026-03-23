@@ -98,11 +98,13 @@ Added `TTT_COSINE=1` env var to frontier_512.py — applies per-document cosine 
 
 | # | Variant | BPB | vs v1 | Time |
 |---|---------|-----|-------|------|
-| c1 | 5ep + cosine | pending | | |
-| c2 | 10ep + cosine | pending | | |
-| c3 | 20ep + cosine | pending | | |
-| c4 | 10ep + cosine + min_doc 256 | pending | | |
-| c5 | 5ep + min_doc 256 (no cosine) | pending | | |
+| c1 | 5ep + cosine | 1.3158 | +0.051 (worse) | 139s |
+| c2 | 10ep + cosine | 1.2934 | +0.029 (worse) | 260s |
+| c3 | 20ep + cosine | KILLED (spot preemption) | — | — |
+| c4 | 10ep + cosine + min_doc 256 | KILLED | — | — |
+| c5 | 5ep + min_doc 256 (no cosine) | KILLED | — | — |
+
+**Cosine decay hurts per-document LoRA TTT.** It's designed for global full-weight TTT (PR #517 style) where position memorization occurs after ~30 global epochs. Per-document LoRA with 2-10 epochs per doc doesn't have this problem. Constant LR wins by a large margin. Cosine sweep abandoned.
 
 **Skipped (H100-sensitive, don't transfer from proxy)**:
 - LR sweep (proxy LR ≠ 8xH100 LR)
@@ -116,6 +118,20 @@ Added `TTT_COSINE=1` env var to frontier_512.py — applies per-document cosine 
 4. Small val data at `data/datasets/fineweb10B_sp4096_small/`
 5. Run any variant with the common env vars above + specific TTT params
 6. Check sweep.log at `/workspace/sweep.log` for any in-progress results
+
+## Key Constraint: 10-min Eval Budget
+
+The competition allows 10 min training + 10 min eval on 8xH100.
+PROTEUS fits 2-epoch LoRA TTT in ~350s (~6 min) on 8xH100.
+3 epochs ≈ 525s (~8.75 min) — fits but tight.
+5 epochs ≈ 875s (~14.5 min) — does NOT fit.
+
+Our submission recipe: 3 epochs + min_doc 256 is the max that fits.
+
+Cost per 8xH100 submission: ~$7 (20 min at ~$21.52/hr on-demand).
+
+Artifact size does NOT grow with longer training — it's determined by
+architecture (param count) and quantization scheme, not training duration.
 
 ## L40S Hardware Profile
 
@@ -163,6 +179,8 @@ The cosine insight: constant LR overfits to eval token positions after ~30 epoch
    - **Fix:** Downloaded checkpoints locally for safety. Restarted pod, checkpoints persisted on /workspace/ volume.
 8. **run_ttt.py wastes time on redundant post-quant eval** — re-computes BPB we already know from training
    - **TODO:** Skip post-quant eval when the number is already known, or make it optional
+9. **Third spot preemption** — L40S spot died during 3ep+min_doc256 run at batch 100/102 and during cosine sweep at c3. Results partially captured from stdout but incomplete.
+   - **Lesson:** Always use nohup. Consider on-demand for critical runs.
 
 ## Key Learnings
 - **frontier_512.py works on L40S with ZERO code changes** — already uses SDPA, handles world_size=1, all config via env vars

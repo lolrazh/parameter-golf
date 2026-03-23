@@ -197,3 +197,27 @@ Key negative results: EMA hurt (r20: quant gap 0.155), high momentum hurt (r15),
 | 29 | lr_retune_2x | 6L×640d at 2× LR | 4.1071 | +0.120 | worse | 3× is right for this shape too |
 | 30 | lr_retune_4x | 6L×640d at 4× LR | 4.0076 | +0.021 | noise | 3× still best |
 | 31 | muon_mom_099 | MUON_MOMENTUM=0.99 (vs 0.95) | 4.0014 | +0.015 | noise | slightly more aggressive, no help |
+
+**L40S proxy runs (1xL40S, 10 min, 131K batch, SDPA)**
+
+| # | Run ID | Config | steps | step_ms | prequant BPB | postquant BPB | post-TTT BPB | artifact MB | verdict |
+|---|--------|--------|-------|---------|--------------|---------------|--------------|-------------|---------|
+| L40S-proteus | L40S_proteus | 11L sp1024, frontier_512.py | 1887 | 318 | 1.3455 | 1.3968 | 1.2870 | 10.1 | PROTEUS control on L40S |
+| L40S-s3 | L40S_s3 | 10L sp4096, frontier_512.py | 1988 | 302 | 1.3143 | 1.3626 | 1.2515 | 11.8 | s3 wins by 0.036 post-TTT |
+
+**TTT sweep (1xL40S, 2M token val subset, frozen s3 checkpoint)**
+
+| # | Run ID | Config | BPB | vs baseline | time | verdict |
+|---|--------|--------|-----|-------------|------|---------|
+| ttt-v1 | ttt_v1 | r8, 2ep, const lr (baseline) | 1.2645 | — | 120s | baseline |
+| ttt-v2 | ttt_v2 | rank 4 | 1.2721 | +0.008 | 121s | worse |
+| ttt-v3 | ttt_v3 | rank 16 | 1.2687 | +0.004 | 121s | worse |
+| ttt-v4 | ttt_v4 | 5 epochs | 1.0331 | -0.231 | 277s | massive gain |
+| ttt-v5 | ttt_v5 | 10 epochs | 0.8386 | -0.426 | 539s | likely overfitting on 2M subset |
+| ttt-v6 | ttt_v6 | chunk 128 | 1.2610 | -0.003 | 222s | noise |
+| ttt-v7 | ttt_v7 | chunk 512 | 1.2837 | +0.019 | 42s | worse |
+| ttt-v8 | ttt_v8 | context 512 | 1.2641 | -0.000 | 45s | noise |
+| ttt-v9 | ttt_v9 | min_doc 256 | 1.2394 | -0.025 | 72s | free improvement |
+| ttt-v10 | ttt_v10 | min_doc 2048 | 1.3028 | +0.038 | 60s | worse |
+| ttt-c1 | ttt_c1 | 5ep + cosine | 1.3158 | +0.051 | 139s | cosine hurts |
+| ttt-c2 | ttt_c2 | 10ep + cosine | 1.2934 | +0.029 | 260s | cosine hurts |
