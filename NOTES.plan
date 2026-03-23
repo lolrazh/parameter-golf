@@ -1,247 +1,529 @@
-2026-03-23 — Race Engineer Mode
-==================================
+2026-03-23 - Race Engineer Mode (Hardened)
+==========================================
 
-THE INSIGHT
+GOAL
 
-Everyone optimizes training. TTT is the underfloor.
+Minimize final judged BPB under the real submission path:
 
-  Training innovations (100+ PRs):  1.224 -> 1.118 = -0.106 BPB
-  TTT alone:                        1.118 -> 0.997 = -0.121 BPB
+  train -> export -> compress -> dequantize exported artifact -> run eval stack -> score BPB
 
-TTT is worth more than all architecture work combined.
-But architecture determines HOW MUCH TTT helps:
+The winning object is not "the model". It is the whole artifact pipeline.
 
-  Standard arch + AdamW TTT:  -0.019 BPB
-  PR #462 arch + AdamW TTT:  -0.053 BPB  (2.8x amplification)
-  PROTEUS + LoRA TTT:        -0.121 BPB  (architecture designed for it)
 
-Newey found downforce in the underfloor while everyone polished
-the bodywork. We find BPB in the eval budget while everyone
-polishes the training loop.
+STATE EQUATION
 
-DEPENDENCY GRAPH
+  final_judged_bpb = postquant_bpb - eval_uplift
+  postquant_bpb    = prequant_bpb + quant_gap
 
-BPB = prediction_quality × tokenizer_efficiency  (MULTIPLICATIVE)
+Expanded:
 
-prediction_quality
-├── model_knowledge (weights after training)
-│   ├── architecture_efficiency ← FREE VARIABLE (highest leverage)
-│   ├── tokens_seen = 600s / step_latency × batch_tokens
-│   │   └── step_latency ← DERIVED from architecture + hardware bandwidth
-│   ├── learning_per_token ← near-optimal (Muon, 100+ PRs)
-│   └── loss_function ← UNDEREXPLORED (everyone uses standard CE)
-├── quant_gap ← DERIVED from architecture's weight distribution
-└── eval_adaptation
-    ├── TTT_delta ← DERIVED from architecture's loss landscape geometry
-    ├── neural_cache (non-parametric, zero grad, stacks with TTT)
-    └── stride-OGD (already implemented)
+  final_judged_bpb = prequant_bpb + quant_gap - eval_uplift
 
-tokenizer_efficiency ← FREE VARIABLE (sp4096 = 1.35× multiplier)
+This is the system we are optimizing.
 
-Architecture is the single free variable that feeds the MOST derived
-variables: raw capacity, quant gap, TTT delta, step latency, artifact
-size. This is why architecture search is highest leverage.
 
-NOVEL INTERVENTIONS (each attacks a different node)
+WHAT THIS IMPLIES
 
-1. Multi-Token Prediction (loss_function node)
-   Train with 2 heads: predict t+1 AND t+2. Discard head 2 at eval.
-   Zero artifact cost. <5% training overhead. Better representations.
-   Forces backbone to encode structure, not just local patterns.
-   ~20 lines of code. Free lunch.
+- Training is not the whole game.
+- Eval-time recovery is underexploited.
+- Export damage is a first-class term, not an afterthought.
+- Architecture matters because it feeds multiple downstream terms:
+  - prequant_bpb
+  - quant_gap
+  - step_latency
+  - artifact_bytes
+  - adaptation_friendliness
 
-2. Depth Recurrence (architecture_efficiency node)
-   Store 6 blocks, loop 2x = 12 effective layers.
-   Reinvest savings: 640d + MLP 4x. Per-loop LoRA for specialization.
-   PR #499 "Frugendorff" validates at 1.1478 BPB (no TTT!).
-   TTT compound: adapting 6 shared blocks = 2x leverage per param
-   (each adapted weight used twice in forward pass).
 
-3. Neural Cache (eval_adaptation node, orthogonal to TTT)
-   Cache (hidden_state, next_token) during eval. Similarity lookup.
-   p(y|x) = (1-λ)*p_model + λ*p_cache
-   Zero params, zero gradients, captures local repetition.
-   Literature: ~10% perplexity gain. Stacks with TTT.
+PRIMARY OBJECTIVE
 
-4. Online TTT / Dynamic Eval (eval_adaptation node)
-   Adapt per-window during sliding eval. Single-pass, causal.
-   DeepMind 2024: middle layers most effective to adapt.
-   Different from batch TTT — more document-specific.
+Primary metric:
 
-DEAD ENDS (researched, ruled out)
-- SAM: 2x compute overhead, disqualifying in 10-min race.
-  EMA/SWA gets similar flat-minima benefits for free.
-- kNN-LM: 400GB datastore. Completely infeasible for 16MB artifact.
-- Full MTP beyond k=2: diminishing returns, not worth overhead.
+  final judged post-export BPB after the chosen eval stack
 
-MOVES
+Everything else is secondary or diagnostic.
 
-1. Get AdamW TTT into train_gpt.py. Can't race without an engine.
-2. Add MTP (k=2) to training. Free lunch, ~20 lines.
-3. GEPA-style search on L40S ($0.26/hr). Metric = TTT DELTA.
-   Search space includes depth recurrence as an architecture axis.
-4. sp4096 x winner compound. 1.35x multiplier on all gains.
-5. Add neural cache to eval pipeline. Stacks with TTT for free.
-6. Final 8xH100 submission with winning recipe.
+Important:
 
-RULES
+- TTT delta is NOT the primary objective.
+- Quant gap is NOT the primary objective.
+- Prequant BPB is NOT the primary objective.
 
-- L40S is for architecture families ONLY
-- Never tune LR, warmdown, batch, momentum on proxy
-- Primary metric: adaptation_uplift = BPB_no_ttt - BPB_after_ttt
-- Rich diagnostics, not scalar scores
-- Reflect after each wave, mutate directed
+They matter only insofar as they improve the final judged score.
 
-HARDWARE
 
-L40S secure spot, RunPod: $0.26/hr
-  6L compiled SDPA: ~306ms/step, ~1960 steps/10min
-  11L compiled SDPA: ~585ms/step, ~1025 steps/10min
-  Fixed 1500 steps per run (~$0.06-0.09 each)
-  No FA3 (Hopper only). No DDP (single GPU). SDPA + compile.
+SELECTION METRICS
 
-DIAGNOSTICS
+Primary sort key:
 
-Every run logs:
-  quant_gap_by_block   — int6 each block solo, measure loss delta
-  activation_outliers  — max/mean/std per layer (attn logits + MLP hidden)
-  weight_effective_rank — SVD per weight matrix, rank at 90% variance
-  adaptation_uplift    — BPB delta from 10ep AdamW TTT
-  lora_sensitivity     — SVD proxy: how much can rank-8 capture?
-  artifact_bytes       — estimated int6+zstd size
-  loss_curve_slope     — final 100 steps trend (descending vs plateau)
-  step_time_ms         — sanity only, never optimize for this
+  1. final_judged_bpb
 
-EXPERIMENT WAVES
+Secondary diagnostics:
 
-Config shared across all runs:
-  TRAIN_BATCH_TOKENS=131072
-  TRAIN_SEQ_LEN=1024
-  ITERATIONS=1500
-  MAX_WALLCLOCK_SECONDS=0
-  VAL_TOKENS_LIMIT=1048576
-  WARMUP_STEPS=2
-  SDPA (no FA3), single GPU, torch.compile
+  2. postquant_bpb without adaptation
+  3. adaptation_uplift = postquant_bpb - final_judged_bpb
+  4. quant_gap = postquant_bpb - prequant_bpb
+  5. artifact_bytes and headroom
+  6. step_time_ms
+  7. loss_curve_slope near the end of training
 
---- Wave 1: Calibrate (4 runs, ~$0.30) ---
+Interpretation rules:
 
-Establish baselines. Answer: what's our TTT delta? Does sp4096 amplify it?
+- A candidate with huge adaptation_uplift but worse final_judged_bpb loses.
+- A candidate with better prequant but much worse quant_gap can still lose.
+- A candidate with slightly worse raw score but much better bytes/headroom can survive on the Pareto front.
 
-  A: 11L sp1024 baseline         -> raw BPB + diagnostics
-  B: 11L sp1024 + TTT 10ep       -> TTT delta (this is our reference)
-  C: 11L sp4096 baseline         -> raw BPB + diagnostics
-  D: 11L sp4096 + TTT 10ep       -> TTT delta (compare to B)
 
-Decision gate: if sp4096 TTT delta > sp1024, lock in sp4096 for later waves.
+FREE VARIABLES
 
---- Wave 2: Architecture families (8 runs, ~$0.65) ---
+The variables worth searching are:
 
-All sp1024 (controlled). Vary one architecture axis per run.
-Every run includes MTP k=2 (free lunch, always on after Wave 1).
-Measure adaptation_uplift + full diagnostics for each.
+1. Architecture family
+   - layer count
+   - width
+   - FFN family
+   - skip/routing structure
+   - local sidecar path
+   - recurrence / weight sharing
+   - attention gating / value routing
 
-  E: 11L + SwiGLU (replace relu^2)
-  F: 11L + learned sigmoid gating on U-Net skips
-  G: 11L + Value Residual (cache V from layer 0, blend all layers)
-  H: 11L + SwiGLU + learned gating combined (PR #462 recipe)
-  I: 11L + Gated Attention (per-head sigmoid gate)
-  J: 6Lx2 recurrence, 640d, MLP 4x, per-loop LoRA (Frugendorff-style)
-  K: 6Lx2 recurrence + SwiGLU
-  L: 6Lx2 recurrence + SwiGLU + learned gating
+2. Eval-time recovery method
+   - sliding window details
+   - doc isolation
+   - stride-OGD
+   - TTT / low-dimensional adaptation
+   - neural cache / PPM-C / local memory
+   - KV reuse across windows
 
-Rank all by adaptation_uplift. The winner isn't the best raw BPB.
-It's the biggest TTT delta.
-The recurrence runs (J-L) test the 2x TTT leverage hypothesis.
+3. Export structure
+   - quant preset
+   - int5/int6 allocation
+   - fp16 passthrough choices
+   - compressibility-aware training or export
 
---- Wave 3: Compound (3-4 runs, ~$0.30) ---
+4. Tokenizer family
+   - sp1024
+   - sp4096
+   - maybe others later
 
-Combine top-2 amplifiers from Wave 2.
-Use diagnostics reflection to guide combos:
-  - if both amplifiers are quant-friendly (low outliers), combine
-  - if one has high effective rank + one has low, they may complement
-  - test 2-3 combos of winners
 
---- Wave 4: sp4096 x winner (2-3 runs, ~$0.20) ---
+DERIVED VARIABLES
 
-Apply winning architecture family to sp4096 tokenizer.
-Measure compound: does tokenizer multiplier stack with arch amplifier?
-If yes, this is our submission recipe.
+These are not directly tuned. They are consequences:
 
---- Wave 5: Eval stack (2-3 runs, ~$0.20) ---
+- effective_steps
+- step_latency
+- quant_gap
+- artifact_headroom
+- adaptation_uplift
+- compile_stability
+- memory_traffic
+- kernel suitability to workload size
 
-On winning architecture from Wave 3/4:
-  M: +neural cache (interpolation weight λ sweep: 0.05, 0.1, 0.2)
-  N: +online TTT per-window (middle layers only, per DeepMind 2024)
-  O: neural cache + batch TTT together (do they stack?)
 
---- Wave 6: 8xH100 (1-2 runs, ~$7) ---
+HIDDEN COUPLINGS
 
-Full 10-min train. Real batch (786K), real FA3, real DDP.
-Tune warmdown/LR HERE, not before.
-Full eval stack: LoRA TTT + neural cache + stride-OGD.
+These couplings are real and must be respected:
 
-Total: ~$6 research + ~$7 submission = ~$13
+- depth <-> throughput under fixed wallclock
+- tokenizer <-> embedding size <-> artifact bytes <-> throughput
+- architecture <-> quant_gap
+- architecture <-> adaptation_uplift
+- eval method <-> trunk family
+- compile behavior <-> API shape
+- kernel choice <-> workload regime
 
-TTT RECIPE (from PR #462, our starting point)
+Do not reason as if these are independent.
 
-  optimizer: AdamW(all_params, lr=5e-4, wd=0.0)
-  scheduler: CosineAnnealingLR(T_max=10, eta_min=5e-5)
-  epochs: 10
-  grad_clip: 1.0
-  batch: 32 sequences x 1024 tokens
-  data: full validation set, sequential chunks
-  when: after EMA (if used), before quantization
-  measure: sliding window BPB before and after
 
-GEPA LOOP (manual, Claude as reflection LM)
+WHAT WE CURRENTLY BELIEVE
 
-  1. SELECT: pick architecture variant from plan or Pareto front
-  2. EXECUTE: run on L40S, collect full diagnostics
-  3. REFLECT: Claude reads diagnostics, diagnoses WHY
-     - "loss plateau + high activation outliers = quant-unfriendly"
-     - "low TTT delta + high effective rank = already well-fit, no room to adapt"
-     - "big TTT delta + steep loss curve = undertrained, adaptation fills gaps"
-  4. MUTATE: propose next variant based on diagnosis, not random
-  5. ACCEPT: if TTT delta improves, add to frontier
+High-confidence beliefs:
 
-Each cycle: one L40S run (~15 min) + 5 min analysis = 20 min.
-3 cycles/hr. 15 cycles in an afternoon = $2.
+- Eval-time recovery is underexploited relative to training-only search.
+- Architecture can change how much adaptation helps.
+- Local document memory is a better direction than naive memorization.
+- Quant gap should be treated as a design target, not just measured after training.
 
-THE NOVEL STACK (our bet)
+Medium-confidence beliefs:
 
-  depth recurrence (6x2) + MTP (k=2) + sp4096 + AdamW TTT + neural cache
+- sp4096 may be a strong multiplier, but not a clean multiplicative one.
+- A trunk can be designed to be more adaptation-friendly.
+- Sidecar local memory should stack with gradient-based adaptation.
 
-Each component attacks a different node in the dependency graph.
-They don't compete — they compound:
-  recurrence → artifact-efficient depth + 2x TTT leverage
-  MTP → better representations → smoother landscape → more TTT gain
-  sp4096 → 1.35x multiplier on every per-token improvement
-  TTT → eval-time adaptation (amplified by recurrence)
-  neural cache → non-parametric local patterns (stacks with TTT)
+Unproven hypotheses:
 
-Nobody has combined these. This is our differentiated play.
+- MTP k=2 improves final judged BPB in this competition.
+- Depth recurrence amplifies TTT enough to be worth the complexity.
+- SwiGLU or gating families increase adaptation_uplift enough to matter.
+- A recurrence family is better than a plain trunk once post-export eval is included.
+
+These stay hypotheses until isolated tests say otherwise.
+
+
+WHAT WE ARE NOT GOING TO ASSUME
+
+- MTP is not a free lunch until it wins an isolated A/B.
+- Recurrence is not automatically a TTT amplifier.
+- Tokenizer choice is not a pure multiplier.
+- Bigger adaptation_uplift is not automatically better.
+- Full-model TTT is not automatically the best adaptation method.
+
+
+THE RIGHT NOVELTY TARGET
+
+The strongest novel direction is:
+
+  neural trunk + local document memory + small online adaptation
+
+In plain terms:
+
+- let the trunk model general structure
+- let a sidecar memory model exact local recurrence
+- let a tiny adaptation method correct document-specific bias
+
+This is better aligned with the competition than:
+
+- naive memorization
+- classic MTP as a default assumption
+- expensive recurrence by itself
+- generic architecture churn
+
+
+PROXY RULES
+
+L40S / single-GPU proxy is for:
+
+- architecture families
+- eval methods
+- quant/export behavior
+- compile stability
+- local memory methods
+
+Proxy is NOT for:
+
+- LR tuning
+- warmdown tuning
+- batch-size tuning
+- momentum tuning
+- deciding final FA3 vs SDPA policy on target hardware
+
+
+REAL EVAL ORDER
+
+When evaluating a candidate for judged score:
+
+1. train candidate
+2. export with intended quant/compression path
+3. reload dequantized exported model
+4. run chosen eval stack on the exported model
+5. record final_judged_bpb
+
+If TTT updates weights during eval, it should update the dequantized exported model,
+not a cleaner pre-export checkpoint, if the goal is honest selection.
+
+
+DIAGNOSTICS BUDGET
+
+Light diagnostics on every run:
+
+- prequant_bpb
+- postquant_bpb
+- final_judged_bpb
+- adaptation_uplift
+- quant_gap
+- artifact_bytes
+- step_time_ms
+- loss_curve_slope
+
+Heavy diagnostics only on promoted candidates:
+
+- quant_gap_by_block
+- activation outliers by layer
+- weight effective rank
+- adapter sensitivity / low-rank sensitivity
+- deeper export sweeps
+
+Reason:
+
+The heavy suite is too expensive to run inside every cheap iteration loop.
+
+
+PARETO FRONT
+
+Keep a frontier on:
+
+- final_judged_bpb
+- quant_gap
+- adaptation_uplift
+- artifact_headroom
+- step_time_ms
+
+But promotion is still governed by final_judged_bpb first.
+
+
+EXPERIMENT PHILOSOPHY
+
+- Freeze the trunk when testing eval methods.
+- Freeze the eval stack when testing trunk families.
+- Freeze the tokenizer until a family survives.
+- Change one hypothesis at a time.
+- Use reflection to mutate family-level structure, not random scalar knobs.
+
+
+WAVE 0 - HARNESS CALIBRATION
+
+Goal:
+
+Establish the real baseline under the real judged path.
+
+Fixed trunk:
+
+  current 11L control on sp1024
+
+Runs:
+
+  A. exported model, sliding/doc only
+  B. A + stride-OGD
+  C. A + TTT
+  D. A + stride-OGD + TTT
+
+Outputs:
+
+- final_judged_bpb for each
+- adaptation_uplift from TTT
+- whether TTT and OGD stack or interfere
+
+Decision gate:
+
+- If TTT uplift is small, unstable, or too expensive, it becomes a promotion-stage tool, not a screening default.
+- If OGD captures much of the same gain cheaply, use OGD in earlier waves and reserve TTT for finalists.
+
+
+WAVE 1 - LOCAL MEMORY BRANCH
+
+Goal:
+
+Test whether local document memory beats more trunk churn.
+
+Fixed trunk:
+
+  current 11L control
+
+Branch candidates:
+
+  E. baseline eval stack
+  F. + KV reuse across sliding windows
+  G. + neural cache
+  H. + lightweight n-gram / PPM-C style mixer
+  I. + best cheap adaptation from Wave 0 on top of F/G/H
+
+Decision gate:
+
+- Promote any method that improves final_judged_bpb on the exported model.
+- Prefer methods that are additive with cheap adaptation.
+
+
+WAVE 2 - ARCHITECTURE FAMILY SCREEN
+
+Goal:
+
+Search for trunks that are good before adaptation and friendly to adaptation.
+
+Tokenizer fixed:
+
+  sp1024
+
+Eval stack fixed:
+
+  best cheap eval stack from Waves 0-1
+
+Candidate families:
+
+  J. control 11L
+  K. stronger local sidecar path
+  L. gated skip / routing variant
+  M. gated attention / value routing variant
+  N. value residual or similar reuse path
+  O. recurrence family
+
+Notes:
+
+- Do not turn on MTP here.
+- Do not combine multiple speculative family changes in the same first-pass run.
+- Recurrence is one family, not the default plan.
+
+Decision gate:
+
+- Rank by final_judged_bpb first.
+- Keep notes on adaptation_uplift and quant_gap, but do not let them override judged score.
+- Promote top 2-3 families.
+
+
+WAVE 3 - ADAPTATION AMPLIFIER TEST
+
+Goal:
+
+Measure whether the promoted trunks actually amplify adaptation.
+
+For each promoted trunk:
+
+  P. exported model, no expensive adaptation
+  Q. exported model + TTT
+  R. exported model + best local-memory stack
+  S. exported model + TTT + best local-memory stack
+
+What we are testing:
+
+- Does this trunk improve final_judged_bpb?
+- Does it improve TTT uplift relative to control?
+- Does it stack with local memory?
+
+This is where "adaptation-friendly architecture" is decided.
+
+
+WAVE 4 - TOKENIZER CROSS-CHECK
+
+Goal:
+
+Test whether the winning family survives or improves under sp4096.
+
+Runs:
+
+  T. winning family on sp1024
+  U. winning family on sp4096
+  V. winning family on sp4096 + best eval stack
+
+Decision gate:
+
+- sp4096 only stays if it improves final_judged_bpb or creates an obviously better Pareto point.
+- Do not assume a clean multiplier.
+
+
+WAVE 5 - SPECULATIVE SIDE BRANCHES
+
+These are isolated A/B tests, not default stack components.
+
+Eligible only after a winning family exists:
+
+  W. MTP k=2 A/B on best current family
+  X. compressibility-aware training / entropy regularization
+  Y. recurrence refinement if recurrence already showed promise
+
+Rules:
+
+- Each of these must beat the current winner in isolation.
+- None are allowed to contaminate the main search before validation.
+
+
+WAVE 6 - TARGET HARDWARE CONFIRMATION
+
+Goal:
+
+Move only finalists to 8xH100.
+
+Now it is valid to retune hardware-dependent knobs:
+
+- batch tokens
+- warmdown
+- LR schedule
+- FA3 policy
+- DDP behavior
+
+But only on finalists.
+
+
+TTT POLICY
+
+TTT is an eval subsystem, not the whole strategy.
+
+Use it in one of three roles:
+
+1. cheap baseline check in Wave 0
+2. amplifier test on promoted trunks in Wave 3
+3. final-stack component if it genuinely improves final_judged_bpb
+
+Do not define the entire search around TTT delta alone.
+
+
+GEPA-STYLE LOOP
+
+For each cycle:
+
+1. SELECT from the current Pareto front or hypothesis backlog
+2. EXECUTE one clean run
+3. REFLECT on the diagnostics
+4. MUTATE one family-level variable
+5. ACCEPT only if the candidate improves judged score or frontier position
+
+Reflection prompts should ask:
+
+- Did this help base quality, export robustness, or eval recovery?
+- Which term moved the most?
+- Was the gain direct or just more room for adaptation to fix a weaker base?
+- Did the candidate become more quant-friendly?
+- Did the candidate become more adaptation-friendly?
+
+
+OUR NOVEL BET
+
+The differentiated play is not:
+
+  "copy SOTA trunk and add more knobs"
+
+It is:
+
+  architecture or sidecar methods that improve local memory and low-dimensional adaptation
+
+Most likely compound:
+
+  strong trunk
+  + local document memory
+  + cheap online adaptation
+  + export-aware selection
+
+This is the underexplored part of the system.
+
 
 PARAMETRIC VS NON-PARAMETRIC MEMORY
 
-Model = 15M params × ~2.6 bits (int6) ≈ 40M bits of storage.
-FineWeb val = ~620M bits of entropy. Model is 15x too small to memorize.
-It MUST generalize.
+The model cannot memorize the corpus in any literal sense under 16MB.
 
-TTT = parametric memorization (gradient-based, lossy, into weights).
-Neural cache = non-parametric memorization (exact lookup, local, zero cost).
-Stride-OGD = lightweight parametric (vocab bias vector only).
-These address different failure modes and stack additively.
+Useful forms of memory are:
+
+- parametric memory:
+  weights updated by training or TTT
+
+- lightweight parametric adaptation:
+  bias-only, head-only, or tiny adapter updates
+
+- non-parametric local memory:
+  cache, n-gram statistics, PPM-C style context mixing
+
+These serve different failure modes and may stack.
+
 
 THINGS TO REMEMBER
 
-- We're not forking PROTEUS or PR #462. We're finding our own underfloor.
-- sp4096 is our unique angle. Nobody else has submitted it + TTT.
-- The architecture that trains best is NOT the architecture that adapts best.
-- Flat minima = good TTT. EMA/SWA for free, SwiGLU and learned gating help.
-- Depth recurrence: PR #499 validates at 1.1478 BPB. TTT on shared
-  weights is 2x leverage — completely unexplored compound.
-- MTP k=2: zero artifact cost, <5% overhead, better representations.
-  Always-on after validation. Free lunch.
-- Neural cache: zero params, zero grads, ~10% perplexity in literature.
-  Captures exactly what the model can't: local repetition patterns.
-- MAML is high-risk: only after Waves 1-4 validate the direction.
+- Final judged BPB is the only real objective.
+- TTT delta is a diagnostic, not the crown.
+- MTP is a hypothesis, not a free lunch.
+- Recurrence is a family to test, not a committed direction.
+- Tokenizer choice is coupled to bytes, speed, and quantization.
+- Heavy diagnostics are for promoted candidates only.
+- Proxy is for structure, not knob tuning.
+- The architecture that trains best may not be the one that adapts best.
+- The architecture with the biggest TTT uplift may still be the wrong submission.
+
+
+CURRENT BEST RESEARCH QUESTION
+
+Which combination of:
+
+- trunk family
+- local memory method
+- low-dimensional adaptation
+
+produces the best final judged BPB after export?
+
+That is the real search.
