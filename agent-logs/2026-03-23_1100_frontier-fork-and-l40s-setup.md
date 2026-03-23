@@ -180,9 +180,11 @@ For Phase 2, use VAL_TOKENS_LIMIT=1048576 so each TTT test takes ~15-20s instead
 
 ## Ready for Next Session
 - ✅ **s3 checkpoint saved** — frozen trunk for TTT experiments
-- 🔧 **PROTEUS checkpoint retraining** — in progress, ~10 min
+- ✅ **PROTEUS checkpoint retraining** — completed
 - 🔧 **Standalone TTT eval script needed** — extract TTT from frontier_512.py for fast iteration
 - ✅ **Both tokenizer datasets on L40S** — sp1024 and sp4096 ready
+- ✅ **Fast TTT loop working** — 2M token val, ~2 min per variant
+- 🔄 **10-variant TTT sweep running** — results in ~20 min
 
 ## Context for Future
 The architecture race is commoditized — everyone converges on 11L/512d/GQA/SmearGate/BigramHash/relu²/MLP3x. The frontier is TTT pipeline engineering. PROTEUS gets 0.224 BPB from TTT alone. Our s3 trunk already beats PROTEUS pre-TTT by 0.034 BPB. The next step is replicating PROTEUS's TTT on our trunk, then sweeping TTT variants to find something better. A standalone TTT eval script is critical for fast iteration (~$0.03 per test vs ~$0.04 per full training run).
