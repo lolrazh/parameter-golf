@@ -1,0 +1,155 @@
+2026-03-23 — Race Engineer Mode
+==================================
+
+THE INSIGHT
+
+Everyone optimizes training. TTT is the underfloor.
+
+  Training innovations (100+ PRs):  1.224 -> 1.118 = -0.106 BPB
+  TTT alone:                        1.118 -> 0.997 = -0.121 BPB
+
+TTT is worth more than all architecture work combined.
+But architecture determines HOW MUCH TTT helps:
+
+  Standard arch + AdamW TTT:  -0.019 BPB
+  PR #462 arch + AdamW TTT:  -0.053 BPB  (2.8x amplification)
+  PROTEUS + LoRA TTT:        -0.121 BPB  (architecture designed for it)
+
+Newey found downforce in the underfloor while everyone polished
+the bodywork. We find BPB in the eval budget while everyone
+polishes the training loop.
+
+MOVES
+
+1. Get AdamW TTT into train_gpt.py. Can't race without an engine.
+2. GEPA-style search on L40S ($0.26/hr). Metric = TTT DELTA.
+   Not "best raw BPB" but "most adaptable architecture."
+3. sp4096 x TTT compound. 35% more bytes/token = 1.35x multiplier
+   on every per-token TTT gain. Nobody has tested this.
+4. Budget split: what if 7min train + 3min pre-adapt? Use late
+   training time for SAM/MAML/LoRA-init instead of more SGD.
+5. Final 8xH100 submission with winning recipe.
+
+RULES
+
+- L40S is for architecture families ONLY
+- Never tune LR, warmdown, batch, momentum on proxy
+- Primary metric: adaptation_uplift = BPB_no_ttt - BPB_after_ttt
+- Rich diagnostics, not scalar scores
+- Reflect after each wave, mutate directed
+
+HARDWARE
+
+L40S secure spot, RunPod: $0.26/hr
+  6L compiled SDPA: ~306ms/step, ~1960 steps/10min
+  11L compiled SDPA: ~585ms/step, ~1025 steps/10min
+  Fixed 1500 steps per run (~$0.06-0.09 each)
+  No FA3 (Hopper only). No DDP (single GPU). SDPA + compile.
+
+DIAGNOSTICS
+
+Every run logs:
+  quant_gap_by_block   — int6 each block solo, measure loss delta
+  activation_outliers  — max/mean/std per layer (attn logits + MLP hidden)
+  weight_effective_rank — SVD per weight matrix, rank at 90% variance
+  adaptation_uplift    — BPB delta from 10ep AdamW TTT
+  lora_sensitivity     — SVD proxy: how much can rank-8 capture?
+  artifact_bytes       — estimated int6+zstd size
+  loss_curve_slope     — final 100 steps trend (descending vs plateau)
+  step_time_ms         — sanity only, never optimize for this
+
+EXPERIMENT WAVES
+
+Config shared across all runs:
+  TRAIN_BATCH_TOKENS=131072
+  TRAIN_SEQ_LEN=1024
+  ITERATIONS=1500
+  MAX_WALLCLOCK_SECONDS=0
+  VAL_TOKENS_LIMIT=1048576
+  WARMUP_STEPS=2
+  SDPA (no FA3), single GPU, torch.compile
+
+--- Wave 1: Calibrate (4 runs, ~$0.30) ---
+
+Establish baselines. Answer: what's our TTT delta? Does sp4096 amplify it?
+
+  A: 11L sp1024 baseline         -> raw BPB + diagnostics
+  B: 11L sp1024 + TTT 10ep       -> TTT delta (this is our reference)
+  C: 11L sp4096 baseline         -> raw BPB + diagnostics
+  D: 11L sp4096 + TTT 10ep       -> TTT delta (compare to B)
+
+Decision gate: if sp4096 TTT delta > sp1024, lock in sp4096 for later waves.
+
+--- Wave 2: Architecture families (6 runs, ~$0.50) ---
+
+All 11L sp1024 (controlled). Vary one architecture axis per run.
+Measure adaptation_uplift + full diagnostics for each.
+
+  E: +SwiGLU (replace relu^2 with silu(x)*linear(x))
+  F: +learned sigmoid gating on U-Net skips
+     gate = sigmoid(skip_gates[i])
+     x = gate*x + (1-gate)*(skip_weights[i]*skip)
+  G: +Value Residual (cache V from layer 0, blend into all layers)
+  H: +SwiGLU + learned gating combined (PR #462 recipe)
+  I: +Gated Attention (per-head sigmoid gate on attn output)
+  J: +full MHA (8 KV heads, no GQA)
+
+Rank all by adaptation_uplift. The winner isn't the best raw BPB.
+It's the biggest TTT delta.
+
+--- Wave 3: Compound (3-4 runs, ~$0.30) ---
+
+Combine top-2 amplifiers from Wave 2.
+Use diagnostics reflection to guide combos:
+  - if both amplifiers are quant-friendly (low outliers), combine
+  - if one has high effective rank + one has low, they may complement
+  - test 2-3 combos of winners
+
+--- Wave 4: sp4096 x winner (2-3 runs, ~$0.20) ---
+
+Apply winning architecture family to sp4096 tokenizer.
+Measure compound: does tokenizer multiplier stack with arch amplifier?
+If yes, this is our submission recipe.
+
+--- Wave 5: 8xH100 (1-2 runs, ~$7) ---
+
+Full 10-min train. Real batch (786K), real FA3, real DDP.
+Tune warmdown/LR HERE, not before.
+LoRA TTT 30ep (PROTEUS-style) in remaining eval budget.
+
+Total: ~$5 research + ~$7 submission = ~$12
+
+TTT RECIPE (from PR #462, our starting point)
+
+  optimizer: AdamW(all_params, lr=5e-4, wd=0.0)
+  scheduler: CosineAnnealingLR(T_max=10, eta_min=5e-5)
+  epochs: 10
+  grad_clip: 1.0
+  batch: 32 sequences x 1024 tokens
+  data: full validation set, sequential chunks
+  when: after EMA (if used), before quantization
+  measure: sliding window BPB before and after
+
+GEPA LOOP (manual, Claude as reflection LM)
+
+  1. SELECT: pick architecture variant from plan or Pareto front
+  2. EXECUTE: run on L40S, collect full diagnostics
+  3. REFLECT: Claude reads diagnostics, diagnoses WHY
+     - "loss plateau + high activation outliers = quant-unfriendly"
+     - "low TTT delta + high effective rank = already well-fit, no room to adapt"
+     - "big TTT delta + steep loss curve = undertrained, adaptation fills gaps"
+  4. MUTATE: propose next variant based on diagnosis, not random
+  5. ACCEPT: if TTT delta improves, add to frontier
+
+Each cycle: one L40S run (~15 min) + 5 min analysis = 20 min.
+3 cycles/hr. 15 cycles in an afternoon = $2.
+
+THINGS TO REMEMBER
+
+- We're not forking PROTEUS or PR #462. We're finding our own underfloor.
+- sp4096 is our unique angle. Nobody else has submitted it + TTT.
+- The architecture that trains best is NOT the architecture that adapts best.
+- Flat minima = good TTT. SwiGLU and learned gating may create them.
+- MAML (move 4) is high-risk: train to minimize post-TTT loss.
+  Needs second-order grads or FOMAML approximation. Expensive.
+  Only attempt after Waves 1-4 validate the direction.
