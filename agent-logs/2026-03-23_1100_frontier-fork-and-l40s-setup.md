@@ -20,7 +20,7 @@ Shift from incremental technique-stacking to a frontier-fork approach: use PR #5
 - ✅ **Both checkpoints downloaded locally** — safe from spot preemption
 - ✅ **Standalone run_ttt.py script** — loads exported checkpoint, runs LoRA TTT, reports BPB
 - ✅ **PROTEUS TTT calibration** — post-TTT BPB: 1.2870 (TTT gain: -0.115)
-- 🔄 **s3 TTT running** — in progress on L40S
+- ✅ **s3 TTT complete** — post-TTT BPB: 1.2515 (TTT gain: -0.1113, 21 min)
 
 ## Baseline Results (L40S, 1xGPU, 10 min, 131K batch)
 
@@ -41,9 +41,9 @@ Key finding: s3 (10L sp4096) beats PROTEUS (11L sp1024) by 0.034 BPB post-quant.
 | Metric | PROTEUS 11L sp1024 | s3 10L sp4096 |
 |---|---|---|
 | Post-quant BPB | 1.4022 | 1.3626 |
-| **Post-TTT BPB** | **1.2870** | 🔄 running |
-| **TTT gain** | **-0.1151** | 🔄 running |
-| TTT time | 1846s (31 min) | ~20 min est |
+| **Post-TTT BPB** | **1.2870** | **1.2515** |
+| **TTT gain** | **-0.1151** | **-0.1113** |
+| TTT time | 1846s (31 min) | 1269s (21 min) |
 | Short/long docs | 31585 / 18415 | 37673 / 12327 |
 
 Notes:
@@ -51,6 +51,30 @@ Notes:
 - PROTEUS on 8xH100 gets -0.224 BPB TTT gain. L40S proxy sees -0.115 (~half) because model trained ~1900 steps vs ~7000
 - sp4096 has fewer long docs (12K vs 18K) because tokens cover more bytes → documents are shorter in token space
 - Spot preemption killed the first TTT attempt at batch 1135/1151. Restarted on same pod, completed second time.
+
+## TTT Sweep (in progress)
+
+Fast loop established: 2M token val subset, ~2 min per variant.
+Running 10 structural variants on frozen s3 checkpoint.
+All use s3 (10L sp4096) with DATA_PATH=fineweb10B_sp4096_small.
+
+| # | Variant | BPB | vs baseline |
+|---|---------|-----|-------------|
+| v1 | baseline (r8, 2ep, const lr) | pending | — |
+| v2 | rank 4 | pending | |
+| v3 | rank 16 | pending | |
+| v4 | 5 epochs | pending | |
+| v5 | 10 epochs | pending | |
+| v6 | chunk 128 | pending | |
+| v7 | chunk 512 | pending | |
+| v8 | context 512 | pending | |
+| v9 | min_doc 256 (adapt more) | pending | |
+| v10 | min_doc 2048 (adapt fewer) | pending | |
+
+Skipped (H100-sensitive, don't transfer from proxy):
+- LR sweep
+- Warmdown tuning
+- Batch size tuning
 
 ## L40S Hardware Profile
 
@@ -90,6 +114,14 @@ The cosine insight: constant LR overfits to eval token positions after ~30 epoch
    - **Fix:** Download from `sproos/parameter-golf-tokenizers` on HuggingFace
 4. **SSH exit code 255 on long commands** — SSH drops during GPU-intensive operations
    - **Workaround:** Use nohup, check results with separate SSH command
+5. **Python stdout buffered to file** — `nohup python3 script.py > log` produces empty log until buffer flushes
+   - **Fix:** Always use `python3 -u` (unbuffered) when redirecting to log files
+6. **zstandard not installed on fresh RunPod pods** — checkpoint decompression fails with `zlib.error: incorrect header check`
+   - **Fix:** `pip install --break-system-packages zstandard` before running
+7. **Spot preemption mid-TTT** — L40S spot instance died at batch 1135/1151 (16 batches from completion)
+   - **Fix:** Downloaded checkpoints locally for safety. Restarted pod, checkpoints persisted on /workspace/ volume.
+8. **run_ttt.py wastes time on redundant post-quant eval** — re-computes BPB we already know from training
+   - **TODO:** Skip post-quant eval when the number is already known, or make it optional
 
 ## Key Learnings
 - **frontier_512.py works on L40S with ZERO code changes** — already uses SDPA, handles world_size=1, all config via env vars
