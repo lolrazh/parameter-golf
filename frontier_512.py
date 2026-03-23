@@ -88,6 +88,7 @@ class Hyperparameters:
     ttt_batch_size = int(os.environ.get("TTT_BATCH_SIZE", 64))
     ttt_min_doc_len = int(os.environ.get("TTT_MIN_DOC_LEN", 1024))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 2))
+    ttt_cosine = bool(int(os.environ.get("TTT_COSINE", "0")))
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
@@ -804,13 +805,18 @@ def _compute_chunk_window(ci: int, pred_len: int, num_chunks: int, chunk_size: i
 
 def _ttt_one_doc(base_model, all_tokens, ds, dl, lora, opt, chunk_size, eval_seq_len,
                   device, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-                  loss_sum, byte_sum, token_count, num_epochs):
+                  loss_sum, byte_sum, token_count, num_epochs, cosine_decay=False):
     """TTT on a single document: score-then-train per chunk, multiple epochs."""
     pred_len = dl - 1
     nc = (pred_len + chunk_size - 1) // chunk_size
     lora.reset()
     _reset_ttt_optimizer(opt)
+    base_lr = opt.param_groups[0]['lr']
     for epoch in range(num_epochs):
+        if cosine_decay and num_epochs > 1:
+            lr_scale = 0.5 * (1 + math.cos(math.pi * epoch / num_epochs))
+            for pg in opt.param_groups:
+                pg['lr'] = base_lr * max(lr_scale, 0.01)
         for ci in range(nc):
             cs = ci * chunk_size
             ce = min((ci + 1) * chunk_size, pred_len)
@@ -908,7 +914,12 @@ def eval_val_ttt_lora(
         pred_lens = [dl - 1 for _, dl in batch]
         num_chunks = [(pl + chunk_size - 1) // chunk_size for pl in pred_lens]
         max_nc = max(num_chunks)
+        base_lr = cur_opt.param_groups[0]['lr']
         for epoch in range(args.ttt_epochs):
+            if args.ttt_cosine and args.ttt_epochs > 1:
+                lr_scale = 0.5 * (1 + math.cos(math.pi * epoch / args.ttt_epochs))
+                for pg in cur_opt.param_groups:
+                    pg['lr'] = base_lr * max(lr_scale, 0.01)
             for ci in range(max_nc):
                 active = [ci < nc for nc in num_chunks]
                 ws_ref, wl_ref, _, _ = _compute_chunk_window(ci, (ci+1)*chunk_size, ci+1, chunk_size, eval_seq_len)

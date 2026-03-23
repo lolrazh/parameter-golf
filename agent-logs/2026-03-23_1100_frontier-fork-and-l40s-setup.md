@@ -52,29 +52,57 @@ Notes:
 - sp4096 has fewer long docs (12K vs 18K) because tokens cover more bytes → documents are shorter in token space
 - Spot preemption killed the first TTT attempt at batch 1135/1151. Restarted on same pod, completed second time.
 
-## TTT Sweep (in progress)
+## TTT Sweep Setup
 
-Fast loop established: 2M token val subset, ~2 min per variant.
-Running 10 structural variants on frozen s3 checkpoint.
-All use s3 (10L sp4096) with DATA_PATH=fineweb10B_sp4096_small.
+**Fast loop**: Created a 2M-token val subset at `data/datasets/fineweb10B_sp4096_small/` (truncated from 44M full val). Each TTT variant takes ~2 min instead of ~30 min.
 
-| # | Variant | BPB | vs baseline |
-|---|---------|-----|-------------|
-| v1 | baseline (r8, 2ep, const lr) | pending | — |
-| v2 | rank 4 | pending | |
-| v3 | rank 16 | pending | |
-| v4 | 5 epochs | pending | |
-| v5 | 10 epochs | pending | |
-| v6 | chunk 128 | pending | |
-| v7 | chunk 512 | pending | |
-| v8 | context 512 | pending | |
-| v9 | min_doc 256 (adapt more) | pending | |
-| v10 | min_doc 2048 (adapt fewer) | pending | |
+**Method**: Load frozen s3 checkpoint, run LoRA TTT with one variable changed, measure BPB on the 2M subset. Compare to v1 baseline.
 
-Skipped (H100-sensitive, don't transfer from proxy):
-- LR sweep
+**Script**: `run_ttt.py` on the L40S pod at `/workspace/parameter-golf/run_ttt.py`. Supports env vars:
+- `CHECKPOINT_PATH` — which checkpoint to load
+- `VAL_TOKENS_LIMIT` — limit val tokens (not working correctly, use small val shard instead)
+- `SKIP_POSTQUANT_EVAL` — set to 1 to skip redundant post-quant BPB computation
+- All frontier_512.py TTT env vars: `TTT_LORA_RANK`, `TTT_EPOCHS`, `TTT_CHUNK_SIZE`, `TTT_EVAL_SEQ_LEN`, `TTT_BATCH_SIZE`, `TTT_MIN_DOC_LEN`, `TTT_LORA_LR`
+
+**Common env vars for all s3 runs**:
+```
+CHECKPOINT_PATH=/workspace/s3_checkpoint.int8.ptz
+NUM_LAYERS=10 VOCAB_SIZE=4096
+DATA_PATH=./data/datasets/fineweb10B_sp4096_small
+TOKENIZER_PATH=./data/tokenizers/fineweb_4096_bpe.model
+TTT_BATCH_SIZE=16
+SKIP_POSTQUANT_EVAL=1
+```
+
+**Sweep results (2M token val subset)**:
+
+| # | Variant | BPB | vs v1 baseline | Time |
+|---|---------|-----|----------------|------|
+| v1 | baseline (r8, 2ep, const lr) | 1.2645 | — | 120s |
+| v2 | rank 4 | 1.2721 | +0.0077 (worse) | 121s |
+| v3 | rank 16 | 1.2687 | +0.0043 (worse) | 121s |
+| v4 | 5 epochs | **1.0331** | **-0.2314** | 277s |
+| v5 | 10 epochs | pending | | |
+| v6 | chunk 128 | pending | | |
+| v7 | chunk 512 | pending | | |
+| v8 | context 512 | pending | | |
+| v9 | min_doc 256 | pending | | |
+| v10 | min_doc 2048 | pending | | |
+
+**Key finding so far**: Rank barely matters (r4/r8/r16 all within 0.008). Epochs is the dominant lever — 5ep gave -0.23 BPB over 2ep.
+
+**Skipped (H100-sensitive, don't transfer from proxy)**:
+- LR sweep (proxy LR ≠ 8xH100 LR)
 - Warmdown tuning
-- Batch size tuning
+- Batch size tuning (limited by L40S 48GB VRAM)
+
+**What a new session needs to continue**:
+1. SSH into L40S: `ssh root@195.26.232.151 -p 23717 -i ~/.ssh/id_ed25519`
+2. Checkpoints at `/workspace/s3_checkpoint.int8.ptz` and `/workspace/proteus_checkpoint.int8.ptz`
+3. Both also saved locally at `parameter-golf/s3_checkpoint.int8.ptz` and `parameter-golf/proteus_checkpoint.int8.ptz`
+4. Small val data at `data/datasets/fineweb10B_sp4096_small/`
+5. Run any variant with the common env vars above + specific TTT params
+6. Check sweep.log at `/workspace/sweep.log` for any in-progress results
 
 ## L40S Hardware Profile
 
