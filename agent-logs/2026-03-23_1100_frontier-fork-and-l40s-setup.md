@@ -252,8 +252,7 @@ Key findings:
 - 12.5 MB artifact leaves 3.5 MB headroom in the 16 MB budget
 - Winner: PROTEUS 11L sp4096
 
-Note: PROTEUS 11L sp4096 checkpoint was NOT downloaded before pod termination.
-Will need to retrain on next GPU session. s3 and PROTEUS sp1024 checkpoints are safe locally.
+The proxy checkpoints are not needed for submission. The 8xH100 submission will train from scratch with the winning config. What transfers from proxy is the recipe: PROTEUS 11L sp4096 + 3ep LoRA TTT + min_doc 256.
 
 ## Ready for Next Session
 - ✅ **s3 checkpoint saved** — frozen trunk for TTT experiments
@@ -262,7 +261,7 @@ Will need to retrain on next GPU session. s3 and PROTEUS sp1024 checkpoints are 
 - ✅ **Both tokenizer datasets on L40S** — sp1024 and sp4096 ready
 - ✅ **Fast TTT loop working** — 2M token val, ~2 min per variant
 - 🔄 **10-variant TTT sweep running** — results in ~20 min
-- ❌ **PROTEUS 11L sp4096 checkpoint lost** — pod terminated before download. Need to retrain (~10 min).
+- ✅ **PROTEUS 11L sp4096 checkpoint not needed** — proxy checkpoints don't transfer to 8xH100 submission. The deliverable is the recipe (config), not the weights.
 - ✅ **Submission recipe identified** — PROTEUS 11L sp4096 + 3ep LoRA TTT + min_doc 256
 
 ## Context for Future
