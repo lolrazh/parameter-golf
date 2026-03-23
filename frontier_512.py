@@ -465,7 +465,8 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             continue
 
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor(t, bits=6)
+        bits = 5 if ".mlp." in name else 6
+        q, s = quantize_float_tensor(t, bits=bits)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
