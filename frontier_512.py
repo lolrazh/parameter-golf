@@ -104,6 +104,7 @@ class Hyperparameters:
     ttt_min_doc_len = int(os.environ.get("TTT_MIN_DOC_LEN", 1024))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 2))
     ttt_cosine = bool(int(os.environ.get("TTT_COSINE", "0")))
+    val_tokens_limit = int(os.environ.get("VAL_TOKENS_LIMIT", 0))  # 0=full val set
     ttt_sf_enabled = bool(int(os.environ.get("TTT_SF_ENABLED", "0")))  # score-first full-weight TTT
     ttt_sf_chunk = int(os.environ.get("TTT_SF_CHUNK", 32768))  # 32K tokens per chunk
     ttt_sf_lr = float(os.environ.get("TTT_SF_LR", 0.002))
@@ -1191,6 +1192,74 @@ def eval_val_ttt_lora(
         p.requires_grad_(True)
     return val_loss, val_bpb
 
+def eval_val_ttt_score_first(
+    args: Hyperparameters, base_model, rank: int, world_size: int, device: torch.device,
+    base_bytes_lut: Tensor, has_leading_space_lut: Tensor, is_boundary_token_lut: Tensor,
+) -> tuple[float, float]:
+    """Score-first full-weight TTT (PR #549 style). Score chunk, then train on graded tokens."""
+    files = sorted(glob.glob(args.val_files))
+    all_tokens = torch.cat([load_data_shard(Path(f)) for f in files])
+    if args.val_tokens_limit > 0:
+        all_tokens = all_tokens[:args.val_tokens_limit + 1]
+    total = all_tokens.numel() - 1
+    chunk = args.ttt_sf_chunk
+    num_chunks = (total + chunk - 1) // chunk
+    master = rank == 0
+
+    base_model.eval()
+    for p in base_model.parameters():
+        p.requires_grad_(False)
+
+    opt = torch.optim.SGD(base_model.parameters(), lr=args.ttt_sf_lr, momentum=args.ttt_sf_mom)
+
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    byte_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    t0 = time.perf_counter()
+
+    for ci in range(num_chunks):
+        cs = ci * chunk
+        ce = min(cs + chunk, total)
+        cl = ce - cs
+        x = all_tokens[cs:ce].to(device=device, dtype=torch.int64).unsqueeze(0)
+        y = all_tokens[cs + 1:ce + 1].to(device=device, dtype=torch.int64).unsqueeze(0)
+
+        # Phase 1: SCORE (no grad)
+        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            logits = base_model.get_logits(x)
+        per_tok = F.cross_entropy(logits[0].float(), y[0], reduction="none")
+        loss_sum += per_tok.to(torch.float64).sum()
+        token_count += cl
+        tb = base_bytes_lut[y[0]].to(torch.float64)
+        tb += (has_leading_space_lut[y[0]] & ~is_boundary_token_lut[x[0]]).to(torch.float64)
+        byte_sum += tb.sum()
+
+        # Phase 2: TRAIN on graded chunk (multi-epoch)
+        for p in base_model.parameters():
+            p.requires_grad_(True)
+        base_model.train()
+        for ep in range(args.ttt_sf_epochs):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                loss = base_model(x, y)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+        base_model.eval()
+        for p in base_model.parameters():
+            p.requires_grad_(False)
+
+        if master and (ci + 1) % 10 == 0:
+            elapsed = 1000 * (time.perf_counter() - t0)
+            avg = loss_sum.item() / max(token_count.item(), 1)
+            print(f"ttt_sf:chunk {ci+1}/{num_chunks} time={elapsed:.0f}ms avg_loss={avg:.4f}")
+
+    val_loss = float(loss_sum.item() / max(token_count.item(), 1))
+    val_bpb = float((loss_sum.item() / math.log(2.0)) / max(byte_sum.item(), 1))
+    base_model.train()
+    for p in base_model.parameters():
+        p.requires_grad_(True)
+    return val_loss, val_bpb
+
 def eval_val_sliding(
     args, base_model: nn.Module, rank: int, world_size: int, device: torch.device,
     val_tokens: Tensor, base_bytes_lut: Tensor, has_leading_space_lut: Tensor,
@@ -1717,8 +1786,28 @@ def main() -> None:
     )
     log0(f"final_ttt_lora_exact val_loss:{ttt_val_loss:.8f} val_bpb:{ttt_val_bpb:.8f}")
     ttt_gap_bpb = ttt_val_bpb - q_val_bpb
-    log0(f"ttt_gain: {-ttt_gap_bpb:.6f} BPB gain over int8 (int8:{q_val_bpb:.6f} ttt:{ttt_val_bpb:.6f})")
+    log0(f"ttt_gain_lora: {-ttt_gap_bpb:.6f} BPB gain over int8 (int8:{q_val_bpb:.6f} ttt:{ttt_val_bpb:.6f})")
     log0(f"phase:ttt_eval wall_ms:{1000.0*(time.perf_counter()-phase_t):.0f}")
+
+    # Score-first full-weight TTT (PR #549 style) — reload quantized checkpoint
+    if args.ttt_sf_enabled:
+        phase_t = time.perf_counter()
+        log0("ttt_sf:start — reloading quantized checkpoint for score-first TTT")
+        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+        base_model.to(device).bfloat16()
+        sf_val_loss, sf_val_bpb = eval_val_ttt_score_first(
+            args, base_model, rank, world_size, device,
+            base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        )
+        log0(
+            f"final_ttt_sf val_loss:{sf_val_loss:.4f} val_bpb:{sf_val_bpb:.4f} "
+            f"eval_time:{1000.0*(time.perf_counter()-phase_t):.0f}ms"
+        )
+        log0(f"final_ttt_sf_exact val_loss:{sf_val_loss:.8f} val_bpb:{sf_val_bpb:.8f}")
+        sf_gap = sf_val_bpb - q_val_bpb
+        log0(f"ttt_gain_sf: {-sf_gap:.6f} BPB gain over int8 (int8:{q_val_bpb:.6f} ttt_sf:{sf_val_bpb:.6f})")
+        log0(f"phase:ttt_sf_eval wall_ms:{1000.0*(time.perf_counter()-phase_t):.0f}")
+
     total_wall_ms = 1000.0 * (time.perf_counter() - wall_start)
     log0(f"phase:TOTAL wall_ms:{total_wall_ms:.0f} ({total_wall_ms/60000:.1f} min)")
     log0(f"phase_breakdown: train:{training_time_ms:.0f}ms postprocess:see_above serialize:see_above eval:see_above ttt:see_above")
