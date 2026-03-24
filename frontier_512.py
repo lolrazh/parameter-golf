@@ -454,7 +454,21 @@ def quantize_float_tensor(t: Tensor, bits: int = 8) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -max_val, max_val).to(torch.int8).contiguous()
     return q, scale
 
-def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
+def _quant_bits_for_name(name: str, preset: str) -> int:
+    """Determine quantization bits based on preset. front3_back1_8_middle6: int8 for
+    first 3 and last 1 layers, int6 for middle. int5mlp: int5 for MLP, int6 for rest."""
+    if preset == "front3_back1_8_middle6":
+        parts = name.split(".")
+        if "blocks" in parts:
+            idx = int(parts[parts.index("blocks") + 1])
+            total = int(os.environ.get("NUM_LAYERS", 11))
+            if idx < 3 or idx >= total - 1:
+                return 8
+            return 6
+        return 6
+    return 5 if ".mlp." in name else 6
+
+def quantize_state_dict_int8(state_dict: dict[str, Tensor], quant_preset: str = "int5mlp"):
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
     dtypes: dict[str, str] = {}
@@ -492,7 +506,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             continue
 
         stats["num_float_tensors"] += 1
-        bits = 5 if ".mlp." in name else 6
+        bits = _quant_bits_for_name(name, quant_preset)
         q, s = quantize_float_tensor(t, bits=bits)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
@@ -1313,7 +1327,7 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params} world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0(f"optimizations: fuse_qkv:{FUSE_QKV} batch_muon:{BATCH_MUON} fa3:{HAS_FA3}")
+    log0(f"optimizations: fuse_qkv:{FUSE_QKV} batch_muon:{BATCH_MUON} fa3:{HAS_FA3} gptq_lite:{GPTQ_LITE} qat:{args.qat_start_frac} quant:{args.quant_preset}")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}")
     log0(f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} iterations:{args.iterations} warmup_steps:{args.warmup_steps} max_wallclock_seconds:{args.max_wallclock_seconds:.3f}")
@@ -1445,7 +1459,7 @@ def main() -> None:
             with torch.no_grad():
                 for name, p in base_model.named_parameters():
                     if p.ndim == 2 and p.numel() > INT8_KEEP_FLOAT_MAX_NUMEL:
-                        bits = 5 if ".mlp." in name else 6
+                        bits = _quant_bits_for_name(name, args.quant_preset)
                         fp = p.data.float()
                         q, s = quantize_float_tensor(fp, bits=bits)
                         p.data.copy_((q.float() * s[:, None] if s.ndim > 0 else q.float() * s).to(p.dtype))
@@ -1558,7 +1572,7 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict(), quant_preset=args.quant_preset)
     if master_process:
         for name in sorted(quant_obj.get("quantized", {}).keys()):
             q = quant_obj["quantized"][name]
