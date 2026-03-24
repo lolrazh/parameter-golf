@@ -104,6 +104,11 @@ class Hyperparameters:
     ttt_min_doc_len = int(os.environ.get("TTT_MIN_DOC_LEN", 1024))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 2))
     ttt_cosine = bool(int(os.environ.get("TTT_COSINE", "0")))
+    ttt_sf_enabled = bool(int(os.environ.get("TTT_SF_ENABLED", "0")))  # score-first full-weight TTT
+    ttt_sf_chunk = int(os.environ.get("TTT_SF_CHUNK", 32768))  # 32K tokens per chunk
+    ttt_sf_lr = float(os.environ.get("TTT_SF_LR", 0.002))
+    ttt_sf_mom = float(os.environ.get("TTT_SF_MOM", 0.9))
+    ttt_sf_epochs = int(os.environ.get("TTT_SF_EPOCHS", 3))
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
@@ -798,7 +803,7 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
+        x = F.leaky_relu(self.fc(x), negative_slope=0.5)
         return self.proj(x.square())
 
 class Block(nn.Module):
