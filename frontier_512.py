@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 import uuid
+import lzma
 import zlib
 try:
     import zstandard as zstd
@@ -60,7 +61,7 @@ class Hyperparameters:
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 0))
     qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.0))  # 0=disabled, 0.15=enable when lr_scale<0.15
-    quant_preset = os.environ.get("QUANT_PRESET", "int5mlp")  # int5mlp | front3_back1_8_middle6
+    quant_preset = os.environ.get("QUANT_PRESET", "int5mlp")  # int5mlp | uniform_int6 | front3_back1_7_middle5 | front3_back1_7_middle6 | front3_back1_6_middle5 | front3_back1_8_middle6
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -464,6 +465,8 @@ def quantize_float_tensor(t: Tensor, bits: int = 8) -> tuple[Tensor, Tensor]:
 
 def _quant_bits_for_name(name: str, preset: str) -> int:
     """Determine quantization bits based on preset and layer position."""
+    if preset == "uniform_int6":
+        return 6
     if preset.startswith("front"):
         parts = name.split(".")
         if "blocks" in parts:
@@ -472,9 +475,16 @@ def _quant_bits_for_name(name: str, preset: str) -> int:
             is_sensitive = idx < 3 or idx >= total - 1
             if preset == "front3_back1_8_middle6":
                 return 8 if is_sensitive else 6
+            if preset == "front3_back1_7_middle5":
+                return 7 if is_sensitive else 5
+            if preset == "front3_back1_7_middle6":
+                return 7 if is_sensitive else 6
             if preset == "front3_back1_6_middle5":
                 return 6 if is_sensitive else 5
-        return 6 if preset == "front3_back1_8_middle6" else 5
+        # fallback for non-block tensors
+        if "8" in preset: return 6
+        if "7" in preset and "middle6" in preset: return 6
+        return 5
     return 5 if ".mlp." in name else 6
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor], quant_preset: str = "int5mlp"):
@@ -1697,22 +1707,34 @@ def main() -> None:
         quant_blob = zlib.compress(quant_raw, level=9)
         compress_label = "zlib-9"
     quant_raw_bytes = len(quant_raw)
+    # Also compress with LZMA for comparison
+    lzma_blob = lzma.compress(quant_raw, preset=9 | lzma.PRESET_EXTREME)
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
             f.write(quant_blob)
         quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+        lzma_file_bytes = len(lzma_blob)
+        with open("final_model.int8.ptl", "wb") as f:
+            f.write(lzma_blob)
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         log0(
             f"Serialized model {compress_label}: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
+        log0(f"Serialized model lzma-9e: {lzma_file_bytes} bytes")
         total_size = quant_file_bytes + code_bytes
+        total_size_lzma = lzma_file_bytes + code_bytes
         log0(f"Total submission size {compress_label}: {total_size} bytes")
+        log0(f"Total submission size lzma-9e: {total_size_lzma} bytes")
         if total_size > 16_000_000:
             log0(f"WARNING: Total size {total_size} exceeds 16MB limit!")
         else:
             log0(f"Size check PASSED: {total_size} / 16,000,000 ({100*total_size/16_000_000:.1f}%)")
+        # Save raw state dict for re-quantization experiments
+        if int(os.environ.get("SAVE_RAW_CHECKPOINT", 0)):
+            torch.save(base_model.state_dict(), "final_model_raw.pt")
+            log0(f"Raw checkpoint saved: {os.path.getsize('final_model_raw.pt')} bytes")
 
     log0(f"phase:serialize wall_ms:{1000.0*(time.perf_counter()-phase_t):.0f} (quant+compress+save)")
     phase_t = time.perf_counter()

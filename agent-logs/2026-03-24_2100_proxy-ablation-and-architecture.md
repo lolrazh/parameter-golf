@@ -109,5 +109,19 @@ Only the first `ROPE_DIMS` dimensions of each attention head get rotary position
 - PR #549 gets only -0.0025 BPB from their version — the technique is inherently fragile
 - LoRA TTT (rank-8, ~200K trainable params) is much more stable: -0.087 BPB gain
 
+## Run 6b: Front-heavy int8 quant on 11L sp1024 (1xH100 proxy)
+- Config: 11L sp1024, XSA4, Partial RoPE 16/64, LeakyReLU(0.5)², QUANT_PRESET=front3_back1_8_middle6, LoRA TTT 1ep
+- Params: 26,829,913
+- Steps: 3,374 @ 177.87ms/step (wallclock cap at 600s)
+- SWA: 8 checkpoints from step 3000
+- Pruning: zeroed 800,146 weights (3.0%)
+- Pre-quant BPB: **1.3426** (exact: 1.34258975)
+- Post-quant BPB: **1.3457** (exact: 1.34569230)
+- Quant gap: **0.003** (excellent — front-heavy int8 nearly eliminates quant damage)
+- Artifact (zstd-22): **17,535,043 bytes (~17.5 MB)** — WARNING: 1.5MB over 16MB limit
+- TTT: **INCOMPLETE** — reached batch 605/679, process died/was killed before final eval. No final_ttt_lora_exact line.
+- Peak memory: 4,146 MiB
+- Verdict: **REJECTED** — 17.5MB over 16MB limit. Great quant gap (0.003) confirms front-heavy int8 is excellent for quality, but int8 weights have too much entropy for zstd to compress under 16MB. Same lesson as Run 2b/2c (18.8MB on sp4096 10L) — int8 is incompatible with the artifact size constraint regardless of tokenizer or layer count.
+
 ## Context for Future
 The proxy ablation shows that naive QAT is not worth it at proxy scale — the training cost exceeds the quant gap reduction. Front-heavy int8 quant is powerful (0.003 quant gap) but the artifact is too large. The best legal configuration is front3_back1_6_middle5 with no QAT, yielding 1.2506 post-TTT BPB on 1xH100 PCIe proxy. The architecture pivot to sp1024 11L with XSA + Partial RoPE is ready to test — these are the key features from the SOTA PR #315 that we haven't tried yet. If Soft-Round QAT (PR #606) pans out, it could further close the quant gap without the training cost penalty of naive STE.
