@@ -242,3 +242,13 @@ Key negative results: EMA hurt (r20: quant gap 0.155), high momentum hurt (r15),
 | **s4-1337** | **s4_seed1337** | **10L sp4096, int5 MLP, wd=2000, 3ep TTT** | **1337** | **8,244** | **72.8** | **1.1543** | **1.1944** | **0.9598** | **14,762,244** | **VALID — best seed** |
 | **s4-2024** | **s4_seed2024** | **10L sp4096, int5 MLP, wd=2000, 3ep TTT** | **2024** | **8,239** | **72.8** | **1.1557** | **1.1955** | **0.9623** | **14,672,017** | **VALID** |
 | | | **Mean (3 seeds)** | | **8,240** | | **1.1562** | **1.1965** | **0.9619** | | **SOTA: 1.1428. We beat by 0.181 BPB.** |
+
+**1xH100 PCIe proxy ablation (10L sp4096, 131K batch, 10 min, 1-epoch TTT, GPTQ-lite on all)**
+
+| # | Run ID | Config | steps | step_ms | pre-quant BPB | post-quant BPB | quant gap | post-TTT BPB | artifact MB | verdict |
+|---|--------|--------|-------|---------|---------------|----------------|-----------|--------------|-------------|---------|
+| run1 | proxy_baseline | no QAT, int5mlp, seq1024 | 3799 | 158 | 1.2570 | 1.2796 | 0.0226 | 1.2544 | 14.4 | baseline |
+| run2 | proxy_qat_int5mlp | QAT@0.15, int5mlp, seq1024 | 3664 | 164 | 1.2737 | 1.2856 | 0.0119 | 1.2629 | 14.6 | QAT hurts on proxy |
+| run2b | proxy_qat_front8 | QAT@0.15, front3_back1_8_mid6 | 3669 | 164 | 1.2687 | 1.2719 | 0.0032 | 1.2510 | 18.8 | best quant gap, over 16MB |
+| run2c | proxy_front8_noqat | no QAT, front3_back1_8_mid6 | 3796 | 158 | 1.2566 | 1.2596 | 0.0030 | 1.2397 | 18.8 | best BPB, over 16MB |
+| run2d | proxy_front6mid5 | no QAT, front3_back1_6_mid5 | 3778 | 159 | 1.2567 | 1.2735 | 0.0168 | 1.2506 | 14.7 | BEST legal option |
