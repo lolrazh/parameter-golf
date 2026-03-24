@@ -1315,6 +1315,7 @@ def main() -> None:
         mlp_hidden=args.mlp_hidden, tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std, logit_softcap=args.logit_softcap,
         rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
+        rope_dims=args.rope_dims, xsa_last_n=args.xsa_last_n,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1695,6 +1696,7 @@ def main() -> None:
         mlp_hidden=args.mlp_hidden, tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std, logit_softcap=args.logit_softcap,
         rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
+        rope_dims=args.rope_dims, xsa_last_n=args.xsa_last_n,
     ).to(device)
     ttt_model.load_state_dict(base_model.state_dict(), strict=True)
     t_ttt = time.perf_counter()
