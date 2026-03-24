@@ -92,5 +92,22 @@ Only the first `ROPE_DIMS` dimensions of each attention head get rotary position
 - PR #490 (1.0891 claimed) was flagged — used illegal pre-eval TTT. Interesting techniques: Value Residual + Gated Attention.
 - Sliding window eval ran on full 62M val set (not VAL_TOKENS_LIMIT) — caused 50+ min hang on proxy. Bug in eval pipeline. Need to fix or just skip on proxy.
 
+## Run 6: LeakyReLU² + TTT Method Comparison (11L sp1024, 1xH100)
+- Config: 11L sp1024, XSA4, Partial RoPE 16/64, LeakyReLU(0.5)², front3_back1_6_middle5 quant
+- Steps: 3,374 @ 177ms/step (slightly slower than Run 5's relu² at 175ms)
+- Pre-quant BPB: 1.3425 (vs Run 5's 1.3499 — LeakyReLU² helped by -0.007)
+- Post-quant BPB: 1.3587 (quant gap: 0.016)
+- Artifact: 12.8 MB
+- LoRA TTT (1ep): **1.2718 BPB** (gain: -0.087). WINNER.
+- Score-first full-weight TTT: **2.2001 BPB** (CATASTROPHICALLY WORSE). SGD lr=0.002 on 26.8M params destroys the model.
+- Verdict: Stick with LoRA TTT. Score-first full-weight TTT doesn't work for our architecture.
+
+## Score-First TTT Post-Mortem
+- Implementation was correct (verified: scoring happens before training, no data leakage)
+- Bug found and fixed: `.bfloat16()` call corrupted CastedLinear float32 weights on checkpoint reload
+- Even after fix, SGD(lr=0.002, mom=0.9) on full 26.8M params is too aggressive
+- PR #549 gets only -0.0025 BPB from their version — the technique is inherently fragile
+- LoRA TTT (rank-8, ~200K trainable params) is much more stable: -0.087 BPB gain
+
 ## Context for Future
 The proxy ablation shows that naive QAT is not worth it at proxy scale — the training cost exceeds the quant gap reduction. Front-heavy int8 quant is powerful (0.003 quant gap) but the artifact is too large. The best legal configuration is front3_back1_6_middle5 with no QAT, yielding 1.2506 post-TTT BPB on 1xH100 PCIe proxy. The architecture pivot to sp1024 11L with XSA + Partial RoPE is ready to test — these are the key features from the SOTA PR #315 that we haven't tried yet. If Soft-Round QAT (PR #606) pans out, it could further close the quant gap without the training cost penalty of naive STE.

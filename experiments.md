@@ -253,3 +253,4 @@ Key negative results: EMA hurt (r20: quant gap 0.155), high momentum hurt (r15),
 | run2c | proxy_front8_noqat | no QAT, front3_back1_8_mid6 | 3796 | 158 | 1.2566 | 1.2596 | 0.0030 | 1.2397 | 18.8 | best BPB, over 16MB |
 | run2d | proxy_front6mid5 | no QAT, front3_back1_6_mid5 | 3778 | 159 | 1.2567 | 1.2735 | 0.0168 | 1.2506 | 14.7 | BEST legal option |
 | run5 | proxy_11L_sp1024_xsa4_prope | 11L sp1024, XSA4, PartialRoPE 16/64, front6mid5 | 3432 | 175 | 1.3499 | 1.3645 | 0.0146 | 1.2736 | 12.9 | 11L needs more steps — proxy undertrained |
+| run6 | proxy_11L_leakyrelu_ttt_cmp | 11L sp1024, XSA4, PartialRoPE, LeakyReLU², front6mid5 | 3374 | 177 | 1.3425 | 1.3587 | 0.016 | 1.2718 (lora) / 2.2001 (sf) | 12.8 | LeakyReLU helps, score-first TTT broken |
