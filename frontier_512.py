@@ -1771,13 +1771,20 @@ def main() -> None:
     log0(f"phase:postquant_eval wall_ms:{1000.0*(time.perf_counter()-phase_t):.0f}")
     phase_t = time.perf_counter()
 
+    # Reset dynamo before using base_model directly (sliding window + TTT)
+    # torch.compile hooks on base_model can corrupt get_logits() calls at different seq_len
+    torch.cuda.synchronize()
+    torch._dynamo.reset()
+    del model, compiled_model  # drop compiled references
+
     if args.eval_stride > 0:
-        torch.cuda.synchronize()
         t_slide = time.perf_counter()
+        # Use train_seq_len for sliding window — NTK-scaled RoPE at longer seq corrupts positions
+        slide_seq_len = args.train_seq_len
         s_val_loss, s_val_bpb = eval_val_sliding(
             args, base_model, rank, world_size, device,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            eval_seq_len=effective_eval_seq_len, eval_stride=args.eval_stride,
+            eval_seq_len=slide_seq_len, eval_stride=args.eval_stride,
         )
         torch.cuda.synchronize()
         log0(
@@ -1786,9 +1793,6 @@ def main() -> None:
             f"stride:{args.eval_stride} seq_len:{effective_eval_seq_len}"
         )
         log0(f"final_sliding_window_exact val_loss:{s_val_loss:.8f} val_bpb:{s_val_bpb:.8f}")
-
-    torch.cuda.synchronize()
-    torch._dynamo.reset()
     ttt_model = GPT(vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
         num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
         mlp_hidden=args.mlp_hidden, tie_embeddings=args.tie_embeddings,
