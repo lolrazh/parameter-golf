@@ -61,6 +61,7 @@ class Hyperparameters:
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 0))
     qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.0))  # 0=disabled, 0.15=enable when lr_scale<0.15
+    entropy_reg = float(os.environ.get("ENTROPY_REG", 0.0))  # 0=disabled, ~0.01=mild entropy regularization during QAT
     quant_preset = os.environ.get("QUANT_PRESET", "int5mlp")  # int5mlp | uniform_int6 | front3_back1_7_middle5 | front3_back1_7_middle6 | front3_back1_6_middle5 | front3_back1_8_middle6
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
@@ -106,6 +107,10 @@ class Hyperparameters:
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 2))
     ttt_cosine = bool(int(os.environ.get("TTT_COSINE", "0")))
     val_tokens_limit = int(os.environ.get("VAL_TOKENS_LIMIT", 0))  # 0=full val set
+    ttt_lact = bool(int(os.environ.get("TTT_LACT", "0")))  # LaCT: Muon optimizer + large chunks for TTT
+    ttt_lact_lr = float(os.environ.get("TTT_LACT_LR", 0.02))  # Muon-style LR for LaCT
+    ttt_lact_chunk = int(os.environ.get("TTT_LACT_CHUNK", 4096))  # large chunk (full doc)
+    ttt_lact_ns_steps = int(os.environ.get("TTT_LACT_NS_STEPS", 5))  # Newton-Schulz iterations
     ttt_sf_enabled = bool(int(os.environ.get("TTT_SF_ENABLED", "0")))  # score-first full-weight TTT
     ttt_sf_chunk = int(os.environ.get("TTT_SF_CHUNK", 32768))  # 32K tokens per chunk
     ttt_sf_lr = float(os.environ.get("TTT_SF_LR", 0.002))
@@ -421,6 +426,37 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
 
 GPTQ_LITE = bool(int(os.environ.get("GPTQ_LITE", "1")))
 GPTQ_LITE_PERCENTILES = [0.999, 0.9995, 0.9999, 0.99999, 1.0]
+DUQUANT = bool(int(os.environ.get("DUQUANT", "0")))
+DUQUANT_BLOCK = int(os.environ.get("DUQUANT_BLOCK", 512))
+
+def _hadamard_matrix(n: int) -> Tensor:
+    """Build n×n normalized Hadamard matrix (orthogonal, H @ H = I)."""
+    # Recursive construction: H_1 = [1], H_{2n} = [[H_n, H_n], [H_n, -H_n]] / sqrt(2)
+    H = torch.ones(1, 1)
+    while H.size(0) < n:
+        H = torch.cat([
+            torch.cat([H, H], dim=1),
+            torch.cat([H, -H], dim=1),
+        ], dim=0) / math.sqrt(2.0)
+    return H
+
+def _block_hadamard_rotate(W: Tensor, block_size: int = 512) -> Tensor:
+    """Apply block-diagonal Hadamard rotation along columns (input dim).
+    W: [out_features, in_features]. Rotation along dim=1.
+    Block size must divide in_features. Returns rotated W (same shape)."""
+    out_f, in_f = W.shape
+    if in_f % block_size != 0:
+        # Pad to next multiple, rotate, unpad
+        pad = block_size - (in_f % block_size)
+        W_pad = F.pad(W, (0, pad))
+        W_rot = _block_hadamard_rotate(W_pad, block_size)
+        return W_rot[:, :in_f]
+    H = _hadamard_matrix(block_size).to(dtype=W.dtype, device=W.device)
+    n_blocks = in_f // block_size
+    blocks = W.reshape(out_f, n_blocks, block_size)
+    # Rotate each block: blocks @ H^T (H is symmetric so H^T = H)
+    rotated = torch.einsum('obk,kj->obj', blocks, H)
+    return rotated.reshape(out_f, in_f)
 
 def quantize_float_tensor(t: Tensor, bits: int = 8) -> tuple[Tensor, Tensor]:
     max_val = 127 if bits == 8 else (2 ** (bits - 1)) - 1  # int6: 31, int8: 127
@@ -526,9 +562,20 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor], quant_preset: str = 
 
         stats["num_float_tensors"] += 1
         bits = _quant_bits_for_name(name, quant_preset)
-        q, s = quantize_float_tensor(t, bits=bits)
+        t_quant = t
+        used_hadamard = False
+        if DUQUANT and t.ndim == 2:
+            t_quant = _block_hadamard_rotate(t.float(), DUQUANT_BLOCK).to(dtype=t.dtype)
+            used_hadamard = True
+        q, s = quantize_float_tensor(t_quant, bits=bits)
+        meta = {}
         if s.ndim > 0:
-            qmeta[name] = {"scheme": "per_row", "axis": 0}
+            meta["scheme"] = "per_row"
+            meta["axis"] = 0
+        if used_hadamard:
+            meta["hadamard"] = DUQUANT_BLOCK
+        if meta:
+            qmeta[name] = meta
         quantized[name] = q
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
@@ -556,10 +603,15 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
         s = obj["scales"][name]
         if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
             s = s.to(dtype=torch.float32)
-            out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
+            w = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1))))
         else:
             scale = float(s.item())
-            out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
+            w = q.float() * scale
+        # Inverse Hadamard rotation (normalized Hadamard is its own inverse)
+        had_block = qmeta.get(name, {}).get("hadamard")
+        if had_block and w.ndim == 2:
+            w = _block_hadamard_rotate(w, had_block)
+        out[name] = w.to(dtype=dtype).contiguous()
     for name, t in obj["passthrough"].items():
         out_t = t.detach().to("cpu").contiguous()
         orig_dtype = passthrough_orig_dtypes.get(name)
@@ -990,7 +1042,59 @@ class BatchedTTTLoRA(nn.Module):
             if isinstance(m, BatchedLinearLoRA):
                 m.reset()
 
-def _reset_ttt_optimizer(opt: torch.optim.Adam) -> None:
+class MuonTTTOptimizer:
+    """Muon-style optimizer for TTT LoRA: Newton-Schulz orthogonalized gradient step."""
+    def __init__(self, params, lr=0.02, momentum=0.9, ns_steps=5):
+        self.param_groups = [{"params": list(params), "lr": lr, "base_lr": lr}]
+        self.lr = lr
+        self.momentum = momentum
+        self.ns_steps = ns_steps
+        self.state: dict[int, dict] = {}
+
+    def zero_grad(self):
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is not None:
+                    p.grad.zero_()
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            lr = group.get("lr", self.lr)
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad.data
+                if g.ndim < 2:
+                    # Scalar/1D params: plain SGD with momentum
+                    sid = id(p)
+                    if sid not in self.state:
+                        self.state[sid] = {"buf": torch.zeros_like(g)}
+                    buf = self.state[sid]["buf"]
+                    buf.mul_(self.momentum).add_(g)
+                    p.data.add_(buf, alpha=-lr)
+                    continue
+                # 2D+ params (LoRA A/B): batched Newton-Schulz
+                sid = id(p)
+                if sid not in self.state:
+                    self.state[sid] = {"buf": torch.zeros_like(g)}
+                buf = self.state[sid]["buf"]
+                buf.mul_(self.momentum).add_(g)
+                # Apply NS to each batch element
+                G = buf.bfloat16()
+                if G.ndim == 2:
+                    G = G.unsqueeze(0)
+                G_ns = batched_newton_schulz(G, steps=self.ns_steps)
+                p.data.add_(G_ns.to(dtype=p.dtype).reshape(p.shape), alpha=-lr)
+
+    def reset(self):
+        for sid in self.state:
+            self.state[sid]["buf"].zero_()
+
+def _reset_ttt_optimizer(opt) -> None:
+    if isinstance(opt, MuonTTTOptimizer):
+        opt.reset()
+        return
     for group in opt.param_groups:
         for p in group["params"]:
             s = opt.state.get(p)
@@ -1000,7 +1104,10 @@ def _reset_ttt_optimizer(opt: torch.optim.Adam) -> None:
             s["exp_avg_sq"].zero_()
             s["step"].fill_(0)
 
-def _build_ttt_optimizer(lora: BatchedTTTLoRA, args: Hyperparameters) -> torch.optim.Adam:
+def _build_ttt_optimizer(lora: BatchedTTTLoRA, args: Hyperparameters):
+    if args.ttt_lact:
+        return MuonTTTOptimizer(lora.parameters(), lr=args.ttt_lact_lr,
+                                 momentum=0.9, ns_steps=args.ttt_lact_ns_steps)
     return torch.optim.Adam(lora.parameters(), lr=args.ttt_lora_lr,
                             betas=(args.beta1, args.beta2), eps=1e-10)
 
@@ -1116,9 +1223,9 @@ def eval_val_ttt_lora(
     if master:
         print(f"ttt:short_docs time={1000*(time.perf_counter()-t0):.0f}ms tokens={int(token_count.item())}")
 
-    long_docs.sort(key=lambda d: (d[1] - 2) // args.ttt_chunk_size)
+    chunk_size = args.ttt_lact_chunk if args.ttt_lact else args.ttt_chunk_size
+    long_docs.sort(key=lambda d: (d[1] - 2) // chunk_size)
     batch_size = args.ttt_batch_size
-    chunk_size = args.ttt_chunk_size
     eval_seq_len = args.ttt_eval_seq_len
     lora = BatchedTTTLoRA(batch_size, base_model, args.ttt_lora_rank).to(device)
     opt = _build_ttt_optimizer(lora, args)
@@ -1449,7 +1556,8 @@ def main() -> None:
     log0(f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}")
     log0(f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} iterations:{args.iterations} warmup_steps:{args.warmup_steps} max_wallclock_seconds:{args.max_wallclock_seconds:.3f}")
     log0(f"seed:{args.seed} ema_enabled:{args.ema_enabled} ema_decay:{args.ema_decay} ema_every:{args.ema_every}")
-    log0(f"ttt_lora_rank:{args.ttt_lora_rank} ttt_lora_lr:{args.ttt_lora_lr} ttt_chunk_size:{args.ttt_chunk_size}")
+    lact_str = f" lact:True lr:{args.ttt_lact_lr} chunk:{args.ttt_lact_chunk} ns:{args.ttt_lact_ns_steps}" if args.ttt_lact else ""
+    log0(f"ttt_lora_rank:{args.ttt_lora_rank} ttt_lora_lr:{args.ttt_lora_lr} ttt_chunk_size:{args.ttt_chunk_size}{lact_str}")
 
     ema_state: dict[str, Tensor] = {}
     _ema_updated = False
@@ -1546,12 +1654,28 @@ def main() -> None:
 
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
+        qat_active = args.qat_start_frac > 0 and scale < args.qat_start_frac
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
+            # Entropy regularization: penalize distance to quantization grid points
+            if qat_active and args.entropy_reg > 0 and micro_step == 0:
+                ent_loss = torch.zeros((), device=device)
+                for name, p in base_model.named_parameters():
+                    if p.ndim == 2 and p.numel() > INT8_KEEP_FLOAT_MAX_NUMEL:
+                        bits = _quant_bits_for_name(name, args.quant_preset)
+                        max_val = 127 if bits == 8 else (2 ** (bits - 1)) - 1
+                        pf = p.float()
+                        row_max = pf.abs().amax(dim=1, keepdim=True).clamp_min(1e-8)
+                        row_scale = row_max / float(max_val)
+                        # Soft quantization residual: distance to nearest grid point
+                        scaled = pf / row_scale
+                        residual = scaled - scaled.round()
+                        ent_loss = ent_loss + (residual ** 2).mean()
+                loss = loss + args.entropy_reg * ent_loss
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
