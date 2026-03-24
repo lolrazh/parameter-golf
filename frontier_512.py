@@ -1794,7 +1794,6 @@ def main() -> None:
         phase_t = time.perf_counter()
         log0("ttt_sf:start — reloading quantized checkpoint for score-first TTT")
         base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
-        base_model.to(device).bfloat16()
         sf_val_loss, sf_val_bpb = eval_val_ttt_score_first(
             args, base_model, rank, world_size, device,
             base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
