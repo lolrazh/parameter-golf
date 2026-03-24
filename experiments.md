@@ -224,3 +224,21 @@ Key negative results: EMA hurt (r20: quant gap 0.155), high momentum hurt (r15),
 | ttt-v10 | ttt_v10 | min_doc 2048 | 1.3028 | +0.038 | 60s | worse |
 | ttt-c1 | ttt_c1 | 5ep + cosine | 1.3158 | +0.051 | 139s | cosine hurts |
 | ttt-c2 | ttt_c2 | 10ep + cosine | 1.2934 | +0.029 | 260s | cosine hurts |
+
+**1xH100 PCIe optimization benchmark (Thunder Compute, 10L sp1024, 131K batch, 30 steps)**
+
+| # | Run ID | Config | step_ms (stable) | step_avg | speedup | verdict |
+|---|--------|--------|------------------|----------|---------|---------|
+| opt-1 | baseline_1xh100 | Separate QKV + Unbatched Muon + SDPA | ~187ms | 189.4ms | — | baseline |
+| opt-2 | fused_batched_sdpa | Fused QKV + Batched Muon + SDPA | ~170ms | 172.6ms | 9.0% | batched Muon is the big win |
+| opt-3 | fused_batched_fa3 | Fused QKV + Batched Muon + FA3 | ~153ms | 154.3ms | 18.5% | FA3 now faster with fused QKV layout |
+
+**8xH100 SXM submission runs (frontier_512.py, fused QKV, batched Muon, FA3, int5 MLP)**
+
+| # | Run ID | Config | seed | steps | step_ms | prequant BPB | postquant BPB | post-TTT BPB | artifact bytes | verdict |
+|---|--------|--------|------|-------|---------|--------------|---------------|--------------|----------------|---------|
+| s4-trial | s4_trial_int6 | 10L sp4096, int6 uniform, wd=2000, 3ep TTT | 1337 | 6,130 | 97.8 | 1.1610 | 1.1736 | **0.9531** | 16,718,251 (OVER) | Proved 0.95 BPB achievable, artifact too big |
+| **s4-42** | **s4_seed42** | **10L sp4096, int5 MLP, wd=2000, 3ep TTT** | **42** | **8,238** | **72.8** | **1.1585** | **1.1995** | **0.9636** | **14,728,565** | **VALID** |
+| **s4-1337** | **s4_seed1337** | **10L sp4096, int5 MLP, wd=2000, 3ep TTT** | **1337** | **8,244** | **72.8** | **1.1543** | **1.1944** | **0.9598** | **14,762,244** | **VALID — best seed** |
+| **s4-2024** | **s4_seed2024** | **10L sp4096, int5 MLP, wd=2000, 3ep TTT** | **2024** | **8,239** | **72.8** | **1.1557** | **1.1955** | **0.9623** | **14,672,017** | **VALID** |
+| | | **Mean (3 seeds)** | | **8,240** | | **1.1562** | **1.1965** | **0.9619** | | **SOTA: 1.1428. We beat by 0.181 BPB.** |
