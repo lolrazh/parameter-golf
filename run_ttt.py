@@ -42,6 +42,7 @@ def main():
         mlp_hidden=args.mlp_hidden, tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std, logit_softcap=args.logit_softcap,
         rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
+        rope_dims=args.rope_dims, xsa_last_n=args.xsa_last_n,
     ).to(device)
     model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     print("checkpoint loaded")
@@ -59,6 +60,7 @@ def main():
         mlp_hidden=args.mlp_hidden, tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std, logit_softcap=args.logit_softcap,
         rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
+        rope_dims=args.rope_dims, xsa_last_n=args.xsa_last_n,
     ).to(device)
     ttt_model.load_state_dict(model.state_dict(), strict=True)
 
