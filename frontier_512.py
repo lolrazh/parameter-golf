@@ -455,17 +455,18 @@ def quantize_float_tensor(t: Tensor, bits: int = 8) -> tuple[Tensor, Tensor]:
     return q, scale
 
 def _quant_bits_for_name(name: str, preset: str) -> int:
-    """Determine quantization bits based on preset. front3_back1_8_middle6: int8 for
-    first 3 and last 1 layers, int6 for middle. int5mlp: int5 for MLP, int6 for rest."""
-    if preset == "front3_back1_8_middle6":
+    """Determine quantization bits based on preset and layer position."""
+    if preset.startswith("front"):
         parts = name.split(".")
         if "blocks" in parts:
             idx = int(parts[parts.index("blocks") + 1])
             total = int(os.environ.get("NUM_LAYERS", 11))
-            if idx < 3 or idx >= total - 1:
-                return 8
-            return 6
-        return 6
+            is_sensitive = idx < 3 or idx >= total - 1
+            if preset == "front3_back1_8_middle6":
+                return 8 if is_sensitive else 6
+            if preset == "front3_back1_6_middle5":
+                return 6 if is_sensitive else 5
+        return 6 if preset == "front3_back1_8_middle6" else 5
     return 5 if ".mlp." in name else 6
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor], quant_preset: str = "int5mlp"):
