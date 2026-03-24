@@ -72,6 +72,25 @@ Key finding: **zstd-22 beats LZMA on 5 out of 6 presets.** Only exception is mar
 - Verdict: **LaCT/Muon doesn't help at this scale.** Tiny LoRA matrices don't benefit from Newton-Schulz orthogonalization. Adam stays default TTT optimizer.
 - Key finding: chunk=4096 is fundamentally broken for score-first TTT — most documents fit in a single chunk, so they get scored but never trained on (zero training signal).
 
+### TTT Hyperparameter Sweep (Run 10 checkpoint, 1M val tokens, ~20s per run)
+
+| Config | BPB | Delta vs baseline |
+|--------|-----|-------------------|
+| Baseline (lr=0.01, chunk=256, rank=8, min_doc=256) | 1.2936 | — |
+| LR=0.005 | 1.2916 | -0.002 |
+| LR=0.02 | 1.3075 | +0.014 |
+| LR=0.05 | 1.5339 | blowup |
+| chunk=128 | 1.2976 | +0.004 (2x slower) |
+| chunk=512 | 1.2941 | +0.0005 (2x faster) |
+| rank=4 | 1.2923 | -0.001 |
+| rank=16 | 1.2974 | +0.004 |
+| min_doc=64 | 1.2936 | identical |
+| min_doc=128 | 1.2937 | identical |
+| LR=0.005 + rank=4 combo | 1.2919 | -0.002 |
+
+- Verdict: **Differences are <0.002 BPB on 1M tokens — within noise.** Not trustworthy for tuning. Only clear signal: LR>=0.02 hurts. Sticking with baseline (lr=0.01, rank=8, chunk=256) for submission.
+- Bug fix: `eval_val_ttt_lora` was loading full 62M tokens regardless of `VAL_TOKENS_LIMIT` — fixed to respect the limit.
+
 ## Bugs & Issues Encountered
 1. **Checkpoint loading missing architecture params** - `run_ttt.py` did not pass `rope_dims` and `xsa_last_n` when loading checkpoints, causing the model to initialize with default architecture instead of the trained one. Loss was 12-13 instead of ~2.
    - **Fix:** Added the missing params to checkpoint loading code.
