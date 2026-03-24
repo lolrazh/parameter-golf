@@ -60,6 +60,7 @@ class Hyperparameters:
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 0))
     qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.0))  # 0=disabled, 0.15=enable when lr_scale<0.15
+    quant_preset = os.environ.get("QUANT_PRESET", "int5mlp")  # int5mlp | front3_back1_8_middle6
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
