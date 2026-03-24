@@ -58,7 +58,8 @@ class Hyperparameters:
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
-    eval_stride = int(os.environ.get("EVAL_STRIDE", 0))  # disabled: hurts with depth_scale, wastes 15 min
+    eval_stride = int(os.environ.get("EVAL_STRIDE", 0))
+    qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.0))  # 0=disabled, 0.15=enable when lr_scale<0.15
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -408,10 +409,35 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
 
+GPTQ_LITE = bool(int(os.environ.get("GPTQ_LITE", "1")))
+GPTQ_LITE_PERCENTILES = [0.999, 0.9995, 0.9999, 0.99999, 1.0]
+
 def quantize_float_tensor(t: Tensor, bits: int = 8) -> tuple[Tensor, Tensor]:
     max_val = 127 if bits == 8 else (2 ** (bits - 1)) - 1  # int6: 31, int8: 127
     t32 = t.float()
     if t32.ndim == 2:
+        if GPTQ_LITE and t32.numel() > 0:
+            # Per-row optimal clip percentile search (GPTQ-lite)
+            best_q = None
+            best_scale = None
+            best_mse = torch.full((t32.shape[0],), float("inf"), device=t32.device)
+            for pct in GPTQ_LITE_PERCENTILES:
+                clip_abs = torch.quantile(t32.abs(), pct, dim=1)
+                clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
+                scale = (clip_abs / float(max_val)).clamp_min(1.0 / float(max_val))
+                q = torch.clamp(torch.round(clipped / scale[:, None]), -max_val, max_val)
+                recon = q * scale[:, None]
+                mse = ((t32 - recon) ** 2).mean(dim=1)
+                improved = mse < best_mse
+                if best_q is None:
+                    best_q = q
+                    best_scale = scale
+                    best_mse = mse
+                else:
+                    best_q[improved] = q[improved]
+                    best_scale[improved] = scale[improved]
+                    best_mse[improved] = mse[improved]
+            return best_q.to(torch.int8).contiguous(), best_scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
         clip_abs = (
             torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
             if t32.numel()
@@ -1412,6 +1438,16 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
         zero_grad_all()
+
+        # QAT: STE fake quantization during late warmdown
+        if args.qat_start_frac > 0 and scale < args.qat_start_frac:
+            with torch.no_grad():
+                for name, p in base_model.named_parameters():
+                    if p.ndim == 2 and p.numel() > INT8_KEEP_FLOAT_MAX_NUMEL:
+                        bits = 5 if ".mlp." in name else 6
+                        fp = p.data.float()
+                        q, s = quantize_float_tensor(fp, bits=bits)
+                        p.data.copy_((q.float() * s[:, None] if s.ndim > 0 else q.float() * s).to(p.dtype))
 
         if args.ema_enabled and step > 0 and step % args.ema_every == 0:
             _ema_updated = True
