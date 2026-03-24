@@ -72,5 +72,25 @@ Only the first `ROPE_DIMS` dimensions of each attention head get rotary position
 - 🔧 Run 6: Best QAT setup (Soft-Round or GPTQ-aligned)
 - 🔧 Batch size research still pending
 
+## Run 5: 11L sp1024 + XSA4 + Partial RoPE (1xH100 proxy)
+- Config: 11L sp1024, XSA on last 4 layers, Partial RoPE 16/64, front3_back1_6_middle5 quant, relu²
+- Steps: 3,432 @ 175ms/step
+- Pre-quant BPB: 1.3499, Post-quant BPB: 1.3645 (quant gap: 0.0146)
+- Post-TTT BPB (LoRA 1ep): 1.2736
+- Artifact: 12.9 MB (massive headroom under 16 MB)
+- front3_back1_8_middle6 tested on same checkpoint: 17.4 MB (over limit even with sp1024)
+
+## New Implementations
+- LeakyReLU(0.5)² — one-line change: `F.leaky_relu(self.fc(x), negative_slope=0.5).square()`. Preserves negative gradient flow. Worth -0.003 BPB per PR #493.
+- Score-first full-weight TTT (PR #549 style) — scores entire chunk with inference_mode, THEN trains 3 epochs SGD on graded tokens. All blocks unfrozen. Legal per Will's rule.
+- TTT_SF_ENABLED=1 env var toggles it. Pipeline runs both LoRA and score-first TTT on same checkpoint.
+- XSA (Exclusive Self-Attention) — subtracts self-value projection from attention output. XSA_LAST_N env var.
+- Partial RoPE — ROPE_DIMS=16 applies RoPE to only 16/64 head dims.
+
+## Competition Intel
+- PR #549 (1.1194 BPB) is the new SOTA target. Uses LeakyReLU², legal score-first TTT, Parallel Muon, LZMA compression.
+- PR #490 (1.0891 claimed) was flagged — used illegal pre-eval TTT. Interesting techniques: Value Residual + Gated Attention.
+- Sliding window eval ran on full 62M val set (not VAL_TOKENS_LIMIT) — caused 50+ min hang on proxy. Bug in eval pipeline. Need to fix or just skip on proxy.
+
 ## Context for Future
 The proxy ablation shows that naive QAT is not worth it at proxy scale — the training cost exceeds the quant gap reduction. Front-heavy int8 quant is powerful (0.003 quant gap) but the artifact is too large. The best legal configuration is front3_back1_6_middle5 with no QAT, yielding 1.2506 post-TTT BPB on 1xH100 PCIe proxy. The architecture pivot to sp1024 11L with XSA + Partial RoPE is ready to test — these are the key features from the SOTA PR #315 that we haven't tried yet. If Soft-Round QAT (PR #606) pans out, it could further close the quant gap without the training cost penalty of naive STE.
