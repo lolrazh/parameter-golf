@@ -1190,6 +1190,8 @@ def eval_val_ttt_lora(
     """TTT eval: per-doc LoRA adaptation, score-then-train, multiple epochs."""
     files = sorted(glob.glob(args.val_files))
     all_tokens = torch.cat([load_data_shard(Path(f)) for f in files])
+    if args.val_tokens_limit > 0:
+        all_tokens = all_tokens[:args.val_tokens_limit + 1]
     docs = _find_docs(all_tokens)
     rank_docs = docs[(len(docs) * rank) // world_size : (len(docs) * (rank + 1)) // world_size]
     short_docs = [d for d in rank_docs if d[1] < args.ttt_min_doc_len]

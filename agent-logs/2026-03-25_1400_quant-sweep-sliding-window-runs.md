@@ -2,7 +2,7 @@
 
 **Date:** 2026-03-25
 **Agent:** Claude Opus 4.6 (1M context)
-**Status:** ⚠️ Partial (Run 10 in progress)
+**Status:** Complete
 
 Building on `2026-03-24_2100_proxy-ablation-and-architecture.md`
 
@@ -15,7 +15,8 @@ User wanted to (1) fix a checkpoint loading bug in run_ttt.py, (2) systematicall
 - ✅ **Run 7: XSA=11 (all layers) ablation** - Confirmed XSA=4 is optimal; XSA=11 is 0.021 BPB worse post-TTT
 - ✅ **Run 9: Sliding window eval** - Discovered and fixed catastrophic NTK-aware RoPE scaling bug
 - ✅ **DuQuant (Hadamard rotation) evaluation** - Tested and rejected; hurts compression
-- ✅ **Run 10 launched** - Entropy-regularized QAT + fixed sliding window (in progress)
+- ✅ **Run 10 completed** - Entropy-regularized QAT + fixed sliding window: best pre/post-quant ever, quant gap halved
+- ✅ **LaCT/Muon TTT evaluation** - Tested chunk sizes 4096 and 512; Adam stays default TTT optimizer
 - ✅ **Best config confirmed** - 11L sp1024, XSA=4, ROPE_DIMS=16, LeakyReLU squared, front3_back1_6_middle5, zstd-22, LoRA TTT 1ep, sliding window stride=64 seq=1024
 
 ## Quant Sweep Results
@@ -50,6 +51,27 @@ Key finding: **zstd-22 beats LZMA on 5 out of 6 presets.** Only exception is mar
 - Sliding window at EVAL_SEQ_LEN=2048: **2.1082 BPB** (catastrophically broken)
 - Sliding window at seq_len=1024, stride=64: **1.2667 BPB** (standard was 1.3008, gain: -0.034)
 
+### Run 10: Entropy-Regularized QAT + Fixed Sliding Window
+- Config: 11L sp1024, XSA4, PartialRoPE, LeakyReLU², front6mid5, QAT_START_FRAC=0.15, ENTROPY_REG=0.01, EVAL_STRIDE=64, EVAL_SEQ_LEN=1024 (fixed)
+- Steps: 3,277 @ 183.17ms/step
+- Pre-quant: 1.3182, Post-quant: 1.3271, Quant gap: 0.0089
+- Sliding window BPB: 1.2936 (WORKING with seq=1024 fix)
+- Post-TTT: 1.2835 (Adam, 1 epoch)
+- TTT gain: -0.044 BPB (less than Run 9's -0.096 because model is better aligned to quant grid)
+- Artifact: 12.98 MB (zstd-22)
+- Verdict: **Entropy-reg QAT is a major win.** Best pre/post-quant BPB ever for 11L sp1024. Quant gap halved vs no-QAT. Less TTT headroom because the model is already closer to its quantized form.
+
+### LaCT/Muon TTT Experiments (on Run 10 checkpoint)
+
+| Method | Chunk | Grad steps | BPB | Time (s) | vs Adam baseline |
+|--------|-------|-----------|-----|----------|-----------------|
+| LaCT + Muon | 4096 | 3 | 1.3084 | 173 | WORSE quality, faster |
+| LaCT + Muon | 512 | 3 | 1.2838 | 1057 | matches quality, 44% SLOWER |
+| Adam (baseline) | 256 | 1 epoch | 1.2835 | 731 | — |
+
+- Verdict: **LaCT/Muon doesn't help at this scale.** Tiny LoRA matrices don't benefit from Newton-Schulz orthogonalization. Adam stays default TTT optimizer.
+- Key finding: chunk=4096 is fundamentally broken for score-first TTT — most documents fit in a single chunk, so they get scored but never trained on (zero training signal).
+
 ## Bugs & Issues Encountered
 1. **Checkpoint loading missing architecture params** - `run_ttt.py` did not pass `rope_dims` and `xsa_last_n` when loading checkpoints, causing the model to initialize with default architecture instead of the trained one. Loss was 12-13 instead of ~2.
    - **Fix:** Added the missing params to checkpoint loading code.
@@ -68,6 +90,10 @@ Key finding: **zstd-22 beats LZMA on 5 out of 6 presets.** Only exception is mar
 - **Hadamard rotation hurts compressed artifact size** - Rotation distributes outliers across channels, reducing the compressibility of weight tensors. When you already have GPTQ-lite handling outliers at quantization time, rotation just adds entropy.
 - **XSA diminishing returns beyond 4 layers** - XSA=4 lets deeper layers specialize in routing while early layers still transform values. XSA=11 forces all layers into routing-only mode, which is too restrictive.
 - **Sliding window is a free -0.034 BPB gain** - But ONLY when eval seq_len matches train seq_len. The stride=64 setting (from SOTA PRs) is confirmed optimal.
+- **Entropy-regularized QAT halves the quant gap** - ENTROPY_REG=0.01 + QAT_START_FRAC=0.15 produces 0.0089 quant gap vs ~0.017 without QAT. The entropy penalty keeps weight distributions smooth, making them more quantization-friendly.
+- **Better-quantized models have less TTT headroom** - Run 10's TTT gain was -0.044 vs Run 9's -0.096. When the model is already well-aligned to the quant grid, there's less "damage" for TTT to repair.
+- **LaCT/Muon is not useful for tiny LoRA matrices** - Newton-Schulz orthogonalization (Muon's core trick) needs matrices large enough for the spectral structure to matter. LoRA rank-8 matrices are too small. Adam's per-parameter learning rates are more useful at this scale.
+- **Score-first TTT with large chunks is broken** - With chunk=4096, most FineWeb documents fit in a single chunk. Score-first evaluates on the first chunk before training, so 1-chunk docs get zero training. This is a fundamental design flaw, not a tuning issue.
 
 ## Architecture Decisions
 - **XSA=4 over XSA=11** - The first 7 layers need value projections to transform representations. Only the last 4 benefit from the XSA parameter savings + routing-only attention pattern.
@@ -79,8 +105,9 @@ Key finding: **zstd-22 beats LZMA on 5 out of 6 presets.** Only exception is mar
 - ✅ **Best config locked in** - 11L sp1024, XSA=4, ROPE_DIMS=16, LeakyReLU squared, front3_back1_6_middle5, zstd-22, LoRA TTT 1ep, sliding window stride=64 seq=1024
 - ✅ **Quant presets fully mapped** - Know exactly which fit under 16MB and which don't
 - ✅ **Sliding window fix validated** - -0.034 BPB free gain confirmed
-- 🔧 **Run 10 in progress** - Entropy-regularized QAT + fixed sliding window. Results pending.
+- ✅ **Run 10 complete** - Entropy-reg QAT: 1.3182 pre-quant, 1.3271 post-quant, 1.2835 post-TTT, 12.98MB artifact
+- ✅ **LaCT/Muon evaluated and rejected** - Adam stays default TTT optimizer
 - 🔧 **8xH100 submission run needed** - Best proxy config needs validation at full scale with 10-min training budget
 
 ## Context for Future
-This session resolved two critical bugs (checkpoint loading, NTK RoPE) and systematically eliminated several dead ends (XSA=11, DuQuant, extended-context sliding window). The best proxy configuration is now fully locked: 11L sp1024 with XSA=4, Partial RoPE, LeakyReLU squared, front3_back1_6_middle5 quant, zstd-22, sliding window at stride=64/seq=1024, and LoRA TTT. Run 10 (entropy-regularized QAT) is the last algorithmic experiment before scaling to 8xH100 for a submission attempt. The sliding window fix alone is worth -0.034 BPB, which could be decisive at the competition margin.
+This session resolved two critical bugs (checkpoint loading, NTK RoPE) and systematically eliminated several dead ends (XSA=11, DuQuant, extended-context sliding window, LaCT/Muon TTT). The best proxy configuration is now fully locked: 11L sp1024 with XSA=4, Partial RoPE, LeakyReLU squared, front3_back1_6_middle5 quant, zstd-22, entropy-regularized QAT (0.01 reg, 0.15 start frac), sliding window at stride=64/seq=1024, and Adam LoRA TTT 1 epoch. Run 10 confirmed that entropy-reg QAT halves the quant gap (0.009 vs 0.017) and produces the best pre/post-quant BPB ever (1.3182/1.3271). The tradeoff is less TTT headroom (-0.044 vs -0.096) because the quantized model is already closer to the full-precision model. LaCT/Muon was tested and rejected — tiny LoRA matrices don't benefit from Newton-Schulz. Next step: 8xH100 submission run.
