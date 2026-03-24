@@ -164,5 +164,19 @@ Confirmed our TTT is **Case 3** (per-document, independent) per GitHub issue #40
 | s3+TTT (L40S) | 3ep + min_doc 256 | **1.1011** post-TTT | — | Realistic 8xH100 config |
 | PROTEUS 11L (L40S) | 11L sp4096, frontier_512.py | **1.0984** post-TTT | 12.5 MB | Best proxy result (0.0027 from s3, possibly noise) |
 
+## 8xH100 SOTA Run Results
+
+- Config: 10L sp4096, 786K batch, FA3, fused QKV, batched Muon, warmdown=2000
+- Pod: 8xH100 SXM 80GB (RunPod), NVLink mesh
+- Steps: 6,130 in 600s (step_avg: 97.8ms including compile warmup, stable ~74ms/step)
+- Pre-quant BPB: 1.1610
+- Post-quant BPB: 1.1736 (int6 uniform, artifact 16.7MB — OVER 16MB LIMIT)
+- Post-TTT BPB: 0.9531 (3ep LoRA TTT, min_doc_len=256, 218s eval time)
+- TTT gain: -0.2205 BPB
+- Total wall clock: 15.1 min (10 train + 5.1 eval)
+- ISSUE: Artifact 16,718,251 bytes — 718KB over 16MB limit. Needs int5 MLP quantization.
+- ISSUE: Only 1 seed run. Submission requires 3 seeds (42, 1337, 2024) with p < 0.01.
+- FIX: Added `bits = 5 if ".mlp." in name else 6` to quantize_state_dict_int8. Need re-run.
+
 ## Context for Future
-frontier_512.py is now the single script for the SOTA submission: fused QKV + batched Muon + FA3 + SmearGate + BigramHash + TTT, all validated on 1xH100 with 18.5% step time improvement. On 8xH100 with 786K batch, estimated ~69ms/step → ~8,695 steps in 10 min. Combined with sp4096 tokenizer advantage and 3-epoch per-document TTT (validated as Case 3 / legitimate), the projected post-TTT BPB should beat SOTA (1.1428). Previous s2 was already 1.1484 without TTT or our new optimizations — with everything together, we should crush it.
+We proved 0.9531 BPB is achievable with the full stack (10L sp4096 + fused QKV + batched Muon + FA3 + 3ep TTT), but need re-runs with int5 MLP quantization (artifact fix to get under 16MB) and 3 seeds (42, 1337, 2024) for a valid submission. The H100 setup is proven and fast (~3 min setup). frontier_512.py remains the single submission script with all optimizations validated on both 1xH100 and 8xH100.

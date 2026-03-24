@@ -1,0 +1,357 @@
+W0324 07:33:12.630000 57456 torch/distributed/run.py:803] 
+W0324 07:33:12.630000 57456 torch/distributed/run.py:803] *****************************************
+W0324 07:33:12.630000 57456 torch/distributed/run.py:803] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0324 07:33:12.630000 57456 torch/distributed/run.py:803] *****************************************
+logs/51910b8c-3b82-4415-9d2a-0f964bd64f66.txt
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=./data/tokenizers/fineweb_4096_bpe.model
+train_loader:dataset:fineweb10B_sp4096 train_shards:80 val_tokens:44847104
+model_params:26041425 world_size:8 grad_accum_steps:1
+optimizations: fuse_qkv:True batch_muon:True fa3:True
+attention_mode:gqa num_heads:8 num_kv_heads:4
+tie_embeddings:True embed_lr:0.03 head_lr:0.0 matrix_lr:0.02 scalar_lr:0.02
+train_batch_tokens:786432 train_seq_len:1024 iterations:20000 warmup_steps:20 max_wallclock_seconds:600.000
+seed:2024 ema_enabled:True ema_decay:0.999 ema_every:10
+ttt_lora_rank:8 ttt_lora_lr:0.01 ttt_chunk_size:256
+warmup_step:1/20
+warmup_step:2/20
+warmup_step:3/20
+warmup_step:4/20
+warmup_step:5/20
+warmup_step:6/20
+warmup_step:7/20
+warmup_step:8/20
+warmup_step:9/20
+warmup_step:10/20
+warmup_step:11/20
+warmup_step:12/20
+warmup_step:13/20
+warmup_step:14/20
+warmup_step:15/20
+warmup_step:16/20
+warmup_step:17/20
+warmup_step:18/20
+warmup_step:19/20
+warmup_step:20/20
+step:0/20000 val_loss:8.3110 val_bpb:3.5670 train_time:0ms step_avg:0.01ms
+step:1/20000 train_loss:8.311852 lr_scale:1.0000 muon_mom:0.9200 train_time:119ms step_avg:118.64ms this_step:118.6ms mem:19151MiB swa_n:0
+step:2/20000 train_loss:8.957989 lr_scale:1.0000 muon_mom:0.9200 train_time:138ms step_avg:69.25ms this_step:19.9ms mem:19152MiB swa_n:0
+step:3/20000 train_loss:8.893133 lr_scale:1.0000 muon_mom:0.9201 train_time:209ms step_avg:69.79ms this_step:70.9ms mem:19152MiB swa_n:0
+step:4/20000 train_loss:8.460364 lr_scale:1.0000 muon_mom:0.9201 train_time:284ms step_avg:70.97ms this_step:74.5ms mem:19152MiB swa_n:0
+step:5/20000 train_loss:8.294372 lr_scale:1.0000 muon_mom:0.9202 train_time:356ms step_avg:71.14ms this_step:71.8ms mem:19152MiB swa_n:0
+step:6/20000 train_loss:8.159757 lr_scale:1.0000 muon_mom:0.9202 train_time:430ms step_avg:71.61ms this_step:74.0ms mem:19152MiB swa_n:0
+step:7/20000 train_loss:7.878675 lr_scale:1.0000 muon_mom:0.9203 train_time:502ms step_avg:71.65ms this_step:71.9ms mem:19152MiB swa_n:0
+step:8/20000 train_loss:7.771463 lr_scale:1.0000 muon_mom:0.9203 train_time:575ms step_avg:71.81ms this_step:73.0ms mem:19152MiB swa_n:0
+step:9/20000 train_loss:7.544584 lr_scale:1.0000 muon_mom:0.9204 train_time:647ms step_avg:71.87ms this_step:72.3ms mem:19152MiB swa_n:0
+step:10/20000 train_loss:7.246474 lr_scale:1.0000 muon_mom:0.9204 train_time:720ms step_avg:71.99ms this_step:73.1ms mem:19152MiB swa_n:0
+step:50/20000 train_loss:4.949593 lr_scale:1.0000 muon_mom:0.9223 train_time:3625ms step_avg:72.50ms this_step:2904.9ms mem:19152MiB swa_n:0
+step:100/20000 train_loss:4.189157 lr_scale:1.0000 muon_mom:0.9246 train_time:7257ms step_avg:72.57ms this_step:3632.1ms mem:19152MiB swa_n:0
+step:150/20000 train_loss:3.914331 lr_scale:1.0000 muon_mom:0.9270 train_time:10938ms step_avg:72.92ms this_step:3680.7ms mem:19152MiB swa_n:0
+step:200/20000 train_loss:3.627508 lr_scale:1.0000 muon_mom:0.9293 train_time:14550ms step_avg:72.75ms this_step:3612.8ms mem:19152MiB swa_n:0
+step:250/20000 train_loss:3.551955 lr_scale:1.0000 muon_mom:0.9316 train_time:18184ms step_avg:72.74ms this_step:3633.5ms mem:19152MiB swa_n:0
+step:300/20000 train_loss:3.410716 lr_scale:1.0000 muon_mom:0.9340 train_time:21877ms step_avg:72.92ms this_step:3692.7ms mem:19152MiB swa_n:0
+step:350/20000 train_loss:3.368143 lr_scale:1.0000 muon_mom:0.9363 train_time:25496ms step_avg:72.85ms this_step:3619.3ms mem:19152MiB swa_n:0
+step:400/20000 train_loss:3.432788 lr_scale:1.0000 muon_mom:0.9386 train_time:29178ms step_avg:72.95ms this_step:3682.3ms mem:19152MiB swa_n:0
+step:450/20000 train_loss:3.113383 lr_scale:1.0000 muon_mom:0.9410 train_time:32804ms step_avg:72.90ms this_step:3625.8ms mem:19152MiB swa_n:0
+step:500/20000 train_loss:3.341901 lr_scale:1.0000 muon_mom:0.9433 train_time:36437ms step_avg:72.87ms this_step:3632.9ms mem:19152MiB swa_n:0
+step:550/20000 train_loss:3.259838 lr_scale:1.0000 muon_mom:0.9456 train_time:40133ms step_avg:72.97ms this_step:3696.0ms mem:19152MiB swa_n:0
+step:600/20000 train_loss:3.276371 lr_scale:1.0000 muon_mom:0.9480 train_time:43769ms step_avg:72.95ms this_step:3636.2ms mem:19152MiB swa_n:0
+step:650/20000 train_loss:3.165964 lr_scale:1.0000 muon_mom:0.9503 train_time:47470ms step_avg:73.03ms this_step:3700.8ms mem:19152MiB swa_n:0
+step:700/20000 train_loss:3.295566 lr_scale:1.0000 muon_mom:0.9526 train_time:51100ms step_avg:73.00ms this_step:3629.9ms mem:19152MiB swa_n:0
+step:750/20000 train_loss:3.121274 lr_scale:1.0000 muon_mom:0.9550 train_time:54740ms step_avg:72.99ms this_step:3640.3ms mem:19152MiB swa_n:0
+step:800/20000 train_loss:3.178408 lr_scale:1.0000 muon_mom:0.9573 train_time:58436ms step_avg:73.05ms this_step:3696.1ms mem:19152MiB swa_n:0
+step:850/20000 train_loss:3.100054 lr_scale:1.0000 muon_mom:0.9596 train_time:62077ms step_avg:73.03ms this_step:3640.3ms mem:19152MiB swa_n:0
+step:900/20000 train_loss:3.088600 lr_scale:1.0000 muon_mom:0.9620 train_time:65766ms step_avg:73.07ms this_step:3689.5ms mem:19152MiB swa_n:0
+step:950/20000 train_loss:3.094982 lr_scale:1.0000 muon_mom:0.9643 train_time:69422ms step_avg:73.08ms this_step:3655.9ms mem:19152MiB swa_n:0
+step:1000/20000 train_loss:3.072598 lr_scale:1.0000 muon_mom:0.9666 train_time:73051ms step_avg:73.05ms this_step:3629.3ms mem:19152MiB swa_n:0
+step:1000/20000 val_loss:3.0843 val_bpb:1.3237 train_time:73091ms step_avg:73.09ms
+step:1050/20000 train_loss:2.880180 lr_scale:1.0000 muon_mom:0.9690 train_time:76757ms step_avg:73.10ms this_step:3705.2ms mem:19152MiB swa_n:0
+step:1100/20000 train_loss:3.008312 lr_scale:1.0000 muon_mom:0.9713 train_time:80388ms step_avg:73.08ms this_step:3631.5ms mem:19152MiB swa_n:0
+step:1150/20000 train_loss:2.992077 lr_scale:1.0000 muon_mom:0.9736 train_time:84076ms step_avg:73.11ms this_step:3688.0ms mem:19152MiB swa_n:0
+step:1200/20000 train_loss:3.067358 lr_scale:1.0000 muon_mom:0.9760 train_time:87716ms step_avg:73.10ms this_step:3640.0ms mem:19152MiB swa_n:0
+step:1250/20000 train_loss:3.116993 lr_scale:1.0000 muon_mom:0.9783 train_time:91352ms step_avg:73.08ms this_step:3635.6ms mem:19152MiB swa_n:0
+step:1300/20000 train_loss:2.979839 lr_scale:1.0000 muon_mom:0.9806 train_time:95032ms step_avg:73.10ms this_step:3680.3ms mem:19152MiB swa_n:0
+step:1350/20000 train_loss:3.063657 lr_scale:1.0000 muon_mom:0.9830 train_time:98684ms step_avg:73.10ms this_step:3651.7ms mem:19152MiB swa_n:0
+step:1400/20000 train_loss:3.037339 lr_scale:1.0000 muon_mom:0.9853 train_time:102370ms step_avg:73.12ms this_step:3686.2ms mem:19152MiB swa_n:0
+step:1450/20000 train_loss:3.019286 lr_scale:1.0000 muon_mom:0.9876 train_time:105997ms step_avg:73.10ms this_step:3627.0ms mem:19152MiB swa_n:0
+step:1500/20000 train_loss:3.448225 lr_scale:1.0000 muon_mom:0.9900 train_time:109627ms step_avg:73.08ms this_step:3630.3ms mem:19152MiB swa_n:0
+step:1550/20000 train_loss:2.962805 lr_scale:1.0000 muon_mom:0.9900 train_time:113317ms step_avg:73.11ms this_step:3689.5ms mem:19152MiB swa_n:0
+step:1600/20000 train_loss:2.953804 lr_scale:1.0000 muon_mom:0.9900 train_time:116942ms step_avg:73.09ms this_step:3625.9ms mem:19152MiB swa_n:0
+step:1650/20000 train_loss:2.957159 lr_scale:1.0000 muon_mom:0.9900 train_time:120564ms step_avg:73.07ms this_step:3622.0ms mem:19152MiB swa_n:0
+step:1700/20000 train_loss:3.142451 lr_scale:1.0000 muon_mom:0.9900 train_time:124247ms step_avg:73.09ms this_step:3682.3ms mem:19152MiB swa_n:0
+step:1750/20000 train_loss:3.053590 lr_scale:1.0000 muon_mom:0.9900 train_time:127869ms step_avg:73.07ms this_step:3622.6ms mem:19152MiB swa_n:0
+step:1800/20000 train_loss:3.053584 lr_scale:1.0000 muon_mom:0.9900 train_time:131557ms step_avg:73.09ms this_step:3687.8ms mem:19152MiB swa_n:0
+step:1850/20000 train_loss:3.028340 lr_scale:1.0000 muon_mom:0.9900 train_time:135185ms step_avg:73.07ms this_step:3627.6ms mem:19152MiB swa_n:0
+step:1900/20000 train_loss:2.867993 lr_scale:1.0000 muon_mom:0.9900 train_time:138809ms step_avg:73.06ms this_step:3623.9ms mem:19152MiB swa_n:0
+step:1950/20000 train_loss:3.032475 lr_scale:1.0000 muon_mom:0.9900 train_time:142487ms step_avg:73.07ms this_step:3678.5ms mem:19152MiB swa_n:0
+step:2000/20000 train_loss:2.991548 lr_scale:1.0000 muon_mom:0.9900 train_time:146110ms step_avg:73.05ms this_step:3622.5ms mem:19152MiB swa_n:0
+step:2000/20000 val_loss:2.9561 val_bpb:1.2687 train_time:146146ms step_avg:73.07ms
+step:2050/20000 train_loss:3.007689 lr_scale:1.0000 muon_mom:0.9900 train_time:149776ms step_avg:73.06ms this_step:3666.3ms mem:19152MiB swa_n:0
+step:2100/20000 train_loss:2.941722 lr_scale:1.0000 muon_mom:0.9900 train_time:153393ms step_avg:73.04ms this_step:3617.1ms mem:19152MiB swa_n:0
+step:2150/20000 train_loss:2.945908 lr_scale:1.0000 muon_mom:0.9900 train_time:157033ms step_avg:73.04ms this_step:3640.1ms mem:19152MiB swa_n:0
+step:2200/20000 train_loss:2.947352 lr_scale:1.0000 muon_mom:0.9900 train_time:160702ms step_avg:73.05ms this_step:3669.5ms mem:19152MiB swa_n:0
+step:2250/20000 train_loss:2.997258 lr_scale:1.0000 muon_mom:0.9900 train_time:164331ms step_avg:73.04ms this_step:3628.2ms mem:19152MiB swa_n:0
+step:2300/20000 train_loss:2.890268 lr_scale:1.0000 muon_mom:0.9900 train_time:168002ms step_avg:73.04ms this_step:3671.4ms mem:19152MiB swa_n:0
+step:2350/20000 train_loss:2.948841 lr_scale:1.0000 muon_mom:0.9900 train_time:171632ms step_avg:73.04ms this_step:3630.3ms mem:19152MiB swa_n:0
+step:2400/20000 train_loss:2.939824 lr_scale:1.0000 muon_mom:0.9900 train_time:175248ms step_avg:73.02ms this_step:3615.8ms mem:19152MiB swa_n:0
+step:2450/20000 train_loss:2.925465 lr_scale:1.0000 muon_mom:0.9900 train_time:178922ms step_avg:73.03ms this_step:3673.9ms mem:19152MiB swa_n:0
+step:2500/20000 train_loss:2.946491 lr_scale:1.0000 muon_mom:0.9900 train_time:182539ms step_avg:73.02ms this_step:3617.1ms mem:19152MiB swa_n:0
+step:2550/20000 train_loss:2.914885 lr_scale:1.0000 muon_mom:0.9900 train_time:186218ms step_avg:73.03ms this_step:3678.5ms mem:19152MiB swa_n:0
+step:2600/20000 train_loss:3.055255 lr_scale:1.0000 muon_mom:0.9900 train_time:189842ms step_avg:73.02ms this_step:3624.3ms mem:19152MiB swa_n:0
+step:2650/20000 train_loss:2.908615 lr_scale:1.0000 muon_mom:0.9900 train_time:193457ms step_avg:73.00ms this_step:3615.5ms mem:19152MiB swa_n:0
+step:2700/20000 train_loss:2.972263 lr_scale:1.0000 muon_mom:0.9900 train_time:197133ms step_avg:73.01ms this_step:3675.9ms mem:19152MiB swa_n:0
+step:2750/20000 train_loss:2.957722 lr_scale:1.0000 muon_mom:0.9900 train_time:200747ms step_avg:73.00ms this_step:3613.3ms mem:19152MiB swa_n:0
+step:2800/20000 train_loss:2.985438 lr_scale:1.0000 muon_mom:0.9900 train_time:204427ms step_avg:73.01ms this_step:3680.6ms mem:19152MiB swa_n:0
+step:2850/20000 train_loss:3.049266 lr_scale:1.0000 muon_mom:0.9900 train_time:208022ms step_avg:72.99ms this_step:3594.3ms mem:19152MiB swa_n:0
+step:2900/20000 train_loss:2.965938 lr_scale:1.0000 muon_mom:0.9900 train_time:211657ms step_avg:72.99ms this_step:3635.8ms mem:19152MiB swa_n:0
+step:2950/20000 train_loss:2.881422 lr_scale:1.0000 muon_mom:0.9900 train_time:215322ms step_avg:72.99ms this_step:3664.6ms mem:19152MiB swa_n:0
+step:3000/20000 train_loss:2.885147 lr_scale:1.0000 muon_mom:0.9900 train_time:218935ms step_avg:72.98ms this_step:3613.3ms mem:19152MiB swa_n:0
+step:3000/20000 val_loss:2.9072 val_bpb:1.2477 train_time:218974ms step_avg:72.99ms
+step:3050/20000 train_loss:3.045674 lr_scale:1.0000 muon_mom:0.9900 train_time:222550ms step_avg:72.97ms this_step:3615.1ms mem:19152MiB swa_n:0
+step:3100/20000 train_loss:2.872368 lr_scale:1.0000 muon_mom:0.9900 train_time:226230ms step_avg:72.98ms this_step:3679.2ms mem:19152MiB swa_n:0
+step:3150/20000 train_loss:2.953324 lr_scale:1.0000 muon_mom:0.9900 train_time:229842ms step_avg:72.97ms this_step:3612.5ms mem:19152MiB swa_n:0
+step:3200/20000 train_loss:2.829576 lr_scale:1.0000 muon_mom:0.9900 train_time:233505ms step_avg:72.97ms this_step:3662.7ms mem:19152MiB swa_n:0
+step:3250/20000 train_loss:2.967613 lr_scale:1.0000 muon_mom:0.9900 train_time:237120ms step_avg:72.96ms this_step:3615.3ms mem:19152MiB swa_n:0
+step:3300/20000 train_loss:2.751826 lr_scale:1.0000 muon_mom:0.9900 train_time:240735ms step_avg:72.95ms this_step:3614.5ms mem:19152MiB swa_n:0
+step:3350/20000 train_loss:2.941231 lr_scale:1.0000 muon_mom:0.9900 train_time:244410ms step_avg:72.96ms this_step:3675.1ms mem:19152MiB swa_n:0
+step:3400/20000 train_loss:2.990367 lr_scale:1.0000 muon_mom:0.9900 train_time:248017ms step_avg:72.95ms this_step:3607.0ms mem:19152MiB swa_n:0
+step:3450/20000 train_loss:2.839281 lr_scale:1.0000 muon_mom:0.9900 train_time:251694ms step_avg:72.95ms this_step:3677.7ms mem:19152MiB swa_n:0
+step:3500/20000 train_loss:2.851094 lr_scale:1.0000 muon_mom:0.9900 train_time:255305ms step_avg:72.94ms this_step:3610.5ms mem:19152MiB swa_n:0
+step:3550/20000 train_loss:2.832044 lr_scale:1.0000 muon_mom:0.9900 train_time:258919ms step_avg:72.93ms this_step:3614.2ms mem:19152MiB swa_n:0
+step:3600/20000 train_loss:2.982748 lr_scale:1.0000 muon_mom:0.9900 train_time:262592ms step_avg:72.94ms this_step:3673.1ms mem:19152MiB swa_n:0
+step:3650/20000 train_loss:2.924245 lr_scale:1.0000 muon_mom:0.9900 train_time:266206ms step_avg:72.93ms this_step:3613.9ms mem:19152MiB swa_n:0
+step:3700/20000 train_loss:2.941683 lr_scale:1.0000 muon_mom:0.9900 train_time:269862ms step_avg:72.94ms this_step:3656.2ms mem:19152MiB swa_n:0
+step:3750/20000 train_loss:2.757113 lr_scale:1.0000 muon_mom:0.9900 train_time:273483ms step_avg:72.93ms this_step:3620.6ms mem:19152MiB swa_n:0
+step:3800/20000 train_loss:2.873606 lr_scale:1.0000 muon_mom:0.9900 train_time:277094ms step_avg:72.92ms this_step:3610.7ms mem:19152MiB swa_n:0
+step:3850/20000 train_loss:3.010560 lr_scale:1.0000 muon_mom:0.9900 train_time:280770ms step_avg:72.93ms this_step:3676.7ms mem:19152MiB swa_n:0
+step:3900/20000 train_loss:2.912123 lr_scale:1.0000 muon_mom:0.9900 train_time:284385ms step_avg:72.92ms this_step:3614.8ms mem:19152MiB swa_n:0
+step:3950/20000 train_loss:2.879360 lr_scale:1.0000 muon_mom:0.9900 train_time:288041ms step_avg:72.92ms this_step:3656.1ms mem:19152MiB swa_n:0
+step:4000/20000 train_loss:2.806892 lr_scale:1.0000 muon_mom:0.9900 train_time:291662ms step_avg:72.92ms this_step:3620.5ms mem:19152MiB swa_n:0
+step:4000/20000 val_loss:2.8834 val_bpb:1.2375 train_time:291698ms step_avg:72.92ms
+step:4050/20000 train_loss:2.835356 lr_scale:1.0000 muon_mom:0.9900 train_time:295270ms step_avg:72.91ms this_step:3607.9ms mem:19152MiB swa_n:0
+step:4100/20000 train_loss:2.768726 lr_scale:1.0000 muon_mom:0.9900 train_time:298953ms step_avg:72.92ms this_step:3683.7ms mem:19152MiB swa_n:0
+step:4150/20000 train_loss:2.924334 lr_scale:1.0000 muon_mom:0.9900 train_time:302560ms step_avg:72.91ms this_step:3606.4ms mem:19152MiB swa_n:0
+step:4200/20000 train_loss:2.973300 lr_scale:1.0000 muon_mom:0.9900 train_time:306229ms step_avg:72.91ms this_step:3669.0ms mem:19152MiB swa_n:0
+step:4250/20000 train_loss:2.766857 lr_scale:1.0000 muon_mom:0.9900 train_time:309840ms step_avg:72.90ms this_step:3610.9ms mem:19152MiB swa_n:0
+step:4300/20000 train_loss:2.584485 lr_scale:1.0000 muon_mom:0.9900 train_time:313449ms step_avg:72.90ms this_step:3609.2ms mem:19152MiB swa_n:0
+step:4350/20000 train_loss:2.852400 lr_scale:1.0000 muon_mom:0.9900 train_time:317116ms step_avg:72.90ms this_step:3667.0ms mem:19152MiB swa_n:0
+step:4400/20000 train_loss:2.957614 lr_scale:1.0000 muon_mom:0.9900 train_time:320711ms step_avg:72.89ms this_step:3595.1ms mem:19152MiB swa_n:0
+step:4450/20000 train_loss:2.792371 lr_scale:1.0000 muon_mom:0.9900 train_time:324338ms step_avg:72.89ms this_step:3627.3ms mem:19152MiB swa_n:0
+step:4500/20000 train_loss:2.826428 lr_scale:1.0000 muon_mom:0.9900 train_time:328003ms step_avg:72.89ms this_step:3664.7ms mem:19152MiB swa_n:0
+step:4550/20000 train_loss:2.835488 lr_scale:1.0000 muon_mom:0.9900 train_time:331621ms step_avg:72.88ms this_step:3617.7ms mem:19152MiB swa_n:0
+step:4600/20000 train_loss:3.062795 lr_scale:1.0000 muon_mom:0.9900 train_time:335293ms step_avg:72.89ms this_step:3671.9ms mem:19152MiB swa_n:0
+step:4650/20000 train_loss:2.998349 lr_scale:1.0000 muon_mom:0.9900 train_time:338904ms step_avg:72.88ms this_step:3611.2ms mem:19152MiB swa_n:0
+step:4700/20000 train_loss:2.867683 lr_scale:1.0000 muon_mom:0.9900 train_time:342508ms step_avg:72.87ms this_step:3604.5ms mem:19152MiB swa_n:0
+step:4750/20000 train_loss:2.871855 lr_scale:1.0000 muon_mom:0.9900 train_time:346175ms step_avg:72.88ms this_step:3666.5ms mem:19152MiB swa_n:0
+step:4800/20000 train_loss:2.926675 lr_scale:1.0000 muon_mom:0.9900 train_time:349785ms step_avg:72.87ms this_step:3610.6ms mem:19152MiB swa_n:0
+step:4850/20000 train_loss:2.960766 lr_scale:1.0000 muon_mom:0.9900 train_time:353458ms step_avg:72.88ms this_step:3672.4ms mem:19152MiB swa_n:0
+step:4900/20000 train_loss:3.007400 lr_scale:1.0000 muon_mom:0.9900 train_time:357065ms step_avg:72.87ms this_step:3607.0ms mem:19152MiB swa_n:0
+step:4950/20000 train_loss:2.916513 lr_scale:1.0000 muon_mom:0.9900 train_time:360750ms step_avg:72.88ms this_step:3685.4ms mem:19152MiB swa_n:0
+step:5000/20000 train_loss:2.960650 lr_scale:1.0000 muon_mom:0.9900 train_time:364418ms step_avg:72.88ms this_step:3667.6ms mem:19152MiB swa_n:0
+step:5000/20000 val_loss:2.8709 val_bpb:1.2322 train_time:364456ms step_avg:72.89ms
+step:5050/20000 train_loss:2.939606 lr_scale:1.0000 muon_mom:0.9900 train_time:368027ms step_avg:72.88ms this_step:3609.1ms mem:19152MiB swa_n:0
+step:5100/20000 train_loss:2.932011 lr_scale:1.0000 muon_mom:0.9900 train_time:371700ms step_avg:72.88ms this_step:3672.9ms mem:19152MiB swa_n:0
+step:5150/20000 train_loss:2.878628 lr_scale:1.0000 muon_mom:0.9900 train_time:375312ms step_avg:72.88ms this_step:3612.6ms mem:19152MiB swa_n:0
+step:5200/20000 train_loss:2.955862 lr_scale:1.0000 muon_mom:0.9900 train_time:378924ms step_avg:72.87ms this_step:3611.6ms mem:19152MiB swa_n:0
+step:5250/20000 train_loss:2.877618 lr_scale:1.0000 muon_mom:0.9900 train_time:382587ms step_avg:72.87ms this_step:3663.1ms mem:19152MiB swa_n:0
+step:5300/20000 train_loss:2.762249 lr_scale:1.0000 muon_mom:0.9900 train_time:386197ms step_avg:72.87ms this_step:3610.2ms mem:19152MiB swa_n:0
+step:5350/20000 train_loss:2.913691 lr_scale:1.0000 muon_mom:0.9900 train_time:389863ms step_avg:72.87ms this_step:3666.3ms mem:19152MiB swa_n:0
+step:5400/20000 train_loss:2.699592 lr_scale:1.0000 muon_mom:0.9900 train_time:393483ms step_avg:72.87ms this_step:3619.9ms mem:19152MiB swa_n:0
+step:5450/20000 train_loss:3.017368 lr_scale:1.0000 muon_mom:0.9900 train_time:397094ms step_avg:72.86ms this_step:3610.6ms mem:19152MiB swa_n:0
+step:5500/20000 train_loss:2.928712 lr_scale:1.0000 muon_mom:0.9900 train_time:400765ms step_avg:72.87ms this_step:3671.5ms mem:19152MiB swa_n:0
+step:5550/20000 train_loss:2.898353 lr_scale:1.0000 muon_mom:0.9900 train_time:404367ms step_avg:72.86ms this_step:3602.1ms mem:19152MiB swa_n:0
+step:5600/20000 train_loss:2.855215 lr_scale:1.0000 muon_mom:0.9900 train_time:408037ms step_avg:72.86ms this_step:3669.9ms mem:19152MiB swa_n:0
+step:5650/20000 train_loss:2.924320 lr_scale:1.0000 muon_mom:0.9900 train_time:411650ms step_avg:72.86ms this_step:3612.8ms mem:19152MiB swa_n:0
+step:5700/20000 train_loss:2.767986 lr_scale:1.0000 muon_mom:0.9900 train_time:415260ms step_avg:72.85ms this_step:3609.7ms mem:19152MiB swa_n:0
+step:5750/20000 train_loss:2.820237 lr_scale:1.0000 muon_mom:0.9900 train_time:418924ms step_avg:72.86ms this_step:3664.1ms mem:19152MiB swa_n:0
+step:5800/20000 train_loss:3.027740 lr_scale:1.0000 muon_mom:0.9900 train_time:422532ms step_avg:72.85ms this_step:3608.4ms mem:19152MiB swa_n:0
+step:5850/20000 train_loss:2.753504 lr_scale:1.0000 muon_mom:0.9900 train_time:426213ms step_avg:72.86ms this_step:3680.7ms mem:19152MiB swa_n:0
+step:5900/20000 train_loss:2.942527 lr_scale:1.0000 muon_mom:0.9900 train_time:429816ms step_avg:72.85ms this_step:3602.7ms mem:19152MiB swa_n:0
+step:5950/20000 train_loss:2.863616 lr_scale:1.0000 muon_mom:0.9900 train_time:433424ms step_avg:72.84ms this_step:3607.8ms mem:19152MiB swa_n:0
+step:6000/20000 train_loss:2.926219 lr_scale:1.0000 muon_mom:0.9900 train_time:437082ms step_avg:72.85ms this_step:3658.9ms mem:19152MiB swa_n:0
+step:6000/20000 val_loss:2.8605 val_bpb:1.2277 train_time:437118ms step_avg:72.85ms
+step:6050/20000 train_loss:2.852445 lr_scale:1.0000 muon_mom:0.9900 train_time:440691ms step_avg:72.84ms this_step:3608.8ms mem:19152MiB swa_n:0
+step:6100/20000 train_loss:2.819807 lr_scale:1.0000 muon_mom:0.9900 train_time:444295ms step_avg:72.84ms this_step:3603.5ms mem:19152MiB swa_n:0
+step:6150/20000 train_loss:2.920069 lr_scale:1.0000 muon_mom:0.9900 train_time:447972ms step_avg:72.84ms this_step:3677.1ms mem:19152MiB swa_n:0
+step:6200/20000 train_loss:2.838679 lr_scale:1.0000 muon_mom:0.9900 train_time:451580ms step_avg:72.84ms this_step:3607.8ms mem:19152MiB swa_n:0
+step:6250/20000 train_loss:2.814497 lr_scale:0.9938 muon_mom:0.9900 train_time:455245ms step_avg:72.84ms this_step:3665.7ms mem:19152MiB swa_n:0
+step:6300/20000 train_loss:2.783375 lr_scale:0.9691 muon_mom:0.9900 train_time:458854ms step_avg:72.83ms this_step:3609.2ms mem:19152MiB swa_n:0
+step:6350/20000 train_loss:2.804105 lr_scale:0.9444 muon_mom:0.9900 train_time:462462ms step_avg:72.83ms this_step:3607.7ms mem:19152MiB swa_n:0
+step:6400/20000 train_loss:2.966228 lr_scale:0.9192 muon_mom:0.9900 train_time:466132ms step_avg:72.83ms this_step:3669.7ms mem:19152MiB swa_n:0
+step:6450/20000 train_loss:2.845705 lr_scale:0.8944 muon_mom:0.9900 train_time:469754ms step_avg:72.83ms this_step:3622.6ms mem:19152MiB swa_n:0
+step:6500/20000 train_loss:2.910561 lr_scale:0.8692 muon_mom:0.9900 train_time:473419ms step_avg:72.83ms this_step:3664.5ms mem:19152MiB swa_n:0
+step:6550/20000 train_loss:2.871485 lr_scale:0.8445 muon_mom:0.9900 train_time:477024ms step_avg:72.83ms this_step:3604.9ms mem:19152MiB swa_n:0
+step:6600/20000 train_loss:2.917764 lr_scale:0.8198 muon_mom:0.9900 train_time:480631ms step_avg:72.82ms this_step:3607.2ms mem:19152MiB swa_n:0
+step:6650/20000 train_loss:2.777817 lr_scale:0.7945 muon_mom:0.9900 train_time:484304ms step_avg:72.83ms this_step:3673.3ms mem:19152MiB swa_n:0
+step:6700/20000 train_loss:2.832511 lr_scale:0.7697 muon_mom:0.9900 train_time:487917ms step_avg:72.82ms this_step:3612.6ms mem:19152MiB swa_n:0
+step:6750/20000 train_loss:2.829908 lr_scale:0.7446 muon_mom:0.9900 train_time:491577ms step_avg:72.83ms this_step:3660.0ms mem:19152MiB swa_n:0
+step:6800/20000 train_loss:2.859707 lr_scale:0.7198 muon_mom:0.9900 train_time:495193ms step_avg:72.82ms this_step:3616.3ms mem:19152MiB swa_n:0
+step:6850/20000 train_loss:2.823010 lr_scale:0.6951 muon_mom:0.9900 train_time:498799ms step_avg:72.82ms this_step:3606.0ms mem:19152MiB swa_n:0
+step:6900/20000 train_loss:2.861679 lr_scale:0.6698 muon_mom:0.9900 train_time:502475ms step_avg:72.82ms this_step:3675.6ms mem:19152MiB swa_n:0
+step:6950/20000 train_loss:2.782567 lr_scale:0.6451 muon_mom:0.9900 train_time:506080ms step_avg:72.82ms this_step:3604.7ms mem:19152MiB swa_n:0
+step:7000/20000 train_loss:2.772118 lr_scale:0.6200 muon_mom:0.9900 train_time:509740ms step_avg:72.82ms this_step:3660.2ms mem:19152MiB swa_n:0
+step:7000/20000 val_loss:2.8050 val_bpb:1.2039 train_time:509775ms step_avg:72.83ms
+step:7050/20000 train_loss:2.766703 lr_scale:0.5952 muon_mom:0.9900 train_time:513353ms step_avg:72.82ms this_step:3612.8ms mem:19152MiB swa_n:0
+step:7100/20000 train_loss:2.776566 lr_scale:0.5705 muon_mom:0.9900 train_time:516956ms step_avg:72.81ms this_step:3603.9ms mem:19152MiB swa_n:0
+step:7150/20000 train_loss:2.748947 lr_scale:0.5452 muon_mom:0.9900 train_time:520629ms step_avg:72.82ms this_step:3672.6ms mem:19152MiB swa_n:0
+step:7200/20000 train_loss:2.803157 lr_scale:0.5205 muon_mom:0.9900 train_time:524238ms step_avg:72.81ms this_step:3608.5ms mem:19152MiB swa_n:0
+step:7250/20000 train_loss:2.835004 lr_scale:0.4953 muon_mom:0.9900 train_time:527902ms step_avg:72.81ms this_step:3664.2ms mem:19152MiB swa_n:0
+step:7300/20000 train_loss:2.839108 lr_scale:0.4706 muon_mom:0.9900 train_time:531503ms step_avg:72.81ms this_step:3601.5ms mem:19152MiB swa_n:0
+step:7350/20000 train_loss:2.843806 lr_scale:0.4458 muon_mom:0.9900 train_time:535115ms step_avg:72.80ms this_step:3612.1ms mem:19152MiB swa_n:0
+step:7400/20000 train_loss:2.845706 lr_scale:0.4206 muon_mom:0.9900 train_time:538784ms step_avg:72.81ms this_step:3668.2ms mem:19152MiB swa_n:0
+step:7450/20000 train_loss:2.762816 lr_scale:0.3958 muon_mom:0.9900 train_time:542397ms step_avg:72.81ms this_step:3613.8ms mem:19152MiB swa_n:0
+step:7500/20000 train_loss:2.818456 lr_scale:0.3711 muon_mom:0.9900 train_time:546004ms step_avg:72.80ms this_step:3606.8ms mem:19152MiB swa_n:0
+step:7550/20000 train_loss:3.488517 lr_scale:0.3459 muon_mom:0.9900 train_time:549667ms step_avg:72.80ms this_step:3663.1ms mem:19152MiB swa_n:0
+step:7600/20000 train_loss:2.786141 lr_scale:0.3211 muon_mom:0.9900 train_time:553274ms step_avg:72.80ms this_step:3607.0ms mem:19152MiB swa_n:0
+step:7650/20000 train_loss:2.759282 lr_scale:0.2959 muon_mom:0.9900 train_time:556949ms step_avg:72.80ms this_step:3674.8ms mem:19152MiB swa_n:0
+step:7700/20000 train_loss:2.711765 lr_scale:0.2711 muon_mom:0.9900 train_time:560560ms step_avg:72.80ms this_step:3610.7ms mem:19152MiB swa_n:0
+step:7750/20000 train_loss:2.744825 lr_scale:0.2463 muon_mom:0.9900 train_time:564169ms step_avg:72.80ms this_step:3609.4ms mem:19152MiB swa_n:0
+step:7800/20000 train_loss:2.816056 lr_scale:0.2212 muon_mom:0.9900 train_time:567831ms step_avg:72.80ms this_step:3661.8ms mem:19152MiB swa_n:0
+step:7850/20000 train_loss:2.748638 lr_scale:0.1964 muon_mom:0.9900 train_time:571441ms step_avg:72.80ms this_step:3610.0ms mem:19152MiB swa_n:0
+swa:start step=7850
+step:7900/20000 train_loss:2.694306 lr_scale:0.1705 muon_mom:0.9900 train_time:575199ms step_avg:72.81ms this_step:3758.2ms mem:19152MiB swa_n:1
+step:7950/20000 train_loss:2.715597 lr_scale:0.1456 muon_mom:0.9900 train_time:578834ms step_avg:72.81ms this_step:3635.2ms mem:19152MiB swa_n:2
+step:8000/20000 train_loss:2.743749 lr_scale:0.1206 muon_mom:0.9900 train_time:582469ms step_avg:72.81ms this_step:3634.2ms mem:19152MiB swa_n:3
+step:8000/20000 val_loss:2.7206 val_bpb:1.1676 train_time:582508ms step_avg:72.81ms
+step:8050/20000 train_loss:2.838413 lr_scale:0.0953 muon_mom:0.9900 train_time:586153ms step_avg:72.81ms this_step:3684.7ms mem:19152MiB swa_n:4
+step:8100/20000 train_loss:2.720664 lr_scale:0.0703 muon_mom:0.9900 train_time:589790ms step_avg:72.81ms this_step:3636.9ms mem:19152MiB swa_n:5
+step:8150/20000 train_loss:2.792064 lr_scale:0.0450 muon_mom:0.9900 train_time:593484ms step_avg:72.82ms this_step:3694.2ms mem:19152MiB swa_n:6
+step:8200/20000 train_loss:2.461507 lr_scale:0.0199 muon_mom:0.9900 train_time:597136ms step_avg:72.82ms this_step:3651.4ms mem:19152MiB swa_n:7
+step:8239/20000 val_loss:2.7047 val_bpb:1.1608 train_time:600033ms step_avg:72.83ms
+stopping_early: wallclock_cap train_time:600033ms step:8239/20000
+peak memory allocated: 19152 MiB reserved: 19852 MiB
+phase:train wall_ms:619394 steps:8239 step_avg:72.83ms
+swa:applying averaged 8 checkpoints
+pruning: zeroed 776,386 weights (3.0%) below 0.003008
+phase:postprocess wall_ms:130 (swa+ema+pruning)
+pre_quant_eval val_loss:2.6928 val_bpb:1.1557 eval_time:12743ms
+pre_quant_eval_exact val_loss:2.69283450 val_bpb:1.15571991
+Serialized model: 99481691 bytes
+Code size: 76762 bytes
+Total submission size: 99558453 bytes
+quant_tensor:bigram.embed.weight shape:[2048, 128] bits:6 scale_range:[0.032257,0.032257]
+quant_tensor:blocks.0.attn.c_qkv.weight shape:[1024, 512] bits:6 scale_range:[0.032257,0.095032]
+quant_tensor:blocks.0.attn.proj.weight shape:[512, 512] bits:6 scale_range:[0.032257,0.032257]
+quant_tensor:blocks.0.mlp.fc.weight shape:[1536, 512] bits:6 scale_range:[0.066650,0.328369]
+quant_tensor:blocks.0.mlp.proj.weight shape:[512, 1536] bits:6 scale_range:[0.066650,0.075684]
+quant_tensor:blocks.1.attn.c_qkv.weight shape:[1024, 512] bits:6 scale_range:[0.032257,0.096069]
+quant_tensor:blocks.1.attn.proj.weight shape:[512, 512] bits:6 scale_range:[0.032257,0.044220]
+quant_tensor:blocks.1.mlp.fc.weight shape:[1536, 512] bits:6 scale_range:[0.066650,0.147827]
+quant_tensor:blocks.1.mlp.proj.weight shape:[512, 1536] bits:6 scale_range:[0.066650,0.150146]
+quant_tensor:blocks.2.attn.c_qkv.weight shape:[1024, 512] bits:6 scale_range:[0.032257,0.048676]
+quant_tensor:blocks.2.attn.proj.weight shape:[512, 512] bits:6 scale_range:[0.032257,0.033752]
+quant_tensor:blocks.2.mlp.fc.weight shape:[1536, 512] bits:6 scale_range:[0.066650,0.337891]
+quant_tensor:blocks.2.mlp.proj.weight shape:[512, 1536] bits:6 scale_range:[0.066650,0.155151]
+quant_tensor:blocks.3.attn.c_qkv.weight shape:[1024, 512] bits:6 scale_range:[0.032257,0.098022]
+quant_tensor:blocks.3.attn.proj.weight shape:[512, 512] bits:6 scale_range:[0.032257,0.044312]
+quant_tensor:blocks.3.mlp.fc.weight shape:[1536, 512] bits:6 scale_range:[0.066650,0.093140]
+quant_tensor:blocks.3.mlp.proj.weight shape:[512, 1536] bits:6 scale_range:[0.066650,0.066650]
+quant_tensor:blocks.4.attn.c_qkv.weight shape:[1024, 512] bits:6 scale_range:[0.032257,0.050842]
+quant_tensor:blocks.4.attn.proj.weight shape:[512, 512] bits:6 scale_range:[0.032257,0.035980]
+quant_tensor:blocks.4.mlp.fc.weight shape:[1536, 512] bits:6 scale_range:[0.066650,0.190430]
+quant_tensor:blocks.4.mlp.proj.weight shape:[512, 1536] bits:6 scale_range:[0.066650,0.066650]
+quant_tensor:blocks.5.attn.c_qkv.weight shape:[1024, 512] bits:6 scale_range:[0.032257,0.053162]
+quant_tensor:blocks.5.attn.proj.weight shape:[512, 512] bits:6 scale_range:[0.032257,0.036530]
+quant_tensor:blocks.5.mlp.fc.weight shape:[1536, 512] bits:6 scale_range:[0.066650,0.080017]
+quant_tensor:blocks.5.mlp.proj.weight shape:[512, 1536] bits:6 scale_range:[0.066650,0.074158]
+quant_tensor:blocks.6.attn.c_qkv.weight shape:[1024, 512] bits:6 scale_range:[0.032257,0.046906]
+quant_tensor:blocks.6.attn.proj.weight shape:[512, 512] bits:6 scale_range:[0.032257,0.035400]
+quant_tensor:blocks.6.mlp.fc.weight shape:[1536, 512] bits:6 scale_range:[0.066650,0.143555]
+quant_tensor:blocks.6.mlp.proj.weight shape:[512, 1536] bits:6 scale_range:[0.066650,0.078369]
+quant_tensor:blocks.7.attn.c_qkv.weight shape:[1024, 512] bits:6 scale_range:[0.032257,0.108154]
+quant_tensor:blocks.7.attn.proj.weight shape:[512, 512] bits:6 scale_range:[0.032257,0.055573]
+quant_tensor:blocks.7.mlp.fc.weight shape:[1536, 512] bits:6 scale_range:[0.066650,0.083252]
+quant_tensor:blocks.7.mlp.proj.weight shape:[512, 1536] bits:6 scale_range:[0.066650,0.066650]
+quant_tensor:blocks.8.attn.c_qkv.weight shape:[1024, 512] bits:6 scale_range:[0.032257,0.046661]
+quant_tensor:blocks.8.attn.proj.weight shape:[512, 512] bits:6 scale_range:[0.032257,0.032257]
+quant_tensor:blocks.8.mlp.fc.weight shape:[1536, 512] bits:6 scale_range:[0.066650,0.153931]
+quant_tensor:blocks.8.mlp.proj.weight shape:[512, 1536] bits:6 scale_range:[0.066650,0.101624]
+quant_tensor:blocks.9.attn.c_qkv.weight shape:[1024, 512] bits:6 scale_range:[0.032257,0.060211]
+quant_tensor:blocks.9.attn.proj.weight shape:[512, 512] bits:6 scale_range:[0.032257,0.033020]
+quant_tensor:blocks.9.mlp.fc.weight shape:[1536, 512] bits:6 scale_range:[0.066650,0.131348]
+quant_tensor:blocks.9.mlp.proj.weight shape:[512, 1536] bits:6 scale_range:[0.066650,0.191650]
+passthrough_tensor:bigram.proj.weight shape:[512, 128] dtype:torch.float16 bytes:131072
+passthrough_tensor:bigram.scale shape:[] dtype:torch.float16 bytes:2
+passthrough_tensor:blocks.0.attn.q_gain shape:[8] dtype:torch.float32 bytes:32
+passthrough_tensor:blocks.0.attn_scale shape:[512] dtype:torch.float32 bytes:2048
+passthrough_tensor:blocks.0.depth_scale shape:[] dtype:torch.float16 bytes:2
+passthrough_tensor:blocks.0.mlp_scale shape:[512] dtype:torch.float32 bytes:2048
+passthrough_tensor:blocks.0.resid_mix shape:[2, 512] dtype:torch.float32 bytes:4096
+passthrough_tensor:blocks.1.attn.q_gain shape:[8] dtype:torch.float32 bytes:32
+passthrough_tensor:blocks.1.attn_scale shape:[512] dtype:torch.float32 bytes:2048
+passthrough_tensor:blocks.1.depth_scale shape:[] dtype:torch.float16 bytes:2
+passthrough_tensor:blocks.1.mlp_scale shape:[512] dtype:torch.float32 bytes:2048
+passthrough_tensor:blocks.1.resid_mix shape:[2, 512] dtype:torch.float32 bytes:4096
+passthrough_tensor:blocks.2.attn.q_gain shape:[8] dtype:torch.float32 bytes:32
+passthrough_tensor:blocks.2.attn_scale shape:[512] dtype:torch.float32 bytes:2048
+passthrough_tensor:blocks.2.depth_scale shape:[] dtype:torch.float16 bytes:2
+passthrough_tensor:blocks.2.mlp_scale shape:[512] dtype:torch.float32 bytes:2048
+passthrough_tensor:blocks.2.resid_mix shape:[2, 512] dtype:torch.float32 bytes:4096
+passthrough_tensor:blocks.3.attn.q_gain shape:[8] dtype:torch.float32 bytes:32
+passthrough_tensor:blocks.3.attn_scale shape:[512] dtype:torch.float32 bytes:2048
+passthrough_tensor:blocks.3.depth_scale shape:[] dtype:torch.float16 bytes:2
+passthrough_tensor:blocks.3.mlp_scale shape:[512] dtype:torch.float32 bytes:2048
+passthrough_tensor:blocks.3.resid_mix shape:[2, 512] dtype:torch.float32 bytes:4096
+passthrough_tensor:blocks.4.attn.q_gain shape:[8] dtype:torch.float32 bytes:32
+passthrough_tensor:blocks.4.attn_scale shape:[512] dtype:torch.float32 bytes:2048
+passthrough_tensor:blocks.4.depth_scale shape:[] dtype:torch.float16 bytes:2
+passthrough_tensor:blocks.4.mlp_scale shape:[512] dtype:torch.float32 bytes:2048
+passthrough_tensor:blocks.4.resid_mix shape:[2, 512] dtype:torch.float32 bytes:4096
+passthrough_tensor:blocks.5.attn.q_gain shape:[8] dtype:torch.float32 bytes:32
+passthrough_tensor:blocks.5.attn_scale shape:[512] dtype:torch.float32 bytes:2048
+passthrough_tensor:blocks.5.depth_scale shape:[] dtype:torch.float16 bytes:2
+passthrough_tensor:blocks.5.mlp_scale shape:[512] dtype:torch.float32 bytes:2048
+passthrough_tensor:blocks.5.resid_mix shape:[2, 512] dtype:torch.float32 bytes:4096
+passthrough_tensor:blocks.6.attn.q_gain shape:[8] dtype:torch.float32 bytes:32
+passthrough_tensor:blocks.6.attn_scale shape:[512] dtype:torch.float32 bytes:2048
+passthrough_tensor:blocks.6.depth_scale shape:[] dtype:torch.float16 bytes:2
+passthrough_tensor:blocks.6.mlp_scale shape:[512] dtype:torch.float32 bytes:2048
+passthrough_tensor:blocks.6.resid_mix shape:[2, 512] dtype:torch.float32 bytes:4096
+passthrough_tensor:blocks.7.attn.q_gain shape:[8] dtype:torch.float32 bytes:32
+passthrough_tensor:blocks.7.attn_scale shape:[512] dtype:torch.float32 bytes:2048
+passthrough_tensor:blocks.7.depth_scale shape:[] dtype:torch.float16 bytes:2
+passthrough_tensor:blocks.7.mlp_scale shape:[512] dtype:torch.float32 bytes:2048
+passthrough_tensor:blocks.7.resid_mix shape:[2, 512] dtype:torch.float32 bytes:4096
+passthrough_tensor:blocks.8.attn.q_gain shape:[8] dtype:torch.float32 bytes:32
+passthrough_tensor:blocks.8.attn_scale shape:[512] dtype:torch.float32 bytes:2048
+passthrough_tensor:blocks.8.depth_scale shape:[] dtype:torch.float16 bytes:2
+passthrough_tensor:blocks.8.mlp_scale shape:[512] dtype:torch.float32 bytes:2048
+passthrough_tensor:blocks.8.resid_mix shape:[2, 512] dtype:torch.float32 bytes:4096
+passthrough_tensor:blocks.9.attn.q_gain shape:[8] dtype:torch.float32 bytes:32
+passthrough_tensor:blocks.9.attn_scale shape:[512] dtype:torch.float32 bytes:2048
+passthrough_tensor:blocks.9.depth_scale shape:[] dtype:torch.float16 bytes:2
+passthrough_tensor:blocks.9.mlp_scale shape:[512] dtype:torch.float32 bytes:2048
+passthrough_tensor:blocks.9.resid_mix shape:[2, 512] dtype:torch.float32 bytes:4096
+passthrough_tensor:skip_weights shape:[5, 512] dtype:torch.float32 bytes:10240
+passthrough_tensor:smear.gate shape:[512] dtype:torch.float16 bytes:1024
+passthrough_tensor:tok_emb.weight shape:[4096, 512] dtype:torch.float16 bytes:4194304
+Serialized model zstd-22: 14595255 bytes (payload:28349782 raw_torch:28391533 payload_ratio:3.51x)
+Total submission size zstd-22: 14672017 bytes
+Size check PASSED: 14672017 / 16,000,000 (91.7%)
+phase:serialize wall_ms:32769 (quant+compress+save)
+final_int8_zlib_roundtrip val_loss:2.7856 val_bpb:1.1955 eval_time:1265ms eval_seq_len:2048
+final_int8_zlib_roundtrip_exact val_loss:2.78561156 val_bpb:1.19553829
+quant_gap: 0.039818 BPB (pre:1.155720 post:1.195538)
+phase:postquant_eval wall_ms:3010
+ttt:rank0 short=1555 long=4695 epochs=3 batch=64
+ttt:short_docs time=14999ms tokens=273062
+ttt:batch 5/74 time=1259ms avg_loss=2.7884
+ttt:batch 10/74 time=2448ms avg_loss=2.7299
+ttt:batch 15/74 time=3625ms avg_loss=2.6913
+ttt:batch 20/74 time=4803ms avg_loss=2.6629
+ttt:batch 25/74 time=5979ms avg_loss=2.6355
+ttt:batch 30/74 time=8354ms avg_loss=2.5627
+ttt:batch 35/74 time=10726ms avg_loss=2.5099
+ttt:batch 40/74 time=13388ms avg_loss=2.4706
+ttt:batch 45/74 time=17459ms avg_loss=2.4148
+ttt:batch 50/74 time=21860ms avg_loss=2.3679
+ttt:batch 55/74 time=27877ms avg_loss=2.3238
+ttt:batch 60/74 time=35781ms avg_loss=2.2791
+ttt:batch 65/74 time=46046ms avg_loss=2.2394
+ttt:batch 70/74 time=62954ms avg_loss=2.1995
+ttt:long_docs time=115032ms docs=4695
+final_ttt_lora val_loss:2.2422 val_bpb:0.9623 eval_time:215423ms lora_rank:8 chunk_size:256
+final_ttt_lora_exact val_loss:2.24224670 val_bpb:0.96233320
+ttt_gain: 0.233205 BPB gain over int8 (int8:1.195538 ttt:0.962333)
+phase:ttt_eval wall_ms:216132
+phase:TOTAL wall_ms:871435 (14.5 min)
+phase_breakdown: train:600033ms postprocess:see_above serialize:see_above eval:see_above ttt:see_above
