@@ -111,6 +111,7 @@ class Hyperparameters:
     ttt_lact_lr = float(os.environ.get("TTT_LACT_LR", 0.02))  # Muon-style LR for LaCT
     ttt_lact_chunk = int(os.environ.get("TTT_LACT_CHUNK", 4096))  # large chunk (full doc)
     ttt_lact_ns_steps = int(os.environ.get("TTT_LACT_NS_STEPS", 5))  # Newton-Schulz iterations
+    ttt_lact_grad_steps = int(os.environ.get("TTT_LACT_GRAD_STEPS", 3))  # gradient steps per chunk (legal: score first, then N steps)
     ttt_sf_enabled = bool(int(os.environ.get("TTT_SF_ENABLED", "0")))  # score-first full-weight TTT
     ttt_sf_chunk = int(os.environ.get("TTT_SF_CHUNK", 32768))  # 32K tokens per chunk
     ttt_sf_lr = float(os.environ.get("TTT_SF_LR", 0.002))
@@ -1244,9 +1245,12 @@ def eval_val_ttt_lora(
         num_chunks = [(pl + chunk_size - 1) // chunk_size for pl in pred_lens]
         max_nc = max(num_chunks)
         base_lr = cur_opt.param_groups[0]['lr']
-        for epoch in range(args.ttt_epochs):
-            if args.ttt_cosine and args.ttt_epochs > 1:
-                lr_scale = 0.5 * (1 + math.cos(math.pi * epoch / args.ttt_epochs))
+        # LaCT forces 1 epoch (legal: multi-epoch over full doc is illegal)
+        num_epochs = 1 if args.ttt_lact else args.ttt_epochs
+        grad_steps_per_chunk = args.ttt_lact_grad_steps if args.ttt_lact else 1
+        for epoch in range(num_epochs):
+            if args.ttt_cosine and num_epochs > 1:
+                lr_scale = 0.5 * (1 + math.cos(math.pi * epoch / num_epochs))
                 for pg in cur_opt.param_groups:
                     pg['lr'] = base_lr * max(lr_scale, 0.01)
             for ci in range(max_nc):
@@ -1270,7 +1274,7 @@ def eval_val_ttt_lora(
                 else:
                     with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         ptl = base_model(x, y, lora=cur_lora)
-                if epoch == args.ttt_epochs - 1:
+                if epoch == num_epochs - 1:
                     with torch.no_grad():
                         for b in range(bsz):
                             if not active[b]: continue
@@ -1282,6 +1286,7 @@ def eval_val_ttt_lora(
                             tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[px]).to(torch.float64)
                             byte_sum += tb.sum()
                 if needs_train:
+                    # First gradient step (uses ptl from scoring forward pass)
                     train_loss = torch.zeros(bsz, device=device)
                     for b in range(bsz):
                         if ci >= num_chunks[b]-1: continue
@@ -1290,6 +1295,18 @@ def eval_val_ttt_lora(
                     cur_opt.zero_grad()
                     train_loss.sum().backward()
                     cur_opt.step()
+                    # Additional gradient steps (LaCT: legal, training on already-scored tokens)
+                    for _gs in range(1, grad_steps_per_chunk):
+                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                            ptl_extra = base_model(x, y, lora=cur_lora)
+                        train_loss_extra = torch.zeros(bsz, device=device)
+                        for b in range(bsz):
+                            if ci >= num_chunks[b]-1: continue
+                            co, cl = doc_info[b]
+                            if cl > 0: train_loss_extra[b] = ptl_extra[b, co:co+cl].mean()
+                        cur_opt.zero_grad()
+                        train_loss_extra.sum().backward()
+                        cur_opt.step()
         if master and (bi + batch_size) % (batch_size * 5) == 0:
             elapsed = 1000 * (time.perf_counter() - t1)
             avg_loss = loss_sum.item() / max(token_count.item(), 1)
