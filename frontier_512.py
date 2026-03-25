@@ -31,15 +31,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-try:
-    from flash_attn_interface import flash_attn_func as flash_attn_3_func
-    HAS_FA3 = not bool(int(os.environ.get("FORCE_SDPA", "0")))
-except ImportError:
-    HAS_FA3 = False
-    flash_attn_3_func = None
-
-FUSE_QKV = bool(int(os.environ.get("FUSE_QKV", "1")))
-BATCH_MUON = bool(int(os.environ.get("BATCH_MUON", "1")))
+from flash_attn_interface import flash_attn_func as flash_attn_3_func
 
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
@@ -58,7 +50,7 @@ class Hyperparameters:
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
-    eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
+    eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 1024))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 0))
     qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.0))  # 0=disabled, 0.15=enable when lr_scale<0.15
     entropy_reg = float(os.environ.get("ENTROPY_REG", 0.0))  # 0=disabled, ~0.01=mild entropy regularization during QAT
@@ -107,20 +99,10 @@ class Hyperparameters:
     ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", 256))
     ttt_eval_seq_len = int(os.environ.get("TTT_EVAL_SEQ_LEN", 1024))
     ttt_batch_size = int(os.environ.get("TTT_BATCH_SIZE", 64))
-    ttt_min_doc_len = int(os.environ.get("TTT_MIN_DOC_LEN", 1024))
-    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 2))
+    ttt_min_doc_len = int(os.environ.get("TTT_MIN_DOC_LEN", 256))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 1))
     ttt_cosine = bool(int(os.environ.get("TTT_COSINE", "0")))
     val_tokens_limit = int(os.environ.get("VAL_TOKENS_LIMIT", 0))  # 0=full val set
-    ttt_lact = bool(int(os.environ.get("TTT_LACT", "0")))  # LaCT: Muon optimizer + large chunks for TTT
-    ttt_lact_lr = float(os.environ.get("TTT_LACT_LR", 0.02))  # Muon-style LR for LaCT
-    ttt_lact_chunk = int(os.environ.get("TTT_LACT_CHUNK", 4096))  # large chunk (full doc)
-    ttt_lact_ns_steps = int(os.environ.get("TTT_LACT_NS_STEPS", 5))  # Newton-Schulz iterations
-    ttt_lact_grad_steps = int(os.environ.get("TTT_LACT_GRAD_STEPS", 3))  # gradient steps per chunk (legal: score first, then N steps)
-    ttt_sf_enabled = bool(int(os.environ.get("TTT_SF_ENABLED", "0")))  # score-first full-weight TTT
-    ttt_sf_chunk = int(os.environ.get("TTT_SF_CHUNK", 32768))  # 32K tokens per chunk
-    ttt_sf_lr = float(os.environ.get("TTT_SF_LR", 0.002))
-    ttt_sf_mom = float(os.environ.get("TTT_SF_MOM", 0.9))
-    ttt_sf_epochs = int(os.environ.get("TTT_SF_EPOCHS", 3))
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
@@ -243,47 +225,6 @@ class Muon(torch.optim.Optimizer):
             p.add_(g, alpha=-lr)
             curr += p.numel()
 
-    def _unbatched_step(self, params, group):
-        lr = group["lr"]
-        momentum = group["momentum"]
-        backend_steps = group["backend_steps"]
-        nesterov = group["nesterov"]
-        wd = group.get("weight_decay", 0.0)
-
-        distributed = dist.is_available() and dist.is_initialized()
-        world_size = dist.get_world_size() if distributed else 1
-        rank = dist.get_rank() if distributed else 0
-
-        total_params = sum(int(p.numel()) for p in params)
-        updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
-
-        curr = 0
-        for i, p in enumerate(params):
-            if i % world_size == rank and p.grad is not None:
-                g = p.grad
-                state = self.state[p]
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g)
-                buf = state["momentum_buffer"]
-                buf.mul_(momentum).add_(g)
-                if nesterov:
-                    g = g.add(buf, alpha=momentum)
-                g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                g *= max(1, g.size(0) / g.size(1)) ** 0.5
-                updates_flat[curr : curr + p.numel()] = g.reshape(-1)
-            curr += p.numel()
-
-        if distributed:
-            dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
-
-        curr = 0
-        for p in params:
-            if wd > 0:
-                p.data.mul_(1.0 - wd * lr)
-            g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
-            p.add_(g, alpha=-lr)
-            curr += p.numel()
-
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
@@ -294,10 +235,7 @@ class Muon(torch.optim.Optimizer):
             params = group["params"]
             if not params:
                 continue
-            if BATCH_MUON:
-                self._batched_step(params, group)
-            else:
-                self._unbatched_step(params, group)
+            self._batched_step(params, group)
         return loss
 
 def build_sentencepiece_luts(
@@ -429,45 +367,13 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
 
-GPTQ_LITE = bool(int(os.environ.get("GPTQ_LITE", "1")))
 GPTQ_LITE_PERCENTILES = [0.999, 0.9995, 0.9999, 0.99999, 1.0]
-DUQUANT = bool(int(os.environ.get("DUQUANT", "0")))
-DUQUANT_BLOCK = int(os.environ.get("DUQUANT_BLOCK", 512))
-
-def _hadamard_matrix(n: int) -> Tensor:
-    """Build n×n normalized Hadamard matrix (orthogonal, H @ H = I)."""
-    # Recursive construction: H_1 = [1], H_{2n} = [[H_n, H_n], [H_n, -H_n]] / sqrt(2)
-    H = torch.ones(1, 1)
-    while H.size(0) < n:
-        H = torch.cat([
-            torch.cat([H, H], dim=1),
-            torch.cat([H, -H], dim=1),
-        ], dim=0) / math.sqrt(2.0)
-    return H
-
-def _block_hadamard_rotate(W: Tensor, block_size: int = 512) -> Tensor:
-    """Apply block-diagonal Hadamard rotation along columns (input dim).
-    W: [out_features, in_features]. Rotation along dim=1.
-    Block size must divide in_features. Returns rotated W (same shape)."""
-    out_f, in_f = W.shape
-    if in_f % block_size != 0:
-        # Pad to next multiple, rotate, unpad
-        pad = block_size - (in_f % block_size)
-        W_pad = F.pad(W, (0, pad))
-        W_rot = _block_hadamard_rotate(W_pad, block_size)
-        return W_rot[:, :in_f]
-    H = _hadamard_matrix(block_size).to(dtype=W.dtype, device=W.device)
-    n_blocks = in_f // block_size
-    blocks = W.reshape(out_f, n_blocks, block_size)
-    # Rotate each block: blocks @ H^T (H is symmetric so H^T = H)
-    rotated = torch.einsum('obk,kj->obj', blocks, H)
-    return rotated.reshape(out_f, in_f)
 
 def quantize_float_tensor(t: Tensor, bits: int = 8) -> tuple[Tensor, Tensor]:
     max_val = 127 if bits == 8 else (2 ** (bits - 1)) - 1  # int6: 31, int8: 127
     t32 = t.float()
     if t32.ndim == 2:
-        if GPTQ_LITE and t32.numel() > 0:
+        if t32.numel() > 0:
             # Per-row optimal clip percentile search (GPTQ-lite)
             best_q = None
             best_scale = None
@@ -567,18 +473,11 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor], quant_preset: str = 
 
         stats["num_float_tensors"] += 1
         bits = _quant_bits_for_name(name, quant_preset)
-        t_quant = t
-        used_hadamard = False
-        if DUQUANT and t.ndim == 2:
-            t_quant = _block_hadamard_rotate(t.float(), DUQUANT_BLOCK).to(dtype=t.dtype)
-            used_hadamard = True
-        q, s = quantize_float_tensor(t_quant, bits=bits)
+        q, s = quantize_float_tensor(t, bits=bits)
         meta = {}
         if s.ndim > 0:
             meta["scheme"] = "per_row"
             meta["axis"] = 0
-        if used_hadamard:
-            meta["hadamard"] = DUQUANT_BLOCK
         if meta:
             qmeta[name] = meta
         quantized[name] = q
@@ -612,10 +511,6 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
         else:
             scale = float(s.item())
             w = q.float() * scale
-        # Inverse Hadamard rotation (normalized Hadamard is its own inverse)
-        had_block = qmeta.get(name, {}).get("hadamard")
-        if had_block and w.ndim == 2:
-            w = _block_hadamard_rotate(w, had_block)
         out[name] = w.to(dtype=dtype).contiguous()
     for name, t in obj["passthrough"].items():
         out_t = t.detach().to("cpu").contiguous()
@@ -734,12 +629,8 @@ class Rotary(nn.Module):
                 inv_freq = self.inv_freq.to(device)
             t = torch.arange(seq_len, device=device, dtype=inv_freq.dtype)
             freqs = torch.outer(t, inv_freq)
-            if HAS_FA3:
-                self._cos_cached = freqs.cos()[None, :, None, :]
-                self._sin_cached = freqs.sin()[None, :, None, :]
-            else:
-                self._cos_cached = freqs.cos()[None, None, :, :]
-                self._sin_cached = freqs.sin()[None, None, :, :]
+            self._cos_cached = freqs.cos()[None, :, None, :]  # [1, T, 1, D/2] for FA3
+            self._sin_cached = freqs.sin()[None, :, None, :]
             self._seq_len_cached = seq_len
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
@@ -769,12 +660,7 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         self.kv_dim = self.num_kv_heads * self.head_dim
-        if FUSE_QKV:
-            self.c_qkv = CastedLinear(dim, dim + 2 * self.kv_dim, bias=False)
-        else:
-            self.c_q = CastedLinear(dim, dim, bias=False)
-            self.c_k = CastedLinear(dim, self.kv_dim, bias=False)
-            self.c_v = CastedLinear(dim, self.kv_dim, bias=False)
+        self.c_qkv = CastedLinear(dim, dim + 2 * self.kv_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
@@ -790,40 +676,24 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: Tensor, q_delta=None, v_delta=None, v_embed=None) -> Tensor:
         bsz, seqlen, dim = x.shape
-        if FUSE_QKV:
-            qkv = self.c_qkv(x)
-            q = qkv[:, :, :dim] + (q_delta if q_delta is not None else 0)
-            k = qkv[:, :, dim:dim + self.kv_dim]
-            v = qkv[:, :, dim + self.kv_dim:] + (v_delta if v_delta is not None else 0)
-        else:
-            q = self.c_q(x) + (q_delta if q_delta is not None else 0)
-            k = self.c_k(x)
-            v = self.c_v(x) + (v_delta if v_delta is not None else 0)
+        qkv = self.c_qkv(x)
+        q = qkv[:, :, :dim] + (q_delta if q_delta is not None else 0)
+        k = qkv[:, :, dim:dim + self.kv_dim]
+        v = qkv[:, :, dim + self.kv_dim:] + (v_delta if v_delta is not None else 0)
         if v_embed is not None:
             v = v + v_embed
         q = q.reshape(bsz, seqlen, self.num_heads, self.head_dim)
         k = k.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        if not HAS_FA3:
-            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        if HAS_FA3:
-            q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
-            y = flash_attn_3_func(q, k, v, causal=True)
-            if self.use_xsa:
-                y = self._xsa(y, v)
-        else:
-            q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-            y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=None, is_causal=True, enable_gqa=(self.num_kv_heads != self.num_heads),
-            )
-            y = y.transpose(1, 2).contiguous()
-            if self.use_xsa:
-                y = self._xsa(y, v.transpose(1, 2))
+        q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
+        y = flash_attn_3_func(q, k, v, causal=True)
+        if self.use_xsa:
+            y = self._xsa(y, v)
         y = y.reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -1091,59 +961,7 @@ class BatchedTTTLoRA(nn.Module):
             if isinstance(m, BatchedLinearLoRA):
                 m.reset()
 
-class MuonTTTOptimizer:
-    """Muon-style optimizer for TTT LoRA: Newton-Schulz orthogonalized gradient step."""
-    def __init__(self, params, lr=0.02, momentum=0.9, ns_steps=5):
-        self.param_groups = [{"params": list(params), "lr": lr, "base_lr": lr}]
-        self.lr = lr
-        self.momentum = momentum
-        self.ns_steps = ns_steps
-        self.state: dict[int, dict] = {}
-
-    def zero_grad(self):
-        for group in self.param_groups:
-            for p in group["params"]:
-                if p.grad is not None:
-                    p.grad.zero_()
-
-    @torch.no_grad()
-    def step(self):
-        for group in self.param_groups:
-            lr = group.get("lr", self.lr)
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                g = p.grad.data
-                if g.ndim < 2:
-                    # Scalar/1D params: plain SGD with momentum
-                    sid = id(p)
-                    if sid not in self.state:
-                        self.state[sid] = {"buf": torch.zeros_like(g)}
-                    buf = self.state[sid]["buf"]
-                    buf.mul_(self.momentum).add_(g)
-                    p.data.add_(buf, alpha=-lr)
-                    continue
-                # 2D+ params (LoRA A/B): batched Newton-Schulz
-                sid = id(p)
-                if sid not in self.state:
-                    self.state[sid] = {"buf": torch.zeros_like(g)}
-                buf = self.state[sid]["buf"]
-                buf.mul_(self.momentum).add_(g)
-                # Apply NS to each batch element
-                G = buf.bfloat16()
-                if G.ndim == 2:
-                    G = G.unsqueeze(0)
-                G_ns = batched_newton_schulz(G, steps=self.ns_steps)
-                p.data.add_(G_ns.to(dtype=p.dtype).reshape(p.shape), alpha=-lr)
-
-    def reset(self):
-        for sid in self.state:
-            self.state[sid]["buf"].zero_()
-
 def _reset_ttt_optimizer(opt) -> None:
-    if isinstance(opt, MuonTTTOptimizer):
-        opt.reset()
-        return
     for group in opt.param_groups:
         for p in group["params"]:
             s = opt.state.get(p)
@@ -1154,9 +972,6 @@ def _reset_ttt_optimizer(opt) -> None:
             s["step"].fill_(0)
 
 def _build_ttt_optimizer(lora: BatchedTTTLoRA, args: Hyperparameters):
-    if args.ttt_lact:
-        return MuonTTTOptimizer(lora.parameters(), lr=args.ttt_lact_lr,
-                                 momentum=0.9, ns_steps=args.ttt_lact_ns_steps)
     return torch.optim.Adam(lora.parameters(), lr=args.ttt_lora_lr,
                             betas=(args.beta1, args.beta2), eps=1e-10)
 
@@ -1274,7 +1089,7 @@ def eval_val_ttt_lora(
     if master:
         print(f"ttt:short_docs time={1000*(time.perf_counter()-t0):.0f}ms tokens={int(token_count.item())}")
 
-    chunk_size = args.ttt_lact_chunk if args.ttt_lact else args.ttt_chunk_size
+    chunk_size = args.ttt_chunk_size
     long_docs.sort(key=lambda d: (d[1] - 2) // chunk_size)
     batch_size = args.ttt_batch_size
     eval_seq_len = args.ttt_eval_seq_len
@@ -1296,8 +1111,8 @@ def eval_val_ttt_lora(
         max_nc = max(num_chunks)
         base_lr = cur_opt.param_groups[0]['lr']
         # LaCT forces 1 epoch (legal: multi-epoch over full doc is illegal)
-        num_epochs = 1 if args.ttt_lact else args.ttt_epochs
-        grad_steps_per_chunk = args.ttt_lact_grad_steps if args.ttt_lact else 1
+        num_epochs = args.ttt_epochs
+        grad_steps_per_chunk = 1
         for epoch in range(num_epochs):
             if args.ttt_cosine and num_epochs > 1:
                 lr_scale = 0.5 * (1 + math.cos(math.pi * epoch / num_epochs))
@@ -1368,74 +1183,6 @@ def eval_val_ttt_lora(
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(byte_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
-
-    val_loss = float(loss_sum.item() / max(token_count.item(), 1))
-    val_bpb = float((loss_sum.item() / math.log(2.0)) / max(byte_sum.item(), 1))
-    base_model.train()
-    for p in base_model.parameters():
-        p.requires_grad_(True)
-    return val_loss, val_bpb
-
-def eval_val_ttt_score_first(
-    args: Hyperparameters, base_model, rank: int, world_size: int, device: torch.device,
-    base_bytes_lut: Tensor, has_leading_space_lut: Tensor, is_boundary_token_lut: Tensor,
-) -> tuple[float, float]:
-    """Score-first full-weight TTT (PR #549 style). Score chunk, then train on graded tokens."""
-    files = sorted(glob.glob(args.val_files))
-    all_tokens = torch.cat([load_data_shard(Path(f)) for f in files])
-    if args.val_tokens_limit > 0:
-        all_tokens = all_tokens[:args.val_tokens_limit + 1]
-    total = all_tokens.numel() - 1
-    chunk = args.ttt_sf_chunk
-    num_chunks = (total + chunk - 1) // chunk
-    master = rank == 0
-
-    base_model.eval()
-    for p in base_model.parameters():
-        p.requires_grad_(False)
-
-    opt = torch.optim.SGD(base_model.parameters(), lr=args.ttt_sf_lr, momentum=args.ttt_sf_mom)
-
-    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
-    byte_sum = torch.zeros((), device=device, dtype=torch.float64)
-    token_count = torch.zeros((), device=device, dtype=torch.float64)
-    t0 = time.perf_counter()
-
-    for ci in range(num_chunks):
-        cs = ci * chunk
-        ce = min(cs + chunk, total)
-        cl = ce - cs
-        x = all_tokens[cs:ce].to(device=device, dtype=torch.int64).unsqueeze(0)
-        y = all_tokens[cs + 1:ce + 1].to(device=device, dtype=torch.int64).unsqueeze(0)
-
-        # Phase 1: SCORE (no grad)
-        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            logits = base_model.get_logits(x)
-        per_tok = F.cross_entropy(logits[0].float(), y[0], reduction="none")
-        loss_sum += per_tok.to(torch.float64).sum()
-        token_count += cl
-        tb = base_bytes_lut[y[0]].to(torch.float64)
-        tb += (has_leading_space_lut[y[0]] & ~is_boundary_token_lut[x[0]]).to(torch.float64)
-        byte_sum += tb.sum()
-
-        # Phase 2: TRAIN on graded chunk (multi-epoch)
-        for p in base_model.parameters():
-            p.requires_grad_(True)
-        base_model.train()
-        for ep in range(args.ttt_sf_epochs):
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                loss = base_model(x, y)
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-        base_model.eval()
-        for p in base_model.parameters():
-            p.requires_grad_(False)
-
-        if master and (ci + 1) % 10 == 0:
-            elapsed = 1000 * (time.perf_counter() - t0)
-            avg = loss_sum.item() / max(token_count.item(), 1)
-            print(f"ttt_sf:chunk {ci+1}/{num_chunks} time={elapsed:.0f}ms avg_loss={avg:.4f}")
 
     val_loss = float(loss_sum.item() / max(token_count.item(), 1))
     val_bpb = float((loss_sum.item() / math.log(2.0)) / max(byte_sum.item(), 1))
@@ -1621,13 +1368,12 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params} world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0(f"optimizations: fuse_qkv:{FUSE_QKV} batch_muon:{BATCH_MUON} fa3:{HAS_FA3} gptq_lite:{GPTQ_LITE} qat:{args.qat_start_frac} quant:{args.quant_preset}")
+    log0(f"optimizations: fuse_qkv:True batch_muon:True fa3:True gptq_lite:True qat:{args.qat_start_frac} quant:{args.quant_preset}")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}")
     log0(f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} iterations:{args.iterations} warmup_steps:{args.warmup_steps} max_wallclock_seconds:{args.max_wallclock_seconds:.3f}")
     log0(f"seed:{args.seed} ema_enabled:{args.ema_enabled} ema_decay:{args.ema_decay} ema_every:{args.ema_every}")
-    lact_str = f" lact:True lr:{args.ttt_lact_lr} chunk:{args.ttt_lact_chunk} ns:{args.ttt_lact_ns_steps}" if args.ttt_lact else ""
-    log0(f"ttt_lora_rank:{args.ttt_lora_rank} ttt_lora_lr:{args.ttt_lora_lr} ttt_chunk_size:{args.ttt_chunk_size}{lact_str}")
+    log0(f"ttt_lora_rank:{args.ttt_lora_rank} ttt_lora_lr:{args.ttt_lora_lr} ttt_chunk_size:{args.ttt_chunk_size}")
 
     ema_state: dict[str, Tensor] = {}
     _ema_updated = False
@@ -1984,7 +1730,7 @@ def main() -> None:
         log0(
             f"final_sliding_window val_loss:{s_val_loss:.4f} val_bpb:{s_val_bpb:.4f} "
             f"eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms "
-            f"stride:{args.eval_stride} seq_len:{effective_eval_seq_len}"
+            f"stride:{args.eval_stride} seq_len:{slide_seq_len}"
         )
         log0(f"final_sliding_window_exact val_loss:{s_val_loss:.8f} val_bpb:{s_val_bpb:.8f}")
     ttt_model = GPT(vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
@@ -2012,24 +1758,6 @@ def main() -> None:
     ttt_gap_bpb = ttt_val_bpb - q_val_bpb
     log0(f"ttt_gain_lora: {-ttt_gap_bpb:.6f} BPB gain over int8 (int8:{q_val_bpb:.6f} ttt:{ttt_val_bpb:.6f})")
     log0(f"phase:ttt_eval wall_ms:{1000.0*(time.perf_counter()-phase_t):.0f}")
-
-    # Score-first full-weight TTT (PR #549 style) — reload quantized checkpoint
-    if args.ttt_sf_enabled:
-        phase_t = time.perf_counter()
-        log0("ttt_sf:start — reloading quantized checkpoint for score-first TTT")
-        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
-        sf_val_loss, sf_val_bpb = eval_val_ttt_score_first(
-            args, base_model, rank, world_size, device,
-            base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-        )
-        log0(
-            f"final_ttt_sf val_loss:{sf_val_loss:.4f} val_bpb:{sf_val_bpb:.4f} "
-            f"eval_time:{1000.0*(time.perf_counter()-phase_t):.0f}ms"
-        )
-        log0(f"final_ttt_sf_exact val_loss:{sf_val_loss:.8f} val_bpb:{sf_val_bpb:.8f}")
-        sf_gap = sf_val_bpb - q_val_bpb
-        log0(f"ttt_gain_sf: {-sf_gap:.6f} BPB gain over int8 (int8:{q_val_bpb:.6f} ttt_sf:{sf_val_bpb:.6f})")
-        log0(f"phase:ttt_sf_eval wall_ms:{1000.0*(time.perf_counter()-phase_t):.0f}")
 
     total_wall_ms = 1000.0 * (time.perf_counter() - wall_start)
     log0(f"phase:TOTAL wall_ms:{total_wall_ms:.0f} ({total_wall_ms/60000:.1f} min)")

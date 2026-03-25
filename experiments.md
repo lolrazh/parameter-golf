@@ -258,3 +258,10 @@ Key negative results: EMA hurt (r20: quant gap 0.155), high momentum hurt (r15),
 | run7 | proxy_11L_xsa_all | 11L sp1024, XSA=11 (all), PartialRoPE, LeakyReLU², front3_back1_7_mid5, GPTQ-lite | 3228 | 186 | 1.3757 | 1.3934 | 0.0177 | 1.2715 | 13.8 | WORSE: XSA all layers +8ms/step, -146 steps, +0.021 BPB vs run6. XSA=4 stays default. |
 | run9 | proxy_11L_sliding_window | 11L sp1024, XSA4, PartialRoPE, LeakyReLU², front6mid5, EVAL_STRIDE=64 | 3406 | 176 | 1.3503 | 1.3672 | 0.017 | 1.2711 | 12.8 | Sliding window broken at seq2048 (NTK RoPE). Fixed to seq1024: -0.034 BPB gain confirmed separately. |
 | **run10** | **proxy_11L_entropy_qat_sliding** | **11L sp1024, XSA4, PartialRoPE, LeakyReLU², front6mid5, QAT@0.15+EntReg0.01, sliding stride=64 seq=1024** | **3277** | **183** | **1.3182** | **1.3271** | **0.009** | **1.2835** | **13.0** | **Entropy-reg QAT halves quant gap. Sliding window works (1.2936). Best pre/post-quant ever. Less TTT headroom.** |
+
+**Proxy A/B comparison (1xH100 Thunder, 10 min train, 1M-token eval, sliding stride=64 seq=1024, 1ep TTT)**
+
+| # | Run ID | Config | Pre-quant BPB | Post-quant BPB | Sliding BPB | Post-TTT BPB | Artifact | Steps | Verdict |
+|---|--------|--------|---------------|----------------|-------------|--------------|----------|-------|---------|
+| run11 | run_a_baseline | 11L MLP=1536 Bigram=2048 noVE 26.8M | 1.3704 | 1.3826 | 1.2936 | 1.2913 | 13.15 MB | 3276 | baseline |
+| run12 | run_b_upgraded | 11L MLP=1792 Bigram=10240 VE128(9,10) 30.9M | 1.3632 | 1.3744 | 1.2926 | 1.2903 | 14.13 MB | 3125 | marginal on proxy, go for 8xH100 |
