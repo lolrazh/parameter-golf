@@ -95,7 +95,7 @@ class Hyperparameters:
     ema_every = int(os.environ.get("EMA_EVERY", 10))
 
     ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 8))
-    ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.01))
+    ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.005))
     ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", 256))
     ttt_eval_seq_len = int(os.environ.get("TTT_EVAL_SEQ_LEN", 1024))
     ttt_batch_size = int(os.environ.get("TTT_BATCH_SIZE", 64))
@@ -996,50 +996,6 @@ def _compute_chunk_window(ci: int, pred_len: int, num_chunks: int, chunk_size: i
     chunk_len = chunk_end - chunk_start
     return win_start, win_len, chunk_offset, chunk_len
 
-def _ttt_one_doc(base_model, all_tokens, ds, dl, lora, opt, chunk_size, eval_seq_len,
-                  device, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-                  loss_sum, byte_sum, token_count, num_epochs, cosine_decay=False):
-    """TTT on a single document: score-then-train per chunk, multiple epochs."""
-    pred_len = dl - 1
-    nc = (pred_len + chunk_size - 1) // chunk_size
-    lora.reset()
-    _reset_ttt_optimizer(opt)
-    base_lr = opt.param_groups[0]['lr']
-    for epoch in range(num_epochs):
-        if cosine_decay and num_epochs > 1:
-            lr_scale = 0.5 * (1 + math.cos(math.pi * epoch / num_epochs))
-            for pg in opt.param_groups:
-                pg['lr'] = base_lr * max(lr_scale, 0.01)
-        for ci in range(nc):
-            cs = ci * chunk_size
-            ce = min((ci + 1) * chunk_size, pred_len)
-            cl = ce - cs
-            ws = max(0, ce - eval_seq_len)
-            wl = ce - ws
-            co = cs - ws
-            x = all_tokens[ds + ws : ds + ws + wl].to(dtype=torch.int64, device=device).unsqueeze(0)
-            y = all_tokens[ds + ws + 1 : ds + ws + wl + 1].to(dtype=torch.int64, device=device).unsqueeze(0)
-            needs_train = ci < nc - 1
-            if needs_train:
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    ptl = base_model(x, y, lora=lora)
-            else:
-                with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    ptl = base_model(x, y, lora=lora)
-            if epoch == num_epochs - 1:
-                with torch.no_grad():
-                    loss_sum += ptl[0, co : co + cl].to(torch.float64).sum()
-                    token_count += cl
-                    tgt = y[0, co : co + cl]
-                    px = x[0, co : co + cl]
-                    tb = base_bytes_lut[tgt].to(torch.float64)
-                    tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[px]).to(torch.float64)
-                    byte_sum += tb.sum()
-            if needs_train:
-                opt.zero_grad()
-                ptl[0, co : co + cl].mean().backward()
-                opt.step()
-
 def eval_val_ttt_lora(
     args: Hyperparameters,
     base_model: GPT,
@@ -1110,9 +1066,7 @@ def eval_val_ttt_lora(
         num_chunks = [(pl + chunk_size - 1) // chunk_size for pl in pred_lens]
         max_nc = max(num_chunks)
         base_lr = cur_opt.param_groups[0]['lr']
-        # LaCT forces 1 epoch (legal: multi-epoch over full doc is illegal)
         num_epochs = args.ttt_epochs
-        grad_steps_per_chunk = 1
         for epoch in range(num_epochs):
             if args.ttt_cosine and num_epochs > 1:
                 lr_scale = 0.5 * (1 + math.cos(math.pi * epoch / num_epochs))
@@ -1151,7 +1105,6 @@ def eval_val_ttt_lora(
                             tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[px]).to(torch.float64)
                             byte_sum += tb.sum()
                 if needs_train:
-                    # First gradient step (uses ptl from scoring forward pass)
                     train_loss = torch.zeros(bsz, device=device)
                     for b in range(bsz):
                         if ci >= num_chunks[b]-1: continue
@@ -1160,18 +1113,6 @@ def eval_val_ttt_lora(
                     cur_opt.zero_grad()
                     train_loss.sum().backward()
                     cur_opt.step()
-                    # Additional gradient steps (LaCT: legal, training on already-scored tokens)
-                    for _gs in range(1, grad_steps_per_chunk):
-                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                            ptl_extra = base_model(x, y, lora=cur_lora)
-                        train_loss_extra = torch.zeros(bsz, device=device)
-                        for b in range(bsz):
-                            if ci >= num_chunks[b]-1: continue
-                            co, cl = doc_info[b]
-                            if cl > 0: train_loss_extra[b] = ptl_extra[b, co:co+cl].mean()
-                        cur_opt.zero_grad()
-                        train_loss_extra.sum().backward()
-                        cur_opt.step()
         if master and (bi + batch_size) % (batch_size * 5) == 0:
             elapsed = 1000 * (time.perf_counter() - t1)
             avg_loss = loss_sum.item() / max(token_count.item(), 1)
