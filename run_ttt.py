@@ -1,4 +1,4 @@
-"""Standalone TTT eval: load exported checkpoint, run LoRA TTT, report BPB.
+"""Standalone TTT eval: load exported checkpoint, run full-model score-first TTT, report BPB.
 Supports SKIP_POSTQUANT_EVAL=1 to skip redundant post-quant eval."""
 import sys, os, io, time, math, zlib, glob
 import torch
@@ -6,7 +6,7 @@ import sentencepiece as spm
 
 sys.path.insert(0, os.path.dirname(__file__))
 from frontier_512 import (
-    Hyperparameters, GPT, eval_val_ttt_lora, eval_val, eval_val_sliding,
+    Hyperparameters, GPT, eval_val_ttt, eval_val, eval_val_sliding,
     build_sentencepiece_luts, load_validation_tokens,
     dequantize_state_dict_int8, HAVE_ZSTD,
 )
@@ -26,9 +26,9 @@ def main():
         val_tokens = val_tokens[:args.val_tokens_limit + 1]
 
     print(f"val_tokens:{val_tokens.numel()} checkpoint:{checkpoint_path}")
-    print(f"ttt_config: rank={args.ttt_lora_rank} lr={args.ttt_lora_lr} epochs={args.ttt_epochs} "
-          f"chunk={args.ttt_chunk_size} ctx={args.ttt_eval_seq_len} batch={args.ttt_batch_size} "
-          f"min_doc={args.ttt_min_doc_len} cosine={args.ttt_cosine}")
+    print(f"ttt_config: lr={args.ttt_lr} epochs={args.ttt_epochs} "
+          f"chunk={args.ttt_chunk_tokens} freeze_blocks={args.ttt_freeze_blocks} "
+          f"momentum={args.ttt_momentum} grad_clip={args.ttt_grad_clip}")
 
     with open(checkpoint_path, "rb") as f:
         blob = f.read()
@@ -69,12 +69,17 @@ def main():
         )
         print(f"sliding_bpb:{s_bpb:.6f} loss:{s_loss:.4f} stride:{args.eval_stride} seq_len:{args.train_seq_len} time:{time.perf_counter()-t_slide:.1f}s")
 
+    # Reload fresh weights for TTT (TTT modifies model in-place)
     ttt_model = GPT(**gpt_kwargs).to(device)
-    ttt_model.load_state_dict(model.state_dict(), strict=True)
+    ttt_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
 
+    stride = args.eval_stride if args.eval_stride > 0 else 64
     t1 = time.perf_counter()
-    ttt_loss, ttt_bpb = eval_val_ttt_lora(args, ttt_model, 0, 1, device,
-                                           base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
+    ttt_loss, ttt_bpb = eval_val_ttt(
+        args, ttt_model, 0, 1, device,
+        val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        stride=stride,
+    )
     print(f"ttt_bpb:{ttt_bpb:.6f} loss:{ttt_loss:.4f} time:{time.perf_counter()-t1:.1f}s")
 
 if __name__ == "__main__":

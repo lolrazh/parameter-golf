@@ -68,5 +68,30 @@ TRAIN_BATCH_TOKENS=786432
 - ✅ **run_ttt.py fixed** - VE params and eval_seq_len bugs resolved
 - 🔧 **Consider adjusting warmdown for proxy** - If doing future proxy A/B tests, scale warmdown proportionally to expected step count (e.g., 1000 for proxy instead of 2000)
 
+### TTT Overhaul: LoRA → Full-Model Score-First (PR #549 Style)
+
+**Discovery:** Competition research revealed that ALL top submissions use full-model SGD TTT (not LoRA), with 3-30 epochs per scored chunk. The merged SOTA (PR #549, 1.1194 BPB) uses score-first full-model SGD with 3 epochs, 32K chunks, cosine LR. Our LoRA TTT (rank-8, 1 epoch, chunk=256) was leaving 0.02-0.06 BPB on the table.
+
+**Legality confirmed:** Multi-epoch TTT on already-scored chunks is unambiguously legal. PR #549 is merged into official records doing exactly this. The rule is: score under inference_mode() first (BPB locked), then train as many epochs as you want. What's illegal is training on future unseen tokens before scoring them.
+
+**Implementation:** Replaced LoRA TTT entirely with full-model score-first TTT ported from PR #549's actual merged code:
+- SGD(lr=0.002, momentum=0.9), grad_clip=1.0
+- 32K token chunks with sliding window scoring (stride=64)
+- 3 epochs per chunk, cosine LR across chunks
+- First 2 blocks frozen (protect early representations)
+- DDP-aware (all_reduce gradients across ranks)
+- Scoring under torch.inference_mode() (hard no-mutation guarantee)
+
+**Verification on 1xH100 (2-min training checkpoint):**
+- Post-quant BPB: 4.6743 (model undertrained, only 2 min)
+- Post-TTT BPB: 3.9817
+- TTT gain: -0.693 BPB (massive because model is weak)
+- TTT time: 33s for 1M tokens (32 chunks × 3 epochs)
+- No crashes, no NaN, cosine LR working, block freezing working
+
+**Code cleanup stats:** frontier_512.py went from 2042 → 1658 lines. Removed LoRA TTT classes (BatchedLinearLoRA, BatchedTTTLoRA), all LaCT code, score-first TTT env vars, DuQuant, SDPA fallback, unbatched Muon, FUSE_QKV toggle. Fixed EVAL_SEQ_LEN default (2048→1024), TTT_EPOCHS (2→1→3), TTT_LORA_LR default.
+
+**3 Opus auditors ran 48 checks — all PASS.** NTK RoPE corruption path verified impossible with defaults.
+
 ## Context for Future
 This session established that the upgraded architecture (wider MLP, larger bigram, value embeddings) provides a small but real improvement that should amplify on the target 8xH100 hardware. The proxy comparison methodology has a known bias against larger models due to fixed warmdown, which should be kept in mind for future A/B experiments. The next step is running the full 8xH100 submission with the upgraded config.

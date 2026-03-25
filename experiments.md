@@ -265,3 +265,4 @@ Key negative results: EMA hurt (r20: quant gap 0.155), high momentum hurt (r15),
 |---|--------|--------|---------------|----------------|-------------|--------------|----------|-------|---------|
 | run11 | run_a_baseline | 11L MLP=1536 Bigram=2048 noVE 26.8M | 1.3704 | 1.3826 | 1.2936 | 1.2913 | 13.15 MB | 3276 | baseline |
 | run12 | run_b_upgraded | 11L MLP=1792 Bigram=10240 VE128(9,10) 30.9M | 1.3632 | 1.3744 | 1.2926 | 1.2903 | 14.13 MB | 3125 | marginal on proxy, go for 8xH100 |
+| run13 | ttt_verify_2min | 11L sp1024 MLP=1792 VE128, 2-min train, full-model TTT 3ep 32K chunk | — | 4.6743 | — | 3.9817 | — | — | TTT verified working (-0.693 BPB gain, 33s for 1M tokens) |
