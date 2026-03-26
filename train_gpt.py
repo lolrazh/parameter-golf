@@ -1079,9 +1079,11 @@ def eval_val_sliding(
 
 # --- N-gram eval cache ---
 
-_NGRAM_PRIMES = torch.tensor([36313, 27191, 51593, 73721, 96017, 11587, 29123], dtype=torch.int64)
+_NGRAM_PRIMES = torch.tensor([36313, 27191, 51593, 73721, 96017, 11587, 29123, 48131, 67411], dtype=torch.int64)
+_NGRAM_MAX_SUPPORTED_ORDER = len(_NGRAM_PRIMES)
 
 def _ngram_init(max_order: int, num_buckets: int) -> list[tuple[Tensor, Tensor]]:
+    assert max_order <= _NGRAM_MAX_SUPPORTED_ORDER, f"max_order={max_order} exceeds {_NGRAM_MAX_SUPPORTED_ORDER} primes"
     """Create empty (ctx_counts, full_counts) int32 tensors on CPU for orders 2..max_order."""
     tables: list[tuple[Tensor, Tensor]] = []
     for _ in range(max_order + 1):  # index 0 and 1 unused, 2..max_order used
@@ -1209,7 +1211,7 @@ def _ngram_blend_nll(tables: list[tuple[Tensor, Tensor]], logits_gpu: Tensor,
         usable_local = usable.nonzero(as_tuple=True)[0]
         global_idx = active_idx[usable_local]
 
-        p_val = fc[usable_local].float() / cc[usable_local].float().clamp(min=1)
+        p_val = (fc[usable_local].float() / cc[usable_local].float().clamp(min=1)).clamp(max=1.0)
         p_ngram[global_idx] = p_val
         resolved[global_idx] = True
 
@@ -1365,6 +1367,10 @@ def eval_val_sliding_ttt(
                         ])  # length = (wlen - s) + 1
                         _ngram_update(ng_tables, scored_stream,
                                       ng_max_order, ng_buckets)
+
+        # NOTE: DDP — each rank maintains its own n-gram cache with 1/N of scored tokens.
+        # Cross-rank sync is complex (double-counting). Accepted limitation on multi-GPU.
+        # Each rank still sees ~7.7M tokens (62M/8), sufficient for n-gram statistics.
 
         # --- Phase 2: TRAIN on this chunk (already scored = legal) ---
         is_last_chunk = (ci == num_chunks - 1)
