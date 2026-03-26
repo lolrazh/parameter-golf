@@ -1376,6 +1376,9 @@ def eval_val_sliding_ttt(
         is_last_chunk = (ci == num_chunks - 1)
         if not is_last_chunk and args.ttt_epochs > 0:
             base_model.train()
+            # Invalidate RoPE cache: cos/sin from inference_mode can't be used in autograd
+            for block in base_model.blocks:
+                block.attn.rotary._seq_len_cached = 0
             chunk_seqs = (chunk_end - chunk_start) // seq_len
             if chunk_seqs > 0:
                 cos_lr = args.ttt_lr * 0.5 * (1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1)))
