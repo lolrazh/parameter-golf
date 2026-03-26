@@ -85,6 +85,7 @@ class Hyperparameters:
     score_temp: float = float(os.environ.get("SCORE_TEMP", 0.5))          # temperature during sampling
     sample_steps: int = int(os.environ.get("SAMPLE_STEPS", 200))          # ODE solver steps
     sample_len: int = int(os.environ.get("SAMPLE_LEN", 256))              # generation length
+    train_block_size: int = int(os.environ.get("TRAIN_BLOCK_SIZE", 0))    # 0=uniform noise, >0=block diffusion
 
     # Optimizer.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -350,12 +351,15 @@ class CastedLinear(nn.Module):
 
 
 def sinusoidal_embedding(t: mx.array, dim: int) -> mx.array:
-    """Timestep → vector via sinusoidal encoding (same idea as RoPE, but for time).
-    t: [B] → out: [B, dim]. Uses CDCD convention: input is ln(sigma)/4."""
+    """Timestep → vector via sinusoidal encoding. Handles any shape.
+    t: [...] → out: [..., dim]. Uses CDCD convention: input is ln(sigma)/4."""
+    orig_shape = t.shape
+    t_flat = t.reshape(-1)  # [N]
     half = dim // 2
     freqs = mx.exp(-math.log(10000.0) * mx.arange(half, dtype=mx.float32) / half)
-    args = t[:, None] * freqs[None, :]
-    return mx.concatenate([mx.cos(args), mx.sin(args)], axis=-1).astype(COMPUTE_DTYPE)
+    args = t_flat[:, None] * freqs[None, :]  # [N, half]
+    emb = mx.concatenate([mx.cos(args), mx.sin(args)], axis=-1)  # [N, dim]
+    return emb.reshape(*orig_shape, dim).astype(COMPUTE_DTYPE)
 
 
 class BidirectionalAttention(nn.Module):
@@ -508,12 +512,17 @@ class DiffusionLM(nn.Module):
         return e / norms * math.sqrt(self.embed_dim)
 
     def encode_timestep(self, t: mx.array) -> mx.array:
-        """Noise level → conditioning vector. [B] → [B, 1, dim]."""
+        """Noise level → conditioning vector. Handles per-position noise.
+        t: [B] → [B, 1, dim]  (global t, broadcast over positions)
+        t: [B, L] → [B, L, dim]  (per-position t, unique conditioning per position)
+        """
         t_input = mx.log(t + 1e-8) / 4.0  # CDCD convention
-        t_emb = sinusoidal_embedding(t_input, self.dim)       # [B, dim]
+        t_emb = sinusoidal_embedding(t_input, self.dim)  # [..., dim]
         t_emb = nn.silu(self.time_fc1(t_emb))
         t_emb = self.time_fc2(t_emb)
-        return t_emb[:, None, :]  # [B, 1, dim] for broadcasting over sequence
+        if t_emb.ndim == 2:
+            return t_emb[:, None, :]  # [B, 1, dim] — global, broadcast
+        return t_emb  # [B, L, dim] — per-position
 
     def softcap(self, logits: mx.array) -> mx.array:
         c = self.logit_softcap
@@ -523,13 +532,17 @@ class DiffusionLM(nn.Module):
         """
         Forward pass: noisy embeddings → token logits.
         z_t:       [B, L, embed_dim] — noisy continuous embeddings
-        t:         [B] — noise levels (sigma values)
-        self_cond: [B, L, embed_dim] or None — previous E[x₀] estimate for self-conditioning
+        t:         [B] or [B, L] — noise levels (global or per-position)
+        self_cond: [B, L, embed_dim] or None — previous E[x₀] estimate
         Returns: [B, L, vocab_size] logits
         """
-        # Scale input to maintain unit variance regardless of noise level.
-        t_broad = t[:, None, None]  # [B, 1, 1]
-        z_scaled = z_t / mx.sqrt(t_broad * t_broad + 1)
+        # Scale input per-position: z / sqrt(t_i² + 1)
+        # For t=[B]: broadcast to [B,1,1]. For t=[B,L]: expand to [B,L,1].
+        if t.ndim == 1:
+            t_scale = t[:, None, None]  # [B, 1, 1] — global
+        else:
+            t_scale = t[:, :, None]     # [B, L, 1] — per-position
+        z_scaled = z_t / mx.sqrt(t_scale * t_scale + 1)
 
         # Concatenate with self-conditioning (zeros if None)
         if self_cond is None:
@@ -558,25 +571,30 @@ class DiffusionLM(nn.Module):
         return self.softcap(logits)
 
     def loss(self, token_ids: mx.array, t: mx.array, eps: mx.array,
-             do_self_cond: bool = False) -> mx.array:
+             do_self_cond: bool = False, block_mask: mx.array | None = None) -> mx.array:
         """
-        Diffusion training loss: add noise to embeddings, predict original tokens.
+        Block diffusion training loss.
 
-        ALL randomness is passed in from outside (not generated here) because
-        mx.compile freezes mx.random calls — they return the SAME values every call.
-        The caller must generate fresh t, eps, and the self-cond coin flip.
+        ALL randomness is passed in from outside (mx.compile freezes mx.random).
 
         token_ids:    [B, L] — clean token sequences
-        t:            [B] — noise levels (pre-sampled outside compiled fn)
-        eps:          [B, L, embed_dim] — Gaussian noise (pre-sampled outside)
+        t:            [B, L] — per-position noise levels (0 for context, >0 for block)
+        eps:          [B, L, embed_dim] — Gaussian noise
         do_self_cond: whether to run draft pass for self-conditioning
-        Returns: scalar cross-entropy loss
+        block_mask:   [B, L] bool — True for positions to score (block), False for context.
+                      If None, score all positions (backward compat with uniform noise).
+        Returns: scalar cross-entropy loss (only on block positions if block_mask given)
         """
         # 1. Embed tokens into continuous space
         e0 = self.get_embeddings(token_ids)  # [B, L, embed_dim]
 
-        # 2. Add Gaussian noise: z_t = embedding + t * epsilon
-        z_t = e0 + t[:, None, None] * eps  # [B, L, embed_dim]
+        # 2. Add per-position noise: z_t = embedding + t_i * epsilon_i
+        # t is [B, L] → expand to [B, L, 1] for broadcasting with [B, L, embed_dim]
+        if t.ndim == 1:
+            t_noise = t[:, None, None]  # [B, 1, 1] — global (backward compat)
+        else:
+            t_noise = t[:, :, None]     # [B, L, 1] — per-position
+        z_t = e0 + t_noise * eps  # context positions: t=0 → no noise added
 
         # 3. Self-conditioning (caller decides whether to do it)
         self_cond = None
@@ -585,15 +603,23 @@ class DiffusionLM(nn.Module):
             draft_probs = mx.softmax(draft_logits.astype(mx.float32), axis=-1)
             self_cond = mx.stop_gradient(draft_probs @ self.get_embedding_matrix())
 
-        # 4. Real forward pass
+        # 4. Real forward pass (per-position t conditioning)
         logits = self(z_t, t, self_cond=self_cond)
 
-        # 5. Cross-entropy loss on ALL positions
-        return nn.losses.cross_entropy(
-            logits.reshape(-1, self.vocab_size).astype(mx.float32),
-            token_ids.reshape(-1),
-            reduction="mean",
-        )
+        # 5. Cross-entropy loss — on block positions only (if mask given)
+        logits_flat = logits.reshape(-1, self.vocab_size).astype(mx.float32)
+        targets_flat = token_ids.reshape(-1)
+
+        if block_mask is not None:
+            mask_flat = block_mask.reshape(-1)
+            # Compute CE per position, then average only over masked (block) positions
+            per_token_ce = nn.losses.cross_entropy(logits_flat, targets_flat, reduction="none")
+            # Sum CE on block positions / count of block positions
+            block_ce_sum = mx.sum(per_token_ce * mask_flat)
+            block_count = mx.sum(mask_flat) + 1e-8
+            return block_ce_sum / block_count
+        else:
+            return nn.losses.cross_entropy(logits_flat, targets_flat, reduction="mean")
 
 # ==============================================================================
 # CoDAR: Contextual Autoregressive Rounding Decoder
@@ -1120,9 +1146,9 @@ def load_validation_tokens(pattern: str, seq_len: int) -> np.ndarray:
     return tokens[:usable]
 
 
-def _sample_noise(B: int, L: int, embed_dim: int, t_min: float, t_max: float,
-                   time_warp: "TimeWarp | None" = None) -> tuple[mx.array, mx.array]:
-    """Sample noise level and Gaussian noise OUTSIDE compiled functions."""
+def _sample_noise_uniform(B: int, L: int, embed_dim: int, t_min: float, t_max: float,
+                          time_warp: "TimeWarp | None" = None) -> tuple[mx.array, mx.array]:
+    """Sample GLOBAL noise level (same t for all positions). Backward compat."""
     if time_warp is not None:
         t = time_warp.sample_t(B)
     else:
@@ -1134,12 +1160,38 @@ def _sample_noise(B: int, L: int, embed_dim: int, t_min: float, t_max: float,
     return t, eps
 
 
+def _sample_noise_block(B: int, L: int, embed_dim: int, t_min: float, t_max: float,
+                        block_size: int = 4) -> tuple[mx.array, mx.array, mx.array]:
+    """Sample per-position noise for block diffusion training.
+    Returns: t [B, L], eps [B, L, embed_dim], block_mask [B, L] (bool).
+    Context positions get t=0 (clean). Block positions get t=sampled."""
+    t = np.zeros((B, L), dtype=np.float32)
+    block_mask = np.zeros((B, L), dtype=np.float32)
+
+    for b in range(B):
+        # Random block start (ensure block fits in sequence)
+        max_start = max(L - block_size, 0)
+        blk_start = np.random.randint(0, max_start + 1)
+        blk_end = min(blk_start + block_size, L)
+
+        # Sample noise level for this block
+        ln_t = np.random.uniform(math.log(t_min), math.log(t_max))
+        t[b, blk_start:blk_end] = math.exp(ln_t)
+        block_mask[b, blk_start:blk_end] = 1.0
+
+    eps = mx.random.normal((B, L, embed_dim))
+    return mx.array(t), eps, mx.array(block_mask)
+
+
 def loss_and_grad_chunked(
     args: Hyperparameters,
     train_loader: TokenLoader,
     compiled_loss_and_grad_sc,
     compiled_loss_and_grad_no_sc,
     model: DiffusionLM,
+    train_block_size: int = 0,
+    compiled_loss_and_grad_sc_blk=None,
+    compiled_loss_and_grad_no_sc_blk=None,
 ) -> tuple[mx.array, dict]:
     chunk_sizes = token_chunks(args.microbatch_tokens, args.train_seq_len, args.mlx_max_microbatch_tokens)
     total_tokens = float(sum(chunk_sizes))
@@ -1148,13 +1200,27 @@ def loss_and_grad_chunked(
     for chunk_tokens in chunk_sizes:
         token_ids = train_loader.next_batch(chunk_tokens, args.train_seq_len)
         B = token_ids.shape[0]
-        t, eps = _sample_noise(B, args.train_seq_len, args.embed_dim,
-                               args.t_min, args.t_max, model.time_warp)
-        # Self-conditioning: 50% of the time
-        if np.random.random() < args.self_cond_prob:
-            loss, grads = compiled_loss_and_grad_sc(token_ids, t, eps)
+
+        if train_block_size > 0:
+            # Block diffusion: per-position noise, loss only on block
+            t, eps, block_mask = _sample_noise_block(
+                B, args.train_seq_len, args.embed_dim,
+                args.t_min, args.t_max, train_block_size)
         else:
-            loss, grads = compiled_loss_and_grad_no_sc(token_ids, t, eps)
+            # Uniform noise: same t for all positions, loss on all
+            t, eps = _sample_noise_uniform(
+                B, args.train_seq_len, args.embed_dim,
+                args.t_min, args.t_max, model.time_warp)
+            block_mask = None
+
+        # Self-conditioning: 50% of the time. Use _blk variants when block_mask present.
+        use_sc = np.random.random() < args.self_cond_prob
+        if block_mask is not None and compiled_loss_and_grad_sc_blk is not None:
+            fn = compiled_loss_and_grad_sc_blk if use_sc else compiled_loss_and_grad_no_sc_blk
+            loss, grads = fn(token_ids, t, eps, block_mask)
+        else:
+            fn = compiled_loss_and_grad_sc if use_sc else compiled_loss_and_grad_no_sc
+            loss, grads = fn(token_ids, t, eps)
         scale = float(token_ids.size) / total_tokens
         loss_value = loss_value + loss.astype(mx.float32) * scale
         grad_accum = accumulate_flat_grads(grad_accum, grads, scale)
@@ -1258,71 +1324,35 @@ def eval_block_nelbo_bpb(
         else:
             ctx_start = 0
 
-        ctx_tokens = val_tokens[ctx_start:block_start]       # clean context
-        blk_tokens = val_tokens[block_start:block_end]        # block to score
-
-        # Build full input: [context, block]
+        ctx_tokens = val_tokens[ctx_start:block_start]
+        blk_tokens = val_tokens[block_start:block_end]
         full_tokens_np = np.concatenate([ctx_tokens, blk_tokens])
         full_len = len(full_tokens_np)
         ctx_len = len(ctx_tokens)
-
         if full_len == 0:
             continue
 
-        # Embed everything
         full_ids = mx.array(full_tokens_np.reshape(1, full_len), dtype=mx.int32)
-        full_emb = model.get_embeddings(full_ids)  # [1, full_len, embed_dim]
-        mx.eval(full_emb)
 
-        # Score block at multiple noise levels
+        # Score block at multiple noise levels using per-position t
         block_ce_sum = 0.0
         for ln_t in ln_ts:
             t_val = math.exp(float(ln_t))
 
-            # Noise only the BLOCK positions, keep context CLEAN
+            # Per-position noise: context=0, block=t_val
+            t_per_pos = np.zeros((1, full_len), dtype=np.float32)
+            t_per_pos[0, ctx_len:] = t_val
+            t_arr = mx.array(t_per_pos)  # [1, full_len]
+
             eps = mx.random.normal((1, full_len, embed_dim))
-            # Context noise = 0 (clean), block noise = t
-            t_per_pos = np.zeros((1, full_len, 1), dtype=np.float32)
-            t_per_pos[0, ctx_len:, 0] = t_val
-            t_mask = mx.array(t_per_pos)
 
-            z_t = full_emb + t_mask * eps  # context positions: emb + 0 = clean
+            # Use model's loss() to get CE on block positions only
+            blk_mask = np.zeros((1, full_len), dtype=np.float32)
+            blk_mask[0, ctx_len:] = 1.0
+            blk_mask_arr = mx.array(blk_mask)
 
-            # Forward pass — model needs a scalar t, use the block's t
-            # (context at t=0 sees clean embeddings through the input scaling)
-            t_batch = mx.array([t_val])
-            # Input scaling: z / sqrt(t²+1). For context (t=0): z/1 = z. For block: z/sqrt(t²+1).
-            t_broad = t_mask  # [1, full_len, 1]
-            z_scaled = z_t / mx.sqrt(t_broad * t_broad + 1)
-
-            # Concatenate with zeros for self-conditioning channel
-            z_cat = mx.concatenate([z_scaled, mx.zeros_like(z_scaled)], axis=-1)
-            x = model.input_proj(z_cat.astype(COMPUTE_DTYPE))
-
-            # Timestep encoding — use the block's noise level
-            t_emb = model.encode_timestep(t_batch)  # [1, 1, dim]
-
-            # Run transformer
-            skips: list[mx.array] = []
-            for i in range(model.num_encoder_layers):
-                x = model.blocks[i](x, t_emb)
-                skips.append(x)
-            for i in range(model.num_decoder_layers):
-                if skips:
-                    x = x + model.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
-                x = model.blocks[model.num_encoder_layers + i](x, t_emb)
-
-            # Output logits
-            x = model.output_norm_fn(x)
-            logits = model.output_head(x.astype(COMPUTE_DTYPE))
-            logits = model.softcap(logits)
-
-            # CE only on the BLOCK positions (not context)
-            block_logits = logits[0, ctx_len:, :]  # [block_size, vocab]
-            block_targets = mx.array(blk_tokens, dtype=mx.int32)
-            ce = nn.losses.cross_entropy(
-                block_logits.astype(mx.float32), block_targets, reduction="mean"
-            )
+            # Direct call — model now handles per-position t natively
+            ce = model.loss(full_ids, t_arr, eps, do_self_cond=False, block_mask=blk_mask_arr)
             mx.eval(ce)
             block_ce_sum += float(ce.item())
 
@@ -1454,6 +1484,7 @@ def main() -> None:
     # All randomness (t, eps, self-cond coin flip) MUST be generated outside
     # and passed as arguments. We compile TWO versions of loss: with and without
     # self-conditioning (since the if-branch is frozen at trace time).
+    # Without block_mask (uniform noise — backward compat)
     compiled_loss_no_sc = mx.compile(
         lambda ids, t, eps: model.loss(ids, t, eps, do_self_cond=False),
         inputs=model.state, outputs=model.state,
@@ -1468,6 +1499,15 @@ def main() -> None:
     )
     compiled_loss_and_grad_sc = mx.compile(
         nn.value_and_grad(model, lambda ids, t, eps: model.loss(ids, t, eps, do_self_cond=True)),
+        inputs=model.state, outputs=model.state,
+    )
+    # With block_mask (block diffusion training)
+    compiled_loss_and_grad_no_sc_blk = mx.compile(
+        nn.value_and_grad(model, lambda ids, t, eps, m: model.loss(ids, t, eps, do_self_cond=False, block_mask=m)),
+        inputs=model.state, outputs=model.state,
+    )
+    compiled_loss_and_grad_sc_blk = mx.compile(
+        nn.value_and_grad(model, lambda ids, t, eps, m: model.loss(ids, t, eps, do_self_cond=True, block_mask=m)),
         inputs=model.state, outputs=model.state,
     )
 
@@ -1501,7 +1541,8 @@ def main() -> None:
             for _ in range(args.grad_accum_steps):
                 warmup_loss, grads = loss_and_grad_chunked(
                     args, train_loader, compiled_loss_and_grad_sc,
-                    compiled_loss_and_grad_no_sc, model)
+                    compiled_loss_and_grad_no_sc, model, args.train_block_size,
+                    compiled_loss_and_grad_sc_blk, compiled_loss_and_grad_no_sc_blk)
                 accum = accumulate_flat_grads(accum, grads, grad_scale)
             mx.eval(warmup_loss, accum)
             mx.synchronize()
@@ -1554,7 +1595,7 @@ def main() -> None:
         for _ in range(args.grad_accum_steps):
             loss, grads = loss_and_grad_chunked(
                 args, train_loader, compiled_loss_and_grad_sc,
-                compiled_loss_and_grad_no_sc, model)
+                compiled_loss_and_grad_no_sc, model, args.train_block_size)
             accum = accumulate_flat_grads(accum, grads, grad_scale)
             train_loss = train_loss + loss.astype(mx.float32) * grad_scale
 
