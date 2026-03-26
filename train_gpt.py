@@ -99,6 +99,11 @@ class Hyperparameters:
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
+    ngram_enabled = bool(int(os.environ.get("NGRAM_ENABLED", "1")))
+    ngram_alpha = float(os.environ.get("NGRAM_ALPHA", 0.20))
+    ngram_max_order = int(os.environ.get("NGRAM_MAX_ORDER", 7))
+    ngram_min_count = int(os.environ.get("NGRAM_MIN_COUNT", 2))
+    ngram_buckets = int(os.environ.get("NGRAM_BUCKETS", 4194304))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -1072,6 +1077,155 @@ def eval_val_sliding(
     return val_loss, bits_per_token * tokens_per_byte
 
 
+# --- N-gram eval cache ---
+
+_NGRAM_PRIMES = torch.tensor([36313, 27191, 51593, 73721, 96017, 11587, 29123], dtype=torch.int64)
+
+def _ngram_init(max_order: int, num_buckets: int) -> list[tuple[Tensor, Tensor]]:
+    """Create empty (ctx_counts, full_counts) int32 tensors on CPU for orders 2..max_order."""
+    tables: list[tuple[Tensor, Tensor]] = []
+    for _ in range(max_order + 1):  # index 0 and 1 unused, 2..max_order used
+        tables.append((
+            torch.zeros(num_buckets, dtype=torch.int32),
+            torch.zeros(num_buckets, dtype=torch.int32),
+        ))
+    return tables
+
+def _ngram_hashes_vec(tokens: Tensor, order: int, num_buckets: int) -> Tensor:
+    """Vectorized hash for all contiguous windows of length `order` in a 1D token sequence.
+    tokens: 1D int64 CPU tensor of length L.
+    Returns: 1D int64 tensor of length (L - order + 1).
+    hash[i] = XOR(PRIME_k * tokens[i+k] for k in 0..order-1) % num_buckets
+    """
+    L = tokens.shape[0]
+    n = L - order + 1
+    if n <= 0:
+        return torch.zeros(0, dtype=torch.int64)
+    h = torch.zeros(n, dtype=torch.int64)
+    for k in range(order):
+        h = h ^ (_NGRAM_PRIMES[k] * tokens[k:k + n].to(torch.int64))
+    return h % num_buckets
+
+def _ngram_update(tables: list[tuple[Tensor, Tensor]], tokens_cpu: Tensor,
+                  max_order: int, num_buckets: int) -> None:
+    """Update n-gram counts from observed tokens (1D CPU int64, length L).
+    The token stream represents consecutive (input, target) pairs:
+    tokens_cpu = [t0, t1, t2, ...]. For a bigram (order=2), context=t0, full=(t0,t1), etc.
+    For order o, we record all contiguous o-grams and their (o-1)-gram contexts.
+    """
+    L = tokens_cpu.shape[0]
+    for order in range(2, max_order + 1):
+        if L < order:
+            continue
+        ctx_counts, full_counts = tables[order]
+        full_h = _ngram_hashes_vec(tokens_cpu, order, num_buckets)       # (L-order+1,)
+        ctx_h = _ngram_hashes_vec(tokens_cpu, order - 1, num_buckets)    # (L-order+2,)
+        n = full_h.shape[0]
+        ctx_h = ctx_h[:n]  # align: ctx_h[i] is context for full_h[i]
+        ones = torch.ones(n, dtype=torch.int32)
+        ctx_counts.scatter_add_(0, ctx_h.long(), ones)
+        full_counts.scatter_add_(0, full_h.long(), ones)
+
+def _ngram_blend_nll(tables: list[tuple[Tensor, Tensor]], logits_gpu: Tensor,
+                     x_cpu: Tensor, y_cpu: Tensor, score_start: int, score_end: int,
+                     alpha: float, max_order: int, min_count: int,
+                     num_buckets: int, device: torch.device) -> Tensor:
+    """Blend neural log-probs with n-gram predictions for scored positions.
+    logits_gpu: (seq_len, V) on GPU.   x_cpu, y_cpu: (seq_len,) int64 CPU.
+    score_start/end: slice into seq dim to score.
+    Returns: (score_end-score_start,) float64 NLL on GPU.
+
+    Vectorized backoff: process orders 7→2. For each order, compute ctx/full hashes
+    for ALL scored positions at once, look up counts, and fill in positions not yet resolved.
+    """
+    n_scored = score_end - score_start
+    if n_scored <= 0:
+        return torch.zeros(0, device=device, dtype=torch.float64)
+
+    # --- Neural p(target) on GPU ---
+    scored_logits = logits_gpu[score_start:score_end].float()         # (n_scored, V)
+    scored_targets_gpu = y_cpu[score_start:score_end].to(device)      # (n_scored,)
+    p_neural = F.softmax(scored_logits, dim=-1)                       # (n_scored, V)
+    p_neural_tgt = p_neural.gather(1, scored_targets_gpu.unsqueeze(1)).squeeze(1)  # (n_scored,)
+
+    # --- N-gram backoff on CPU (vectorized per order) ---
+    p_ngram = torch.zeros(n_scored, dtype=torch.float32)     # CPU
+    resolved = torch.zeros(n_scored, dtype=torch.bool)       # CPU
+
+    for order in range(max_order, 1, -1):
+        unresolved = ~resolved
+        if not unresolved.any():
+            break
+        ctx_len = order - 1
+        # For scored position j (in seq coords), we need:
+        #   context tokens = x_cpu[j-ctx_len+1 : j+1]  (length ctx_len)
+        #   full tokens    = x_cpu[j-ctx_len+1 : j+1] ++ [y_cpu[j]]  (length order)
+        # Positions where j - ctx_len + 1 < 0 can't use this order → skip.
+        # Build context and full hashes for all n_scored positions at once.
+
+        # Absolute sequence positions of scored slots
+        pos = torch.arange(score_start, score_end, dtype=torch.int64)  # (n_scored,)
+        valid = (pos - ctx_len + 1) >= 0  # can form context of this length
+        active = unresolved & valid
+
+        if not active.any():
+            continue
+
+        active_idx = active.nonzero(as_tuple=True)[0]  # indices into scored array
+        active_pos = pos[active_idx]                     # seq positions
+
+        # Gather context windows: for each active position j, tokens x[j-ctx_len+1 .. j]
+        # Shape: (n_active, ctx_len)
+        offsets = torch.arange(ctx_len, dtype=torch.int64).unsqueeze(0)  # (1, ctx_len)
+        ctx_starts = (active_pos - ctx_len + 1).unsqueeze(1)             # (n_active, 1)
+        ctx_indices = ctx_starts + offsets                                # (n_active, ctx_len)
+        ctx_windows = x_cpu[ctx_indices]                                  # (n_active, ctx_len)
+
+        # Full window = context ++ target
+        targets = y_cpu[active_pos].unsqueeze(1)                          # (n_active, 1)
+        full_windows = torch.cat([ctx_windows, targets], dim=1)           # (n_active, order)
+
+        # Compute hashes (vectorized across active positions)
+        ctx_h = torch.zeros(active_idx.shape[0], dtype=torch.int64)
+        for k in range(ctx_len):
+            ctx_h = ctx_h ^ (_NGRAM_PRIMES[k] * ctx_windows[:, k].to(torch.int64))
+        ctx_h = ctx_h % num_buckets
+
+        full_h = torch.zeros(active_idx.shape[0], dtype=torch.int64)
+        for k in range(order):
+            full_h = full_h ^ (_NGRAM_PRIMES[k] * full_windows[:, k].to(torch.int64))
+        full_h = full_h % num_buckets
+
+        # Look up counts
+        ctx_counts, full_counts = tables[order]
+        cc = ctx_counts[ctx_h.long()]    # (n_active,) int32
+        fc = full_counts[full_h.long()]  # (n_active,) int32
+
+        # Only use positions where context count >= min_count
+        usable = cc >= min_count
+        if not usable.any():
+            continue
+
+        usable_local = usable.nonzero(as_tuple=True)[0]
+        global_idx = active_idx[usable_local]
+
+        p_val = fc[usable_local].float() / cc[usable_local].float().clamp(min=1)
+        p_ngram[global_idx] = p_val
+        resolved[global_idx] = True
+
+    # --- Blend on GPU ---
+    p_ngram_gpu = p_ngram.to(device)
+    resolved_gpu = resolved.to(device)
+
+    p_final = torch.where(
+        resolved_gpu,
+        (1.0 - alpha) * p_neural_tgt + alpha * p_ngram_gpu,
+        p_neural_tgt,
+    )
+    nll = -torch.log(p_final.clamp(min=1e-10)).to(torch.float64)
+    return nll
+
+
 def eval_val_sliding_ttt(
     args: Hyperparameters, base_model: nn.Module, rank: int, world_size: int,
     device: torch.device, val_tokens: Tensor, base_bytes_lut: Tensor,
@@ -1103,6 +1257,17 @@ def eval_val_sliding_ttt(
          f"total_windows={len(window_starts)} stride={stride} "
          f"ttt_lr={args.ttt_lr} ttt_epochs={args.ttt_epochs} "
          f"freeze_blocks={args.ttt_freeze_blocks}")
+
+    # --- N-gram cache initialization ---
+    ngram_on = args.ngram_enabled
+    if ngram_on:
+        ng_tables = _ngram_init(args.ngram_max_order, args.ngram_buckets)
+        ng_alpha = args.ngram_alpha
+        ng_max_order = args.ngram_max_order
+        ng_min_count = args.ngram_min_count
+        ng_buckets = args.ngram_buckets
+        log0(f"ttt_sliding:ngram enabled alpha={ng_alpha} max_order={ng_max_order} "
+             f"min_count={ng_min_count} buckets={ng_buckets}")
 
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
@@ -1158,20 +1323,48 @@ def eval_val_sliding_ttt(
                     y_batch[i, :wlen] = chunk_tok[1:]
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     logits = base_model.forward_logits(x_batch)
-                nll = F.cross_entropy(
-                    logits.reshape(-1, logits.size(-1)).float(),
-                    y_batch.reshape(-1), reduction="none",
-                ).reshape(bsz, seq_len)
+                if not ngram_on:
+                    nll = F.cross_entropy(
+                        logits.reshape(-1, logits.size(-1)).float(),
+                        y_batch.reshape(-1), reduction="none",
+                    ).reshape(bsz, seq_len)
+                # Keep CPU copies for n-gram if enabled
+                if ngram_on:
+                    x_batch_cpu = x_batch.cpu()
+                    y_batch_cpu = y_batch.cpu()
                 for i, ws in enumerate(batch_ws):
                     wlen = wlens[i]
                     s = 0 if ws == 0 else max(wlen - stride, 0)
-                    scored_nll = nll[i, s:wlen].to(torch.float64)
+                    if ngram_on:
+                        scored_nll = _ngram_blend_nll(
+                            ng_tables, logits[i, :wlen], x_batch_cpu[i, :wlen],
+                            y_batch_cpu[i, :wlen], s, wlen, ng_alpha,
+                            ng_max_order, ng_min_count, ng_buckets, device,
+                        )
+                    else:
+                        scored_nll = nll[i, s:wlen].to(torch.float64)
                     loss_sum += scored_nll.sum()
                     token_count += float(wlen - s)
                     tgt, prev = y_batch[i, s:wlen], x_batch[i, s:wlen]
                     tb = base_bytes_lut[tgt].to(torch.float64)
                     tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
                     byte_count += tb.sum()
+                # --- N-gram cache update: feed scored tokens ---
+                if ngram_on:
+                    for i, ws in enumerate(batch_ws):
+                        wlen = wlens[i]
+                        s = 0 if ws == 0 else max(wlen - stride, 0)
+                        # Token stream for this scored region: x tokens in [s, wlen)
+                        # plus the final target y[wlen-1] to close the last n-gram.
+                        # We use the full window x[0:wlen] ++ [y[wlen-1]] so n-grams
+                        # crossing the score boundary still get context from earlier.
+                        # But to only COUNT scored positions, we use x[s:wlen] ++ [y[wlen-1]].
+                        scored_stream = torch.cat([
+                            x_batch_cpu[i, s:wlen],
+                            y_batch_cpu[i, wlen - 1:wlen],
+                        ])  # length = (wlen - s) + 1
+                        _ngram_update(ng_tables, scored_stream,
+                                      ng_max_order, ng_buckets)
 
         # --- Phase 2: TRAIN on this chunk (already scored = legal) ---
         is_last_chunk = (ci == num_chunks - 1)

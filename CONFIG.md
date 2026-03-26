@@ -86,6 +86,16 @@ Single source of truth. Every parameter, every change, every reason.
 | ttt_momentum | 0.9 | SOTA PR #549 |
 | ttt_grad_clip | 1.0 | SOTA PR #549 |
 
+## N-gram Eval Cache
+
+| Parameter | Value | Source |
+|-----------|-------|--------|
+| ngram_enabled | True | Backward-looking n-gram blending during TTT scoring |
+| ngram_alpha | 0.20 | Fixed blend weight: p_final = 0.8*neural + 0.2*ngram |
+| ngram_max_order | 7 | Try 7-gram down to bigram with backoff |
+| ngram_min_count | 2 | Require >= 2 context hits before trusting n-gram |
+| ngram_buckets | 4194304 | 4M hash buckets per order (int32, ~192MB total CPU) |
+
 ## Changelog
 
 | Date | Change | Why |
@@ -96,3 +106,4 @@ Single source of truth. Every parameter, every change, every reason.
 | 2026-03-26 | Added GPTQ-lite per-row clip search | Per-row optimal percentile beats global search. 5 candidates per row. |
 | 2026-03-26 | Switched compression to zstd-22 | Beats LZMA on 5/6 quant presets. Proven in quant sweep. |
 | 2026-03-26 | LeakyReLU slope 0.5 → 0.9 | Controlled sweep in issue #140 shows monotonic improvement. 0.9 beats 0.5 by 0.013 BPB. One-line change. |
+| 2026-03-26 | Added backward-looking n-gram eval cache | Blends n-gram predictions with neural during TTT scoring. Cache builds from scored tokens only (no oracle). Fixed alpha=0.20, backoff orders 7→2. |
