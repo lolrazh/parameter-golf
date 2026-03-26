@@ -23,15 +23,16 @@ export NUM_HEADS=8 NUM_KV_HEADS=4
 export XSA_LAST_N=4 ROPE_DIMS=16 ROPE_BASE=10000
 export QAT_START_FRAC=0.15 ENTROPY_REG=0.01
 export QUANT_PRESET=front3_back1_6_middle5
-export EVAL_STRIDE=64 WARMDOWN_ITERS=3500
+export EVAL_STRIDE=64
 export SEED="$SEED"
 
 if [[ "$MODE" == "--proxy" ]]; then
     echo "=== PROXY MODE (1xH100, fast iteration) ==="
     export TRAIN_BATCH_TOKENS=131072
     export TRAIN_SEQ_LEN=1024
+    export WARMDOWN_ITERS=1500
     export VAL_TOKENS_LIMIT=1048576
-    export MAX_WALLCLOCK_SECONDS=120
+    export MAX_WALLCLOCK_SECONDS=600
     export DATA_PATH=./data/datasets/fineweb10B_sp1024
     export TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model
     python3 train_gpt.py 2>&1 | tee "proxy_seed${SEED}.log"
@@ -41,6 +42,7 @@ elif [[ "$MODE" == "--prod" ]]; then
     export TRAIN_BATCH_TOKENS=786432
     export TRAIN_SEQ_LEN=2048
     export EVAL_SEQ_LEN=2048
+    export WARMDOWN_ITERS=3500
     export MAX_WALLCLOCK_SECONDS=600
     export DATA_PATH=./data/datasets/fineweb10B_sp1024
     export TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model
