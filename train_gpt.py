@@ -1914,8 +1914,8 @@ def main() -> None:
                     if p.ndim == 2 and p.numel() > 65536:
                         w32 = p.float()
                         row_max = w32.abs().amax(dim=1)
-                        scale = (row_max / 31.0).clamp_min(1.0 / 31.0)
-                        residual = w32 / scale[:, None] - torch.round(w32 / scale[:, None])
+                        qscale = (row_max / 31.0).clamp_min(1.0 / 31.0)
+                        residual = w32 / qscale[:, None] - torch.round(w32 / qscale[:, None])
                         ent_penalty = ent_penalty + residual.pow(2).mean()
                 loss = loss + args.entropy_reg * ent_penalty
             train_loss += loss.detach()
