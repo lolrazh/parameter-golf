@@ -171,6 +171,65 @@ def accumulate_flat_grads(
 
 
 # ==============================================================================
+# TIME WARPING: Adaptive noise level sampling
+# ==============================================================================
+# Instead of sampling t uniformly in log-space, concentrate training on noise
+# levels where the model struggles most. Periodically measure L(t) across noise
+# levels, fit a CDF, then sample via inverse CDF transform.
+
+class TimeWarp:
+    """Adaptive noise level sampler (CDCD, Dieleman et al. 2022)."""
+
+    def __init__(self, t_min: float, t_max: float, num_bins: int = 50, update_every: int = 100):
+        self.t_min = t_min
+        self.t_max = t_max
+        self.num_bins = num_bins
+        self.update_every = update_every
+        # Start with uniform log-spaced bins
+        self.bin_edges = np.linspace(math.log(t_min), math.log(t_max), num_bins + 1, dtype=np.float32)
+        self.bin_weights = np.ones(num_bins, dtype=np.float32) / num_bins  # uniform initially
+        self._step_count = 0
+
+    def sample_t(self, batch_size: int) -> mx.array:
+        """Sample noise levels using current warped distribution."""
+        # Pick a bin according to weights, then sample uniformly within that bin
+        bins = np.random.choice(self.num_bins, size=batch_size, p=self.bin_weights)
+        lo = self.bin_edges[bins]
+        hi = self.bin_edges[bins + 1]
+        ln_t = lo + np.random.uniform(size=batch_size).astype(np.float32) * (hi - lo)
+        return mx.exp(mx.array(ln_t))
+
+    def maybe_update(self, model: "DiffusionLM", sample_tokens: mx.array) -> bool:
+        """Measure L(t) and update warping weights. Returns True if updated."""
+        self._step_count += 1
+        if self._step_count % self.update_every != 0:
+            return False
+
+        # Measure loss at each bin center
+        bin_centers = 0.5 * (self.bin_edges[:-1] + self.bin_edges[1:])
+        losses = np.zeros(self.num_bins, dtype=np.float32)
+        e0 = model.get_embeddings(sample_tokens)
+
+        for i, ln_t in enumerate(bin_centers):
+            t = mx.array([math.exp(float(ln_t))])
+            eps = mx.random.normal(e0.shape)
+            z_t = e0 + t[:, None, None] * eps
+            logits = model(z_t, t)
+            ce = nn.losses.cross_entropy(
+                logits.reshape(-1, model.vocab_size).astype(mx.float32),
+                sample_tokens.reshape(-1),
+                reduction="mean",
+            )
+            mx.eval(ce)
+            losses[i] = float(ce.item())
+
+        # Weight bins by loss (harder noise levels get more training)
+        losses = np.maximum(losses, 1e-8)
+        self.bin_weights = losses / losses.sum()
+        return True
+
+
+# ==============================================================================
 # MATH HELPERS
 # ==============================================================================
 
@@ -387,7 +446,7 @@ class DiffusionLM(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, dim: int, embed_dim: int,
                  num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_softcap: float, rope_base: float, qk_gain_init: float,
-                 t_min: float, t_max: float):
+                 t_min: float, t_max: float, self_cond_prob: float = 0.5):
         super().__init__()
         self.vocab_size = vocab_size
         self.dim = dim
@@ -395,6 +454,8 @@ class DiffusionLM(nn.Module):
         self.logit_softcap = logit_softcap
         self.t_min = t_min
         self.t_max = t_max
+        self._self_cond_prob = self_cond_prob
+        self.time_warp: TimeWarp | None = None  # set externally to enable adaptive sampling
 
         # --- Diffusion embedding: tokens → continuous L2-normalized vectors ---
         # This is the "GPS coordinate" for each word in continuous space.
@@ -404,9 +465,10 @@ class DiffusionLM(nn.Module):
             self.diff_emb.weight.shape, dtype=mx.float32
         ) * 0.01
 
-        # --- Input projection: embed_dim → model_dim ---
-        # Maps from the small 64-dim embedding space to the 512-dim model space.
-        self.input_proj = CastedLinear(embed_dim, dim)
+        # --- Input projection: 2*embed_dim → model_dim ---
+        # Always takes (noisy_embed, self_cond_or_zeros) concatenated.
+        # Self-conditioning: previous E[x₀] estimate, or zeros if not available.
+        self.input_proj = CastedLinear(2 * embed_dim, dim)
 
         # --- Timestep encoding: scalar t → [dim] vector ---
         # ln(t)/4 → sinusoidal → MLP. Tells each block "how noisy is the input?"
@@ -457,20 +519,25 @@ class DiffusionLM(nn.Module):
         c = self.logit_softcap
         return c * mx.tanh(logits / c)
 
-    def __call__(self, z_t: mx.array, t: mx.array) -> mx.array:
+    def __call__(self, z_t: mx.array, t: mx.array, self_cond: mx.array | None = None) -> mx.array:
         """
         Forward pass: noisy embeddings → token logits.
-        z_t: [B, L, embed_dim] — noisy continuous embeddings
-        t:   [B] — noise levels (sigma values)
+        z_t:       [B, L, embed_dim] — noisy continuous embeddings
+        t:         [B] — noise levels (sigma values)
+        self_cond: [B, L, embed_dim] or None — previous E[x₀] estimate for self-conditioning
         Returns: [B, L, vocab_size] logits
         """
         # Scale input to maintain unit variance regardless of noise level.
-        # At t=1: divide by sqrt(2). At t=300: divide by ~300. Keeps magnitudes stable.
         t_broad = t[:, None, None]  # [B, 1, 1]
         z_scaled = z_t / mx.sqrt(t_broad * t_broad + 1)
 
-        # Project from embed_dim (64) to model_dim (512)
-        x = self.input_proj(z_scaled.astype(COMPUTE_DTYPE))
+        # Concatenate with self-conditioning (zeros if None)
+        if self_cond is None:
+            self_cond = mx.zeros_like(z_scaled)
+        z_cat = mx.concatenate([z_scaled, self_cond], axis=-1)  # [B, L, 2*embed_dim]
+
+        # Project from 2*embed_dim (128) to model_dim (512)
+        x = self.input_proj(z_cat.astype(COMPUTE_DTYPE))
 
         # Timestep conditioning
         t_emb = self.encode_timestep(t)  # [B, 1, dim]
@@ -493,6 +560,7 @@ class DiffusionLM(nn.Module):
     def loss(self, token_ids: mx.array) -> mx.array:
         """
         Diffusion training loss: add noise to embeddings, predict original tokens.
+        Includes self-conditioning and optional time warping.
         token_ids: [B, L] — clean token sequences
         Returns: scalar cross-entropy loss
         """
@@ -501,24 +569,32 @@ class DiffusionLM(nn.Module):
         # 1. Embed tokens into continuous space
         e0 = self.get_embeddings(token_ids)  # [B, L, embed_dim]
 
-        # 2. Sample noise level (log-uniform between t_min and t_max)
-        #    Log-uniform concentrates more samples at lower noise levels,
-        #    where the model needs to be most precise.
-        ln_t = (
-            mx.random.uniform(shape=(B,))
-            * (math.log(self.t_max) - math.log(self.t_min))
-            + math.log(self.t_min)
-        )
-        t = mx.exp(ln_t)  # [B]
+        # 2. Sample noise level (time warping if enabled, else log-uniform)
+        if self.time_warp is not None:
+            t = self.time_warp.sample_t(B)
+        else:
+            ln_t = (
+                mx.random.uniform(shape=(B,))
+                * (math.log(self.t_max) - math.log(self.t_min))
+                + math.log(self.t_min)
+            )
+            t = mx.exp(ln_t)
 
         # 3. Add Gaussian noise: z_t = embedding + t * epsilon
         eps = mx.random.normal(e0.shape)
         z_t = e0 + t[:, None, None] * eps  # [B, L, embed_dim]
 
-        # 4. Predict original tokens from noisy embeddings
-        logits = self(z_t, t)  # [B, L, vocab_size]
+        # 4. Self-conditioning: 50% of the time, run a draft pass first
+        self_cond = None
+        if float(mx.random.uniform(shape=())) < self._self_cond_prob:
+            draft_logits = mx.stop_gradient(self(z_t, t, None))
+            draft_probs = mx.softmax(draft_logits.astype(mx.float32), axis=-1)
+            self_cond = mx.stop_gradient(draft_probs @ self.get_embedding_matrix())
 
-        # 5. Cross-entropy loss on ALL positions
+        # 5. Real forward pass (with or without self-conditioning hint)
+        logits = self(z_t, t, self_cond=self_cond)
+
+        # 6. Cross-entropy loss on ALL positions
         return nn.losses.cross_entropy(
             logits.reshape(-1, self.vocab_size).astype(mx.float32),
             token_ids.reshape(-1),
@@ -526,8 +602,145 @@ class DiffusionLM(nn.Module):
         )
 
 # ==============================================================================
+# CoDAR: Contextual Autoregressive Rounding Decoder
+# ==============================================================================
+# Instead of pointwise argmax (which ignores token-token dependencies),
+# a small AR decoder cross-attends to the diffusion output and decodes
+# tokens left-to-right. "cat sat" instead of "car mat."
+
+class CrossAttention(nn.Module):
+    """Decoder attends to diffusion encoder output (cross-attention)."""
+    def __init__(self, dim: int, num_heads: int):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.c_q = CastedLinear(dim, dim)
+        self.c_k = CastedLinear(dim, dim)
+        self.c_v = CastedLinear(dim, dim)
+        self.proj = CastedLinear(dim, dim)
+        self.scale = self.head_dim ** -0.5
+
+    def __call__(self, x: mx.array, context: mx.array) -> mx.array:
+        """x: decoder hidden [B,L,D]. context: diffusion output [B,L,D]."""
+        bsz, seqlen, dim = x.shape
+        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        k = self.c_k(context).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        v = self.c_v(context).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale)  # no mask: full cross-attn
+        y = y.transpose(0, 2, 1, 3).reshape(bsz, seqlen, dim)
+        return self.proj(y)
+
+
+class RoundingDecoderBlock(nn.Module):
+    """One block of the AR rounding decoder: causal self-attn + cross-attn to diffusion + MLP."""
+    def __init__(self, dim: int, num_heads: int, mlp_mult: int):
+        super().__init__()
+        # Causal self-attention (AR decoding)
+        self.self_attn = BidirectionalAttention(dim, num_heads, num_heads, rope_base=10000.0, qk_gain_init=1.0)
+        # Cross-attention to diffusion output
+        self.cross_attn = CrossAttention(dim, num_heads)
+        self.mlp = MLP(dim, mlp_mult)
+
+    def __call__(self, x: mx.array, context: mx.array) -> mx.array:
+        # Causal self-attention (with causal mask for AR)
+        bsz, seqlen, dim = x.shape
+        q = self.self_attn.c_q(rms_norm(x)).reshape(bsz, seqlen, self.self_attn.num_heads, self.self_attn.head_dim).transpose(0, 2, 1, 3)
+        k = self.self_attn.c_k(rms_norm(x)).reshape(bsz, seqlen, self.self_attn.num_kv_heads, self.self_attn.head_dim).transpose(0, 2, 1, 3)
+        v = self.self_attn.c_v(rms_norm(x)).reshape(bsz, seqlen, self.self_attn.num_kv_heads, self.self_attn.head_dim).transpose(0, 2, 1, 3)
+        q = self.self_attn.rope(q.astype(COMPUTE_DTYPE))
+        k = self.self_attn.rope(k.astype(COMPUTE_DTYPE))
+        sa_out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.self_attn.scale, mask="causal")
+        sa_out = sa_out.transpose(0, 2, 1, 3).reshape(bsz, seqlen, dim)
+        x = x + self.self_attn.proj(sa_out)
+        # Cross-attention to diffusion context
+        x = x + self.cross_attn(rms_norm(x), context)
+        # MLP
+        x = x + self.mlp(rms_norm(x))
+        return x
+
+
+class RoundingDecoder(nn.Module):
+    """
+    Small AR transformer that takes diffusion output and decodes tokens left-to-right.
+    Cross-attends to the continuous diffusion states, capturing token-token dependencies
+    that pointwise argmax misses.
+    """
+    def __init__(self, vocab_size: int, dim: int, num_layers: int = 2,
+                 num_heads: int = 8, mlp_mult: int = 2):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.tok_emb = nn.Embedding(vocab_size, dim)
+        self.blocks = [RoundingDecoderBlock(dim, num_heads, mlp_mult) for _ in range(num_layers)]
+        self.output_head = CastedLinear(dim, vocab_size)
+        # Zero-init output projections
+        for b in self.blocks:
+            b.self_attn.proj.weight = mx.zeros_like(b.self_attn.proj.weight)
+            b.cross_attn.proj.weight = mx.zeros_like(b.cross_attn.proj.weight)
+            b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
+
+    def __call__(self, target_ids: mx.array, context: mx.array) -> mx.array:
+        """
+        target_ids: [B, L] — shifted token IDs (teacher forcing)
+        context:    [B, L, dim] — diffusion model's final hidden states
+        Returns:    [B, L, vocab_size] logits
+        """
+        x = self.tok_emb(target_ids).astype(COMPUTE_DTYPE)
+        for block in self.blocks:
+            x = block(x, context)
+        return self.output_head(rms_norm(x))
+
+    def loss(self, token_ids: mx.array, context: mx.array) -> mx.array:
+        """Teacher-forced CE loss. Context is the diffusion output."""
+        # Input: [BOS, tok1, tok2, ...], Target: [tok1, tok2, tok3, ...]
+        # For simplicity, use the same tokens shifted: input = tokens[:-1], target = tokens[1:]
+        # But since context has L positions matching L tokens, we predict all positions
+        # given the context, using teacher forcing with left-shifted tokens.
+        B, L = token_ids.shape
+        # Prepend a zero token as BOS
+        bos = mx.zeros((B, 1), dtype=mx.int32)
+        input_ids = mx.concatenate([bos, token_ids[:, :-1]], axis=1)  # [B, L]
+        logits = self(input_ids, context)
+        return nn.losses.cross_entropy(
+            logits.reshape(-1, self.vocab_size).astype(mx.float32),
+            token_ids.reshape(-1),
+            reduction="mean",
+        )
+
+    def decode(self, context: mx.array) -> mx.array:
+        """Autoregressive decoding given diffusion context. Returns [B, L] token IDs."""
+        B, L, _ = context.shape
+        tokens = mx.zeros((B, L), dtype=mx.int32)
+        for pos in range(L):
+            logits = self(tokens, context)  # [B, L, V]
+            next_token = mx.argmax(logits[:, pos, :], axis=-1)  # [B]
+            if pos < L - 1:
+                tokens = tokens.at[:, pos + 1].add(next_token)  # type: ignore
+            # Store the decoded token
+            tokens_list = tokens.tolist()
+            for b in range(B):
+                tokens_list[b][pos] = int(next_token[b].item())
+            tokens = mx.array(tokens_list, dtype=mx.int32)
+            mx.eval(tokens)
+        return tokens
+
+
+# ==============================================================================
 # SAMPLING: Generate text from noise via probability flow ODE
 # ==============================================================================
+
+def _score_interpolation(
+    model: DiffusionLM, z: mx.array, t_batch: mx.array,
+    emb_matrix: mx.array, temperature: float,
+    self_cond: mx.array | None = None,
+) -> tuple[mx.array, mx.array]:
+    """One forward pass → score via interpolation. Returns (score, E[x₀])."""
+    logits = model(z, t_batch, self_cond=self_cond)
+    probs = mx.softmax((logits / temperature).astype(mx.float32), axis=-1)
+    e_x0 = probs @ emb_matrix  # expected clean embedding
+    t_sq = t_batch[:, None, None] ** 2
+    score = (e_x0 - z) / t_sq
+    return score, e_x0
+
 
 def sample_text(
     model: DiffusionLM,
@@ -536,14 +749,16 @@ def sample_text(
     seq_len: int = 256,
     num_steps: int = 200,
     temperature: float = 0.5,
+    solver: str = "heun",
+    rounding_decoder: RoundingDecoder | None = None,
 ) -> list[str]:
     """
     Generate text by denoising from pure Gaussian noise.
 
-    1. Start with z ~ N(0, t_max² I) — pure noise in embedding space
-    2. Build a schedule of noise levels: t_max → t_min in num_steps
-    3. At each step: forward pass → score interpolation → Euler step
-    4. Final: argmax of logits → tokens → decode with tokenizer
+    Solvers:
+      - "euler": 1 forward pass per step. Simple, fast.
+      - "heun":  2 forward passes per step. Look, tentative step, look again, average.
+                 Same compute as Euler with 2x steps, but smoother ODE trajectory.
     """
     embed_dim = model.embed_dim
     t_min, t_max = model.t_min, model.t_max
@@ -559,38 +774,60 @@ def sample_text(
 
     # Get embedding matrix for score interpolation
     emb_matrix = model.get_embedding_matrix()  # [V, embed_dim]
+    self_cond = None  # self-conditioning: starts as None, updated each step
 
     for i in range(num_steps):
         t_now = ts[i]
         t_next = ts[i + 1]
         dt = t_next - t_now  # negative (moving from high noise to low noise)
+        t_batch_now = mx.broadcast_to(t_now, (num_samples,))
 
-        # Broadcast t for batch dimension
-        t_batch = mx.broadcast_to(t_now, (num_samples,))
+        # Score at current position
+        score_now, e_x0 = _score_interpolation(
+            model, z, t_batch_now, emb_matrix, temperature, self_cond,
+        )
+        # drift = -t × score  (the ODE right-hand side)
+        d1 = -t_now * score_now
 
-        # Forward pass: get token probabilities
-        logits = model(z, t_batch)  # [B, L, V]
-        probs = mx.softmax((logits / temperature).astype(mx.float32), axis=-1)  # [B, L, V]
+        if solver == "heun" and i < num_steps - 1:
+            # Heun: take tentative step, evaluate score there, average
+            z_tentative = z + d1 * dt
+            t_batch_next = mx.broadcast_to(t_next, (num_samples,))
+            score_next, _ = _score_interpolation(
+                model, z_tentative, t_batch_next, emb_matrix, temperature, e_x0,
+            )
+            d2 = -t_next * score_next
+            z = z + 0.5 * (d1 + d2) * dt
+        else:
+            # Euler: just go
+            z = z + d1 * dt
 
-        # Score interpolation:
-        # E[x₀|z,t] = weighted sum of embeddings by predicted probabilities
-        e_x0 = probs @ emb_matrix  # [B, L, embed_dim]
+        # Self-conditioning: feed E[x₀] to the next step
+        self_cond = e_x0
+        mx.eval(z)
 
-        # Score = (E[x₀] - z) / t²
-        score = (e_x0 - z) / (t_now * t_now)
-
-        # Euler step along probability flow ODE: dz = -t × score × dt
-        z = z - t_now * score * dt
-
-        mx.eval(z)  # force evaluation to avoid memory buildup
-
-    # Final rounding: one last forward pass at t_min, argmax → tokens
+    # Final rounding: get the diffusion model's final hidden states + logits
     t_final = mx.broadcast_to(ts[-1], (num_samples,))
-    final_logits = model(z, t_final)
-    token_ids = mx.argmax(final_logits, axis=-1)  # [B, L]
-    mx.eval(token_ids)
+    final_logits = model(z, t_final, self_cond=self_cond)
 
-    # Decode tokens to text
+    if rounding_decoder is not None:
+        # CoDAR: contextual AR rounding using the diffusion output as context
+        # Get the final hidden states (before output head) by re-running the model
+        # For simplicity, use the logits as context (the decoder will learn to use them)
+        context = model.output_norm_fn(
+            model.input_proj(
+                mx.concatenate([
+                    z / mx.sqrt(ts[-1] ** 2 + 1),
+                    self_cond if self_cond is not None else mx.zeros_like(z),
+                ], axis=-1).astype(COMPUTE_DTYPE)
+            )
+        )
+        token_ids = rounding_decoder.decode(context)
+    else:
+        # Simple argmax rounding
+        token_ids = mx.argmax(final_logits, axis=-1)
+
+    mx.eval(token_ids)
     texts = []
     for i in range(num_samples):
         ids = token_ids[i].tolist()
@@ -1016,6 +1253,7 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         t_min=args.t_min,
         t_max=args.t_max,
+        self_cond_prob=args.self_cond_prob,
     )
     opt = SplitOptimizers(model, args)
 
@@ -1032,6 +1270,12 @@ def main() -> None:
         nn.value_and_grad(model, lambda token_ids: model.loss(token_ids)),
         inputs=model.state, outputs=model.state,
     )
+
+    # Time warping: adaptive noise level sampling (enable with TIME_WARP=1)
+    if os.environ.get("TIME_WARP", "0") == "1":
+        tw_update_every = int(os.environ.get("TW_UPDATE_EVERY", 100))
+        model.time_warp = TimeWarp(args.t_min, args.t_max, update_every=tw_update_every)
+        log(f"time_warp:enabled update_every:{tw_update_every}")
 
     # Log config
     n_params = sum(int(np.prod(p.shape)) for _, p in tree_flatten(model.parameters()))
@@ -1113,6 +1357,14 @@ def main() -> None:
         train_loss_value = float(train_loss.item())
         opt.step(model, grads, step=step, lr_mul=lr_mul)
         mx.synchronize()
+
+        # Time warp: periodically measure L(t) and update sampling weights
+        if model.time_warp is not None:
+            # Use a small sample of val tokens for L(t) measurement
+            tw_sample = mx.array(
+                val_tokens[:args.train_seq_len].reshape(1, args.train_seq_len), dtype=mx.int32
+            )
+            model.time_warp.maybe_update(model, tw_sample)
 
         step_ms = 1000.0 * (time.perf_counter() - step_t0)
         approx_train_time_ms = train_time_ms + 1000.0 * (time.perf_counter() - t0)
