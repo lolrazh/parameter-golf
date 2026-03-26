@@ -24,6 +24,7 @@ export XSA_LAST_N=4 ROPE_DIMS=16 ROPE_BASE=10000
 export LATE_QAT_THRESHOLD=0.15 ENTROPY_REG=0.01
 export QUANT_PRESET=front3_back1_6_middle5
 export EVAL_STRIDE=64
+export TTT_ENABLED=1 TTT_FREEZE_BLOCKS=0
 export SEED="$SEED"
 
 if [[ "$MODE" == "--proxy" ]]; then
