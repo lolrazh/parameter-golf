@@ -1197,6 +1197,169 @@ def eval_val(
             log_fn(f"val_progress:{batch_idx}/{total_batches}")
     return total_loss_sum / total_tokens
 
+def eval_block_nelbo_bpb(
+    model: DiffusionLM,
+    val_tokens: np.ndarray,
+    args: Hyperparameters,
+    base_bytes_lut: np.ndarray,
+    has_leading_space_lut: np.ndarray,
+    is_boundary_token_lut: np.ndarray,
+    block_size: int = 4,
+    num_t_samples: int = 32,
+    context_len: int = 0,
+    log_fn: Callable[[str], None] | None = None,
+) -> tuple[float, float]:
+    """
+    Block Diffusion NELBO → BPB (BD3-LM style scoring).
+
+    Splits the validation sequence into blocks of L' tokens. Each block is scored
+    via diffusion NELBO conditioned on clean left context. This gives a valid upper
+    bound on NLL that tightens as block_size shrinks (at L'=1, equals AR NLL).
+
+    The model sees:
+      - Context: clean embeddings (t=0, no noise) for all tokens left of the block
+      - Block: noisy embeddings at various noise levels t
+      - Future: not visible (we only feed context + block)
+
+    For each block, NELBO = ln(t_max/t_min) × (1/K) × Σ_k CE_k
+
+    block_size:    L' — tokens per block. 4 = ~18% gap to AR. 1 = exact AR.
+    num_t_samples: MC samples for noise integration per block.
+    context_len:   max context tokens (0 = unlimited). Sliding window if set.
+    """
+    t_min, t_max = args.t_min, args.t_max
+    embed_dim = args.embed_dim
+    log_range = math.log(t_max) - math.log(t_min)
+
+    # Fixed noise levels for deterministic scoring
+    ln_ts = np.linspace(math.log(t_min), math.log(t_max), num_t_samples, dtype=np.float32)
+
+    # Fixed seed for reproducible eval
+    rng_state_np = np.random.get_state()
+    np.random.seed(42)
+
+    total_tokens = val_tokens.size
+    total_nelbo_sum = 0.0
+    total_scored_tokens = 0
+    total_bytes = 0.0
+
+    # Process sequence block by block
+    num_blocks = total_tokens // block_size
+    if log_fn:
+        log_fn(f"block_nelbo: {num_blocks} blocks of {block_size} tokens, {num_t_samples} MC samples each")
+
+    for b_idx in range(num_blocks):
+        block_start = b_idx * block_size
+        block_end = block_start + block_size
+
+        # Context: all clean tokens before this block (with sliding window cap)
+        if context_len > 0:
+            ctx_start = max(0, block_start - context_len)
+        else:
+            ctx_start = 0
+
+        ctx_tokens = val_tokens[ctx_start:block_start]       # clean context
+        blk_tokens = val_tokens[block_start:block_end]        # block to score
+
+        # Build full input: [context, block]
+        full_tokens_np = np.concatenate([ctx_tokens, blk_tokens])
+        full_len = len(full_tokens_np)
+        ctx_len = len(ctx_tokens)
+
+        if full_len == 0:
+            continue
+
+        # Embed everything
+        full_ids = mx.array(full_tokens_np.reshape(1, full_len), dtype=mx.int32)
+        full_emb = model.get_embeddings(full_ids)  # [1, full_len, embed_dim]
+        mx.eval(full_emb)
+
+        # Score block at multiple noise levels
+        block_ce_sum = 0.0
+        for ln_t in ln_ts:
+            t_val = math.exp(float(ln_t))
+
+            # Noise only the BLOCK positions, keep context CLEAN
+            eps = mx.random.normal((1, full_len, embed_dim))
+            # Context noise = 0 (clean), block noise = t
+            t_per_pos = np.zeros((1, full_len, 1), dtype=np.float32)
+            t_per_pos[0, ctx_len:, 0] = t_val
+            t_mask = mx.array(t_per_pos)
+
+            z_t = full_emb + t_mask * eps  # context positions: emb + 0 = clean
+
+            # Forward pass — model needs a scalar t, use the block's t
+            # (context at t=0 sees clean embeddings through the input scaling)
+            t_batch = mx.array([t_val])
+            # Input scaling: z / sqrt(t²+1). For context (t=0): z/1 = z. For block: z/sqrt(t²+1).
+            t_broad = t_mask  # [1, full_len, 1]
+            z_scaled = z_t / mx.sqrt(t_broad * t_broad + 1)
+
+            # Concatenate with zeros for self-conditioning channel
+            z_cat = mx.concatenate([z_scaled, mx.zeros_like(z_scaled)], axis=-1)
+            x = model.input_proj(z_cat.astype(COMPUTE_DTYPE))
+
+            # Timestep encoding — use the block's noise level
+            t_emb = model.encode_timestep(t_batch)  # [1, 1, dim]
+
+            # Run transformer
+            skips: list[mx.array] = []
+            for i in range(model.num_encoder_layers):
+                x = model.blocks[i](x, t_emb)
+                skips.append(x)
+            for i in range(model.num_decoder_layers):
+                if skips:
+                    x = x + model.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
+                x = model.blocks[model.num_encoder_layers + i](x, t_emb)
+
+            # Output logits
+            x = model.output_norm_fn(x)
+            logits = model.output_head(x.astype(COMPUTE_DTYPE))
+            logits = model.softcap(logits)
+
+            # CE only on the BLOCK positions (not context)
+            block_logits = logits[0, ctx_len:, :]  # [block_size, vocab]
+            block_targets = mx.array(blk_tokens, dtype=mx.int32)
+            ce = nn.losses.cross_entropy(
+                block_logits.astype(mx.float32), block_targets, reduction="mean"
+            )
+            mx.eval(ce)
+            block_ce_sum += float(ce.item())
+
+        # Block NELBO = log_range × mean(CE across noise levels)
+        block_nelbo = log_range * block_ce_sum / num_t_samples
+
+        total_nelbo_sum += block_nelbo * block_size
+        total_scored_tokens += block_size
+
+        # Byte counting for this block (parameter-golf compatible)
+        for pos in range(block_size):
+            global_pos = block_start + pos
+            if global_pos == 0:
+                continue  # no previous token for first position
+            tgt_id = int(blk_tokens[pos])
+            prev_id = int(val_tokens[global_pos - 1])
+            b_count = int(base_bytes_lut[tgt_id])
+            b_count += int(has_leading_space_lut[tgt_id]) & (1 - int(is_boundary_token_lut[prev_id]))
+            total_bytes += b_count
+
+        # Progress logging
+        if log_fn and (b_idx + 1) % max(num_blocks // 10, 1) == 0:
+            avg_so_far = total_nelbo_sum / max(total_scored_tokens, 1)
+            log_fn(f"block_nelbo_progress: {b_idx+1}/{num_blocks} avg_nelbo:{avg_so_far:.4f}")
+
+    # Restore RNG state
+    np.random.set_state(rng_state_np)
+
+    # Final conversion: NELBO (nats) → BPB
+    if total_scored_tokens == 0 or total_bytes == 0:
+        return 0.0, 0.0
+    avg_nelbo_nats = total_nelbo_sum / total_scored_tokens
+    bits_per_token = avg_nelbo_nats / math.log(2.0)
+    val_bpb = bits_per_token * (total_scored_tokens / total_bytes)
+    return avg_nelbo_nats, val_bpb
+
+
 # -----------------------------
 # TRAINING
 # -----------------------------
@@ -1255,6 +1418,11 @@ def main() -> None:
         limit = (args.val_tokens_limit // args.train_seq_len) * args.train_seq_len
         val_tokens = val_tokens[:limit]
         log(f"val_tokens_limit:{args.val_tokens_limit} actual_val_tokens:{val_tokens.size}")
+
+    # Byte LUTs for BPB computation (same as parameter-golf GPT eval)
+    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
+        sp, args.vocab_size
+    )
 
     # ==============================================================================
     # MODEL + OPTIMIZER
@@ -1413,6 +1581,25 @@ def main() -> None:
                 f"train_time:{approx_train_time_ms:.0f}ms step_avg:{approx_train_time_ms / step:.2f}ms tok_s:{tok_s:.0f}")
         if max_wallclock_ms is not None and stop_after_step is None and approx_train_time_ms >= max_wallclock_ms:
             stop_after_step = step
+
+    # ==============================================================================
+    # BLOCK NELBO → BPB EVALUATION (BD3-LM style, parameter-golf compatible)
+    # ==============================================================================
+    block_size = int(os.environ.get("EVAL_BLOCK_SIZE", 4))
+    num_t_eval = int(os.environ.get("EVAL_T_SAMPLES", 32))
+    eval_ctx = int(os.environ.get("EVAL_CONTEXT_LEN", 0))  # 0 = unlimited
+    if block_size > 0 and num_t_eval > 0:
+        log(f"Computing block NELBO (L'={block_size}, {num_t_eval} MC samples)...")
+        nelbo_t0 = time.perf_counter()
+        nelbo_nats, val_bpb = eval_block_nelbo_bpb(
+            model, val_tokens, args,
+            base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            block_size=block_size, num_t_samples=num_t_eval,
+            context_len=eval_ctx, log_fn=log,
+        )
+        nelbo_ms = 1000.0 * (time.perf_counter() - nelbo_t0)
+        log(f"NELBO: {nelbo_nats:.4f} nats/token  val_bpb:{val_bpb:.4f}  "
+            f"(L'={block_size}, {num_t_eval} MC, {nelbo_ms:.0f}ms)")
 
     # ==============================================================================
     # SERIALIZATION
