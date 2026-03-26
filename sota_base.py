@@ -78,7 +78,6 @@ class Hyperparameters:
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
-    entropy_reg = float(os.environ.get("ENTROPY_REG", 0.01))  # entropy regularization during QAT
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
@@ -1243,11 +1242,8 @@ def _classify_param(name: str) -> str:
 def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
-        # GPTQ-lite: per-row optimal clip percentile search (our addition)
-        best_q = None
-        best_s = None
-        best_mse = torch.full((t32.shape[0],), float("inf"), device=t32.device)
-        for pct in [0.999, 0.9995, 0.9999, 0.99999, 1.0]:
+        best_q, best_s, best_err = None, None, float('inf')
+        for pct in [0.9990, 0.9995, 0.9999, 0.99999, 1.0]:
             if pct < 1.0:
                 row_clip = torch.quantile(t32.abs(), pct, dim=1)
             else:
@@ -1255,14 +1251,9 @@ def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tens
             s = (row_clip / clip_range).clamp_min(1.0 / clip_range).to(torch.float16)
             q = torch.clamp(torch.round(t32 / s.float()[:, None]), -clip_range, clip_range).to(torch.int8)
             recon = q.float() * s.float()[:, None]
-            mse = (t32 - recon).pow(2).mean(dim=1)
-            improved = mse < best_mse
-            if best_q is None:
-                best_q, best_s, best_mse = q, s, mse
-            else:
-                best_q[improved] = q[improved]
-                best_s[improved] = s[improved]
-                best_mse[improved] = mse[improved]
+            err = (t32 - recon).pow(2).mean().item()
+            if err < best_err:
+                best_q, best_s, best_err = q, s, err
         return best_q, best_s
     amax = t32.abs().max().item()
     scale = torch.tensor(amax / clip_range if amax > 0 else 1.0, dtype=torch.float16)
@@ -1336,21 +1327,6 @@ def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict
             out[name] = tensor
     return out
 
-QUANT_PRESET = os.environ.get("QUANT_PRESET", "front3_back1_6_middle5")
-
-def _quant_bits_for_layer(name: str, num_layers: int, preset: str) -> int:
-    """Layer-position-aware bit selection. Sensitive layers get more bits."""
-    if preset == "uniform_int6":
-        return 6
-    if not name.startswith("blocks."):
-        return 6  # non-block tensors default to int6
-    parts = name.split(".")
-    idx = int(parts[1])
-    is_sensitive = idx < 3 or idx >= num_layers - 1
-    if preset == "front3_back1_6_middle5":
-        return 6 if is_sensitive else 5
-    return 6  # fallback
-
 def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
     num_layers_total = max(
         (int(k.split(".")[1]) for k in state_dict if k.startswith("blocks.")),
@@ -1371,12 +1347,10 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
             meta[name] = "passthrough_ctrl"
             continue
         if cat in int6_cats and t.ndim >= 1:
-            bits = _quant_bits_for_layer(name, num_layers_total, QUANT_PRESET)
-            clip_range = (2 ** (bits - 1)) - 1  # int6: 31, int5: 15
-            q, s = quantize_int6_per_row(t, clip_range=clip_range)
+            q, s = quantize_int6_per_row(t)
             result[name + ".q"] = q
             result[name + ".scale"] = s
-            meta[name] = {"type": f"int{bits}"}
+            meta[name] = {"type": "int6"}
         else:
             q, s = quantize_float_tensor(t)
             result[name + ".q"] = q
@@ -1708,17 +1682,6 @@ def main() -> None:
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
-            # Entropy-regularized QAT: push weights toward quant grid during QAT phase
-            if CastedLinear._qat_enabled and args.entropy_reg > 0 and micro_step == 0:
-                ent_penalty = torch.zeros((), device=device)
-                for name, p in model.named_parameters():
-                    if p.ndim == 2 and p.numel() > 65536:
-                        w32 = p.float()
-                        row_max = w32.abs().amax(dim=1)
-                        scale = (row_max / 31.0).clamp_min(1.0 / 31.0)
-                        residual = w32 / scale[:, None] - torch.round(w32 / scale[:, None])
-                        ent_penalty = ent_penalty + residual.pow(2).mean()
-                loss = loss + args.entropy_reg * ent_penalty
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
