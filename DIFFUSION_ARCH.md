@@ -324,6 +324,87 @@ dz = −t × ∇_z log p(z,t) dt
 L = E_t [ CE(f_θ(z_t, t), x₀) ]    (cross-entropy, all positions)
 ```
 
+## Improvement Roadmap
+
+### 1. Self-Conditioning (CDCD, 2022) — ~0.4 nats gain
+
+**ELI5:** Right now each forward pass is blind — it only sees noisy vectors. With self-
+conditioning, we do a "draft" pass first, get a rough prediction, then feed that rough
+prediction back as extra input for the "real" pass. The model thinks: "my draft says this
+is probably 'cat' — let me refine from there."
+
+**Status:** Not yet implemented. Need a two-pass training step (draft 50% of the time, zeros otherwise).
+
+**Diffusion-coded?** No — this is an engineering trick. Applies to any generative model.
+
+**Implementation:**
+- Expand `input_proj` from `embed_dim → dim` to `2*embed_dim → dim`
+- During training: 50% of the time, run a no-grad forward pass, compute E[x₀], concatenate with z_scaled
+- During sampling: already free — feed previous step's E[x₀] as self-conditioning
+
+### 2. Heun Solver — better ODE trajectories, same compute
+
+**ELI5:** Our ODE solver (Euler) is like walking through fog — look at the lighthouse,
+take one step. But the lighthouse angle shifts after you step. Heun says: look, take a
+tentative step, look AGAIN from the new position, then take the real step using the
+average direction. Two looks per step = smoother trajectory = better text.
+
+**Status:** Not yet implemented. ~15 lines of code.
+
+**Diffusion-coded?** YES — this is core diffusion theory. Euler vs Heun vs DPM-Solver
+is how image diffusion people think. Understanding ODE solvers is understanding diffusion.
+
+**Implementation:**
+```
+# Euler:  z_next = z - t * score(z, t) * dt
+
+# Heun:   z_tentative = z - t * score(z, t) * dt
+#         z_next = z - 0.5 * dt * (t*score(z,t) + t_next*score(z_tentative, t_next))
+```
+
+### 3. Time Warping (CDCD, 2022) — smarter noise sampling
+
+**ELI5:** Right now we train equally on all noise levels. But some noise levels are
+easy (very high noise = just guess "the"; very low = barely noisy). Time warping is
+like a teacher who spends more class time on the hard chapters. We measure which noise
+levels the model struggles on, then sample those more during training.
+
+**Status:** Not yet implemented. Need periodic L(t) measurement + CDF fitting.
+
+**Diffusion-coded?** Sort of — it's specific to diffusion training dynamics, but it's
+more of an optimization trick than a fundamental concept.
+
+**Implementation:**
+- Every N steps, evaluate loss at 50 evenly-spaced t values
+- Fit a piecewise-linear CDF F(t) such that L(F^{-1}(u)) is ~constant
+- Sample t = F^{-1}(u), u ~ Uniform, instead of log-uniform
+
+### 4. CoDAR-style AR Decoder — fix the rounding bottleneck
+
+**ELI5:** After our beautiful ODE sampling, the last step is argmax — snap each position
+to its nearest token independently. This is like writing a novel where you pick each
+word without reading the sentence. "cat sat" becomes "car mat" because rounding doesn't
+know bigram statistics. An AR decoder reads all continuous outputs and decodes them
+left-to-right, so it knows "cat sat" is way more likely than "car mat."
+
+**Status:** Not yet implemented. Requires a small separate autoregressive transformer.
+
+**Diffusion-coded?** No — this is a post-processing fix for the rounding problem. The
+diffusion part is already done when this kicks in. But it's the single biggest quality
+improvement available (CoDAR: Gen PPL 50.68 vs MDLM 123.73).
+
+**Implementation:**
+- Small AR transformer (2-4 layers) that cross-attends to the denoised continuous states
+- Trained separately or jointly with the diffusion model
+- At inference: after ODE finishes, run AR decoder on the final continuous states
+
+### Priority Order
+
+1. **Heun solver** — most diffusion-coded, simplest to implement, immediate quality gain
+2. **Self-conditioning** — biggest bang-for-buck in training quality
+3. **Time warping** — training efficiency, moderate complexity
+4. **CoDAR decoder** — biggest quality jump, but adds a whole second model
+
 ## File Map
 
 | File | Purpose |
