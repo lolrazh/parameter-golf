@@ -266,3 +266,14 @@ Key negative results: EMA hurt (r20: quant gap 0.155), high momentum hurt (r15),
 | run11 | run_a_baseline | 11L MLP=1536 Bigram=2048 noVE 26.8M | 1.3704 | 1.3826 | 1.2936 | 1.2913 | 13.15 MB | 3276 | baseline |
 | run12 | run_b_upgraded | 11L MLP=1792 Bigram=10240 VE128(9,10) 30.9M | 1.3632 | 1.3744 | 1.2926 | 1.2903 | 14.13 MB | 3125 | marginal on proxy, go for 8xH100 |
 | run13 | ttt_verify_2min | 11L sp1024 MLP=1792 VE128, 2-min train, full-model TTT 3ep 32K chunk | — | 4.6743 | — | 3.9817 | — | — | TTT verified working (-0.693 BPB gain, 33s for 1M tokens) |
+
+**8xH100 Submission Run — PR #885 (SOTA base + n-gram + entropy-reg QAT + mixed quant + LeakyReLU 0.9)**
+
+Rebased on PR #549's train_gpt.py. 80 shards, seq_len=2048, Parallel Muon, full-model score-first TTT + 7-gram eval cache.
+
+| # | Seed | Steps | ms/step | Pre-quant BPB | Post-quant BPB | Sliding BPB | Post-TTT+ngram BPB | Artifact | Verdict |
+|---|------|-------|---------|---------------|----------------|-------------|-------------------|----------|---------|
+| run14 | 1337 | 5,735 | 104.6 | 1.1473 | 1.1759 | 1.1516 | **0.9977** | 13,834,050 | sub-1.0 |
+| run15 | 42 | 6,799 | 88.3 | 1.1441 | 1.1717 | 1.1485 | **0.9947** | 13,933,238 | sub-1.0 |
+| run16 | 2025 | 6,446 | 93.1 | 1.1452 | 1.1686 | 1.1448 | **0.9949** | 14,007,046 | sub-1.0 |
+| **mean** | — | ~6,327 | ~95 | 1.1455 | 1.1721 | 1.1483 | **0.9958 (std 0.0017)** | ~13.9 MB | **PR #885 submitted** |
