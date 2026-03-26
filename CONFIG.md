@@ -23,7 +23,7 @@ Single source of truth. Every parameter, every change, every reason.
 | ve_dim | 128 | SOTA PR #549 |
 | ve_layers | 9,10 | SOTA PR #549 |
 | ln_scale | True | SOTA PR #549 |
-| activation | LeakyReLU(0.5)^2 | SOTA PR #549 |
+| activation | LeakyReLU(0.9)^2 | Sweep in issue #140, +0.013 BPB over 0.5 |
 
 ## Training
 
@@ -95,3 +95,4 @@ Single source of truth. Every parameter, every change, every reason.
 | 2026-03-26 | Added mixed quant preset front3_back1_6_middle5 | int6 for sensitive layers (first 3 + last 1), int5 for middle. Proven in experiments 44-55. |
 | 2026-03-26 | Added GPTQ-lite per-row clip search | Per-row optimal percentile beats global search. 5 candidates per row. |
 | 2026-03-26 | Switched compression to zstd-22 | Beats LZMA on 5/6 quant presets. Proven in quant sweep. |
+| 2026-03-26 | LeakyReLU slope 0.5 → 0.9 | Controlled sweep in issue #140 shows monotonic improvement. 0.9 beats 0.5 by 0.013 BPB. One-line change. |
