@@ -277,3 +277,21 @@ Rebased on PR #549's train_gpt.py. 80 shards, seq_len=2048, Parallel Muon, full-
 | run15 | 42 | 6,799 | 88.3 | 1.1441 | 1.1717 | 1.1485 | **0.9947** | 13,933,238 | sub-1.0 |
 | run16 | 2025 | 6,446 | 93.1 | 1.1452 | 1.1686 | 1.1448 | **0.9949** | 14,007,046 | sub-1.0 |
 | **mean** | — | ~6,327 | ~95 | 1.1455 | 1.1721 | 1.1483 | **0.9958 (std 0.0017)** | ~13.9 MB | **PR #885 submitted** |
+
+---
+
+## Diffusion LM Experiments (Exploratory — CDCD-style continuous diffusion on MLX)
+
+**Not competing for BPB** — pure exploration. val_loss is diffusion reconstruction CE (not comparable to GPT val_loss/val_bpb). BPB requires ELBO evaluation (not yet implemented).
+
+**Setup:** M4 Air, train_diffusion_mlx.py, CDCD architecture: 9L 512d bidirectional + AdaLN, 64-dim L2-norm embeddings, score interpolation, Heun ODE sampling. Self-conditioning 50%. Batch=4096 tokens, seq_len=512.
+
+| # | Run ID | Config | Steps | ms/step | val_loss | Train loss | Verdict |
+|---|--------|--------|-------|---------|----------|------------|---------|
+| d1 | diffusion_smoke | Euler, no self-cond, 27.1M params | 5 | ~729 | 7.04 | 7.05 | Sanity check — model runs, loss near ln(1024)=6.93 |
+| d2 | diffusion_gen_test | Euler, no self-cond | 50 | ~511 | 5.28 | 4.80 | English words emerging in generation: "the", "and", "for" |
+| d3 | diffusion_full_test | Heun + self-cond, 27.1M params | 50 | ~507 | 5.19 | 4.77 | Self-cond improves val by 0.08 vs d2 |
+| d4 | diffusion_long | Heun + self-cond, BUGGY (frozen mx.random in mx.compile) | 2500 | ~1213 | **23.21** | 2.97 | BUG: val diverged due to frozen random values in compiled loss |
+| d5 | diffusion_fixed | Heun + self-cond, randomness externalized | 500 | ~1265 | **4.85** | 3.85 | FIX CONFIRMED: val tracks training. Mild overfitting from tiny batch. |
+
+**Bug found:** `mx.compile` freezes `mx.random` calls AND Python `if`-branches at trace time. All randomness must be generated outside compiled functions and passed as arguments. See agent-logs/2026-03-27_1500_diffusion-lm-experiment.md for details.
