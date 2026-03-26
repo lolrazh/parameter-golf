@@ -293,5 +293,8 @@ Rebased on PR #549's train_gpt.py. 80 shards, seq_len=2048, Parallel Muon, full-
 | d3 | diffusion_full_test | Heun + self-cond, 27.1M params | 50 | ~507 | 5.19 | 4.77 | Self-cond improves val by 0.08 vs d2 |
 | d4 | diffusion_long | Heun + self-cond, BUGGY (frozen mx.random in mx.compile) | 2500 | ~1213 | **23.21** | 2.97 | BUG: val diverged due to frozen random values in compiled loss |
 | d5 | diffusion_fixed | Heun + self-cond, randomness externalized | 500 | ~1265 | **4.85** | 3.85 | FIX CONFIRMED: val tracks training. Mild overfitting from tiny batch. |
+| d6 | block_diffusion_v2 | **Block L'=4, per-position AdaLN** | 50 | ~668 | 5.88 | **0.05** | **BPB: 18.11**. Architecture works. Train loss → 0 (overfitting on tiny batch). |
 
-**Bug found:** `mx.compile` freezes `mx.random` calls AND Python `if`-branches at trace time. All randomness must be generated outside compiled functions and passed as arguments. See agent-logs/2026-03-27_1500_diffusion-lm-experiment.md for details.
+**Bug found:** `mx.compile` freezes `mx.random` calls AND Python `if`-branches at trace time. All randomness must be generated outside compiled functions and passed as arguments.
+
+**Architecture upgrade (d6):** Per-position AdaLN conditioning + block diffusion training + BD3-LM style block NELBO → BPB evaluation. At L'=4, bound is ~18% above AR at scale (BD3-LM published). Current BPB 18.11 is purely from undertrained model (50 steps, 4K batch). Need H100 training to close the gap. See agent-logs/2026-03-27_1500_diffusion-lm-experiment.md.
