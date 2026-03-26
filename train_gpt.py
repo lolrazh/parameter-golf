@@ -10,13 +10,7 @@ import subprocess
 import sys
 import time
 import uuid
-import zlib
 from pathlib import Path
-try:
-    import zstandard
-    _COMPRESSOR = "zstd"
-except ImportError:
-    _COMPRESSOR = "zlib"
 import numpy as np
 import sentencepiece as spm
 import torch

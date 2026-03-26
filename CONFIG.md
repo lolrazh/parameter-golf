@@ -70,8 +70,8 @@ Single source of truth. Every parameter, every change, every reason.
 | quant_preset | front3_back1_6_middle5 | Ours (experiments 44-55) |
 | gptq_lite | True (per-row) | Ours (experiment a13) |
 | entropy_reg | 0.01 | Ours (run10, halves quant gap) |
-| qat_start_frac | 0.15 | Ours (run10) |
-| compression | zstd-22 | Ours (beats LZMA on 5/6 presets) |
+| late_qat_threshold | 0.15 | Ours (run10) |
+| compression | lzma preset=6 | SOTA PR #549 (zstd-22 was never implemented) |
 
 ## Eval / TTT
 
@@ -104,6 +104,6 @@ Single source of truth. Every parameter, every change, every reason.
 | 2026-03-26 | Added entropy-reg QAT (0.01 reg, 0.15 start) | Halves quant gap from 0.017 to 0.009. Proven in run10. |
 | 2026-03-26 | Added mixed quant preset front3_back1_6_middle5 | int6 for sensitive layers (first 3 + last 1), int5 for middle. Proven in experiments 44-55. |
 | 2026-03-26 | Added GPTQ-lite per-row clip search | Per-row optimal percentile beats global search. 5 candidates per row. |
-| 2026-03-26 | Switched compression to zstd-22 | Beats LZMA on 5/6 quant presets. Proven in quant sweep. |
+| 2026-03-26 | ~~Switched compression to zstd-22~~ | Reverted: zstd was never implemented, dead code removed. Using LZMA preset=6 (matches SOTA). |
 | 2026-03-26 | LeakyReLU slope 0.5 → 0.9 | Controlled sweep in issue #140 shows monotonic improvement. 0.9 beats 0.5 by 0.013 BPB. One-line change. |
 | 2026-03-26 | Added backward-looking n-gram eval cache | Blends n-gram predictions with neural during TTT scoring. Cache builds from scored tokens only (no oracle). Fixed alpha=0.20, backoff orders 7→2. |
