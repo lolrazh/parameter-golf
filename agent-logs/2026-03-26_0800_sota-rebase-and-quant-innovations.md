@@ -19,6 +19,7 @@ User wanted to prepare a competitive 8xH100 submission for the Parameter Golf ch
 - ✅ **Root cause analysis** — Forensic parameter-by-parameter comparison vs SOTA revealed 3 killers: 10 vs 80 training shards, seq_len 1024 vs 2048, model bloat (30.9M vs 26.9M).
 - ✅ **Full rebase on SOTA** — Extracted PR #549's train_gpt.py as new base. Added our 3 proven quant innovations (~85 lines). New file: `train_gpt.py` (1935 lines).
 - ✅ **CONFIG.md created** — Single source of truth for every parameter, traced to source, with changelog.
+- ✅ **run.sh bug fixes** — Fixed dead env var (QAT_START_FRAC → LATE_QAT_THRESHOLD), added missing EVAL_SEQ_LEN=1024 to proxy mode (prevents NTK RoPE mismatch), made all mode-specific vars overridable with ${VAR:-default} syntax for smoke testing.
 
 ## Technical Implementation
 
@@ -61,6 +62,15 @@ During QAT phase (when `CastedLinear._qat_enabled`), adds penalty: `entropy_reg 
 
 7. **Model bloat (30.9M vs 26.9M)** — BigramHash 10240 + MLP 1792 + VE128 added 4M params costing +20ms/step and -1,158 training steps. Proxy showed only -0.001 BPB benefit.
    - **Fix:** Rebase on SOTA's lean 26.9M architecture.
+
+8. **QAT_START_FRAC was a dead env var** — run.sh exported QAT_START_FRAC=0.15 but train_gpt.py reads LATE_QAT_THRESHOLD. Worked by accident since both default to 0.15.
+   - **Fix:** Renamed to LATE_QAT_THRESHOLD in run.sh.
+
+9. **EVAL_SEQ_LEN missing from proxy mode** — Proxy trains at seq_len 1024 but EVAL_SEQ_LEN defaults to 2048 in train_gpt.py. This triggers NTK RoPE scaling at eval time.
+   - **Fix:** Added export EVAL_SEQ_LEN=1024 to proxy block.
+
+10. **run.sh env var overrides didn't work** — `export FOO=bar` inside the script clobbers command-line overrides like `FOO=99 ./run.sh`. Prevented ad-hoc smoke test config.
+    - **Fix:** Changed all mode-specific vars to `${VAR:-default}` syntax.
 
 ## Key Learnings
 
