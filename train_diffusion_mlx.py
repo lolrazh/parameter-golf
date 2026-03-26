@@ -1251,7 +1251,7 @@ def eval_val(
         token_ids = mx.array(chunk.reshape(-1, args.train_seq_len), dtype=mx.int32)
         B = token_ids.shape[0]
         # Fresh noise generated OUTSIDE compiled function
-        t, eps = _sample_noise(B, args.train_seq_len, embed_dim, args.t_min, args.t_max)
+        t, eps = _sample_noise_uniform(B, args.train_seq_len, embed_dim, args.t_min, args.t_max)
         chunk_token_count = float(token_ids.size)
         batch_loss = compiled_loss_no_sc(token_ids, t, eps).astype(mx.float32)
         mx.eval(batch_loss)
