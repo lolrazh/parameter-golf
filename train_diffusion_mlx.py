@@ -557,44 +557,38 @@ class DiffusionLM(nn.Module):
         logits = self.output_head(x.astype(COMPUTE_DTYPE))
         return self.softcap(logits)
 
-    def loss(self, token_ids: mx.array) -> mx.array:
+    def loss(self, token_ids: mx.array, t: mx.array, eps: mx.array,
+             do_self_cond: bool = False) -> mx.array:
         """
         Diffusion training loss: add noise to embeddings, predict original tokens.
-        Includes self-conditioning and optional time warping.
-        token_ids: [B, L] — clean token sequences
+
+        ALL randomness is passed in from outside (not generated here) because
+        mx.compile freezes mx.random calls — they return the SAME values every call.
+        The caller must generate fresh t, eps, and the self-cond coin flip.
+
+        token_ids:    [B, L] — clean token sequences
+        t:            [B] — noise levels (pre-sampled outside compiled fn)
+        eps:          [B, L, embed_dim] — Gaussian noise (pre-sampled outside)
+        do_self_cond: whether to run draft pass for self-conditioning
         Returns: scalar cross-entropy loss
         """
-        B = token_ids.shape[0]
-
         # 1. Embed tokens into continuous space
         e0 = self.get_embeddings(token_ids)  # [B, L, embed_dim]
 
-        # 2. Sample noise level (time warping if enabled, else log-uniform)
-        if self.time_warp is not None:
-            t = self.time_warp.sample_t(B)
-        else:
-            ln_t = (
-                mx.random.uniform(shape=(B,))
-                * (math.log(self.t_max) - math.log(self.t_min))
-                + math.log(self.t_min)
-            )
-            t = mx.exp(ln_t)
-
-        # 3. Add Gaussian noise: z_t = embedding + t * epsilon
-        eps = mx.random.normal(e0.shape)
+        # 2. Add Gaussian noise: z_t = embedding + t * epsilon
         z_t = e0 + t[:, None, None] * eps  # [B, L, embed_dim]
 
-        # 4. Self-conditioning: 50% of the time, run a draft pass first
+        # 3. Self-conditioning (caller decides whether to do it)
         self_cond = None
-        if float(mx.random.uniform(shape=())) < self._self_cond_prob:
+        if do_self_cond:
             draft_logits = mx.stop_gradient(self(z_t, t, None))
             draft_probs = mx.softmax(draft_logits.astype(mx.float32), axis=-1)
             self_cond = mx.stop_gradient(draft_probs @ self.get_embedding_matrix())
 
-        # 5. Real forward pass (with or without self-conditioning hint)
+        # 4. Real forward pass
         logits = self(z_t, t, self_cond=self_cond)
 
-        # 6. Cross-entropy loss on ALL positions
+        # 5. Cross-entropy loss on ALL positions
         return nn.losses.cross_entropy(
             logits.reshape(-1, self.vocab_size).astype(mx.float32),
             token_ids.reshape(-1),
@@ -1126,10 +1120,26 @@ def load_validation_tokens(pattern: str, seq_len: int) -> np.ndarray:
     return tokens[:usable]
 
 
+def _sample_noise(B: int, L: int, embed_dim: int, t_min: float, t_max: float,
+                   time_warp: "TimeWarp | None" = None) -> tuple[mx.array, mx.array]:
+    """Sample noise level and Gaussian noise OUTSIDE compiled functions."""
+    if time_warp is not None:
+        t = time_warp.sample_t(B)
+    else:
+        ln_t = np.random.uniform(
+            math.log(t_min), math.log(t_max), size=B
+        ).astype(np.float32)
+        t = mx.array(np.exp(ln_t))
+    eps = mx.random.normal((B, L, embed_dim))
+    return t, eps
+
+
 def loss_and_grad_chunked(
     args: Hyperparameters,
     train_loader: TokenLoader,
-    compiled_loss_and_grad,
+    compiled_loss_and_grad_sc,
+    compiled_loss_and_grad_no_sc,
+    model: DiffusionLM,
 ) -> tuple[mx.array, dict]:
     chunk_sizes = token_chunks(args.microbatch_tokens, args.train_seq_len, args.mlx_max_microbatch_tokens)
     total_tokens = float(sum(chunk_sizes))
@@ -1137,7 +1147,14 @@ def loss_and_grad_chunked(
     grad_accum: dict[str, mx.array] | None = None
     for chunk_tokens in chunk_sizes:
         token_ids = train_loader.next_batch(chunk_tokens, args.train_seq_len)
-        loss, grads = compiled_loss_and_grad(token_ids)
+        B = token_ids.shape[0]
+        t, eps = _sample_noise(B, args.train_seq_len, args.embed_dim,
+                               args.t_min, args.t_max, model.time_warp)
+        # Self-conditioning: 50% of the time
+        if np.random.random() < args.self_cond_prob:
+            loss, grads = compiled_loss_and_grad_sc(token_ids, t, eps)
+        else:
+            loss, grads = compiled_loss_and_grad_no_sc(token_ids, t, eps)
         scale = float(token_ids.size) / total_tokens
         loss_value = loss_value + loss.astype(mx.float32) * scale
         grad_accum = accumulate_flat_grads(grad_accum, grads, scale)
@@ -1146,12 +1163,14 @@ def loss_and_grad_chunked(
 
 def eval_val(
     args: Hyperparameters,
-    compiled_loss,
+    compiled_loss_no_sc,
     val_tokens: np.ndarray,
+    embed_dim: int,
     log_fn: Callable[[str], None] | None = None,
 ) -> float:
-    # Validation: compute average diffusion loss (CE at random noise levels) on val set.
-    # This measures reconstruction quality — how well the model predicts tokens from noisy embeddings.
+    # Validation: compute average diffusion loss on val set.
+    # Uses NO self-conditioning (deterministic eval) and FRESH random noise per batch
+    # (generated outside mx.compile to avoid the frozen-random bug).
     val_batch_tokens = args.val_batch_size // args.grad_accum_steps
     val_batch_seqs = max(val_batch_tokens // args.train_seq_len, 1)
     total_seqs = val_tokens.size // args.train_seq_len
@@ -1164,8 +1183,11 @@ def eval_val(
         raw_end = batch_seq_end * args.train_seq_len
         chunk = val_tokens[raw_start:raw_end]
         token_ids = mx.array(chunk.reshape(-1, args.train_seq_len), dtype=mx.int32)
+        B = token_ids.shape[0]
+        # Fresh noise generated OUTSIDE compiled function
+        t, eps = _sample_noise(B, args.train_seq_len, embed_dim, args.t_min, args.t_max)
         chunk_token_count = float(token_ids.size)
-        batch_loss = compiled_loss(token_ids).astype(mx.float32)
+        batch_loss = compiled_loss_no_sc(token_ids, t, eps).astype(mx.float32)
         mx.eval(batch_loss)
         total_loss_sum += float(batch_loss.item()) * chunk_token_count
         total_tokens += chunk_token_count
@@ -1260,14 +1282,24 @@ def main() -> None:
     # ==============================================================================
     # COMPILED FUNCTIONS (MLX)
     # ==============================================================================
-    # Diffusion loss takes a single input (token_ids), not (x, y).
-    # model.loss() handles noise sampling and CE computation internally.
-    compiled_loss = mx.compile(
-        lambda token_ids: model.loss(token_ids),
+    # CRITICAL: mx.compile freezes mx.random calls and Python if-branches.
+    # All randomness (t, eps, self-cond coin flip) MUST be generated outside
+    # and passed as arguments. We compile TWO versions of loss: with and without
+    # self-conditioning (since the if-branch is frozen at trace time).
+    compiled_loss_no_sc = mx.compile(
+        lambda ids, t, eps: model.loss(ids, t, eps, do_self_cond=False),
         inputs=model.state, outputs=model.state,
     )
-    compiled_loss_and_grad = mx.compile(
-        nn.value_and_grad(model, lambda token_ids: model.loss(token_ids)),
+    compiled_loss_sc = mx.compile(
+        lambda ids, t, eps: model.loss(ids, t, eps, do_self_cond=True),
+        inputs=model.state, outputs=model.state,
+    )
+    compiled_loss_and_grad_no_sc = mx.compile(
+        nn.value_and_grad(model, lambda ids, t, eps: model.loss(ids, t, eps, do_self_cond=False)),
+        inputs=model.state, outputs=model.state,
+    )
+    compiled_loss_and_grad_sc = mx.compile(
+        nn.value_and_grad(model, lambda ids, t, eps: model.loss(ids, t, eps, do_self_cond=True)),
         inputs=model.state, outputs=model.state,
     )
 
@@ -1299,7 +1331,9 @@ def main() -> None:
             warmup_loss = mx.array(0.0, dtype=mx.float32)
             grad_scale = 1.0 / args.grad_accum_steps
             for _ in range(args.grad_accum_steps):
-                warmup_loss, grads = loss_and_grad_chunked(args, train_loader, compiled_loss_and_grad)
+                warmup_loss, grads = loss_and_grad_chunked(
+                    args, train_loader, compiled_loss_and_grad_sc,
+                    compiled_loss_and_grad_no_sc, model)
                 accum = accumulate_flat_grads(accum, grads, grad_scale)
             mx.eval(warmup_loss, accum)
             mx.synchronize()
@@ -1314,7 +1348,9 @@ def main() -> None:
         if warm_seqs > 0:
             warm_chunk = val_tokens[:warm_seqs * args.train_seq_len]
             warm_ids = mx.array(warm_chunk.reshape(-1, args.train_seq_len), dtype=mx.int32)
-            mx.eval(compiled_loss(warm_ids))
+            t, eps = _sample_noise(warm_ids.shape[0], args.train_seq_len, args.embed_dim,
+                                   args.t_min, args.t_max)
+            mx.eval(compiled_loss_no_sc(warm_ids, t, eps))
             mx.synchronize()
 
         train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name)
@@ -1331,7 +1367,7 @@ def main() -> None:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
         if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
             train_time_ms += 1000.0 * (time.perf_counter() - t0)
-            val_loss = eval_val(args, compiled_loss, val_tokens, log_fn=log)
+            val_loss = eval_val(args, compiled_loss_no_sc, val_tokens, args.embed_dim, log_fn=log)
             if step % 25 == 0 or last_step:
                 log(f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} "
                     f"train_time:{train_time_ms:.0f}ms step_avg:{train_time_ms / max(step, 1):.2f}ms")
@@ -1348,7 +1384,9 @@ def main() -> None:
         train_loss = mx.array(0.0, dtype=mx.float32)
         grad_scale = 1.0 / args.grad_accum_steps
         for _ in range(args.grad_accum_steps):
-            loss, grads = loss_and_grad_chunked(args, train_loader, compiled_loss_and_grad)
+            loss, grads = loss_and_grad_chunked(
+                args, train_loader, compiled_loss_and_grad_sc,
+                compiled_loss_and_grad_no_sc, model)
             accum = accumulate_flat_grads(accum, grads, grad_scale)
             train_loss = train_loss + loss.astype(mx.float32) * grad_scale
 
