@@ -333,14 +333,14 @@ conditioning, we do a "draft" pass first, get a rough prediction, then feed that
 prediction back as extra input for the "real" pass. The model thinks: "my draft says this
 is probably 'cat' — let me refine from there."
 
-**Status:** Not yet implemented. Need a two-pass training step (draft 50% of the time, zeros otherwise).
+**Status:** Implemented. `input_proj` takes `2*embed_dim`, draft pass runs 50% of training steps.
 
 **Diffusion-coded?** No — this is an engineering trick. Applies to any generative model.
 
-**Implementation:**
-- Expand `input_proj` from `embed_dim → dim` to `2*embed_dim → dim`
-- During training: 50% of the time, run a no-grad forward pass, compute E[x₀], concatenate with z_scaled
-- During sampling: already free — feed previous step's E[x₀] as self-conditioning
+**Implementation:** (done in train_diffusion_mlx.py)
+- `input_proj`: `2*embed_dim → dim` (noisy embed + self-cond concatenated)
+- Training: 50% of steps, `mx.stop_gradient(self(z_t, t, None))` → compute E[x₀] → feed back
+- Sampling: free — previous step's E[x₀] is already computed
 
 ### 2. Heun Solver — better ODE trajectories, same compute
 
@@ -349,17 +349,18 @@ take one step. But the lighthouse angle shifts after you step. Heun says: look, 
 tentative step, look AGAIN from the new position, then take the real step using the
 average direction. Two looks per step = smoother trajectory = better text.
 
-**Status:** Not yet implemented. ~15 lines of code.
+**Status:** Implemented. Default solver in `sample_text()`.
 
 **Diffusion-coded?** YES — this is core diffusion theory. Euler vs Heun vs DPM-Solver
 is how image diffusion people think. Understanding ODE solvers is understanding diffusion.
 
-**Implementation:**
+**Implementation:** (done in train_diffusion_mlx.py)
 ```
-# Euler:  z_next = z - t * score(z, t) * dt
+# Euler:  z_next = z + d1 * dt
 
-# Heun:   z_tentative = z - t * score(z, t) * dt
-#         z_next = z - 0.5 * dt * (t*score(z,t) + t_next*score(z_tentative, t_next))
+# Heun:   z_tentative = z + d1 * dt
+#         d2 = drift(z_tentative, t_next)
+#         z_next = z + 0.5 * (d1 + d2) * dt
 ```
 
 ### 3. Time Warping (CDCD, 2022) — smarter noise sampling
@@ -369,15 +370,15 @@ easy (very high noise = just guess "the"; very low = barely noisy). Time warping
 like a teacher who spends more class time on the hard chapters. We measure which noise
 levels the model struggles on, then sample those more during training.
 
-**Status:** Not yet implemented. Need periodic L(t) measurement + CDF fitting.
+**Status:** Implemented. Enable with `TIME_WARP=1`. Updates every 100 steps by default.
 
 **Diffusion-coded?** Sort of — it's specific to diffusion training dynamics, but it's
 more of an optimization trick than a fundamental concept.
 
-**Implementation:**
-- Every N steps, evaluate loss at 50 evenly-spaced t values
-- Fit a piecewise-linear CDF F(t) such that L(F^{-1}(u)) is ~constant
-- Sample t = F^{-1}(u), u ~ Uniform, instead of log-uniform
+**Implementation:** (done — `TimeWarp` class in train_diffusion_mlx.py)
+- `TimeWarp` measures L(t) at 50 log-spaced bins every N steps
+- Weights bins by loss magnitude (harder bins get more training samples)
+- `model.time_warp` is set externally; `loss()` checks for it automatically
 
 ### 4. CoDAR-style AR Decoder — fix the rounding bottleneck
 
@@ -387,23 +388,83 @@ word without reading the sentence. "cat sat" becomes "car mat" because rounding 
 know bigram statistics. An AR decoder reads all continuous outputs and decodes them
 left-to-right, so it knows "cat sat" is way more likely than "car mat."
 
-**Status:** Not yet implemented. Requires a small separate autoregressive transformer.
+**Status:** Implemented. `RoundingDecoder` class with 2-layer AR transformer + cross-attention.
+Not yet trained (needs separate training phase on diffusion outputs).
 
 **Diffusion-coded?** No — this is a post-processing fix for the rounding problem. The
 diffusion part is already done when this kicks in. But it's the single biggest quality
 improvement available (CoDAR: Gen PPL 50.68 vs MDLM 123.73).
 
-**Implementation:**
-- Small AR transformer (2-4 layers) that cross-attends to the denoised continuous states
-- Trained separately or jointly with the diffusion model
-- At inference: after ODE finishes, run AR decoder on the final continuous states
+**Implementation:** (done — `RoundingDecoder` + `CrossAttention` + `RoundingDecoderBlock`)
+- 2-layer AR transformer: causal self-attention + cross-attention to diffusion states
+- `decoder.loss(token_ids, context)`: teacher-forced CE training
+- `decoder.decode(context)`: AR decoding at inference
+- Pass `rounding_decoder=decoder` to `sample_text()` to use instead of argmax
 
-### Priority Order
+### 5. Consistency Models — "Just Learn To Do It In One Step"
 
-1. **Heun solver** — most diffusion-coded, simplest to implement, immediate quality gain
-2. **Self-conditioning** — biggest bang-for-buck in training quality
-3. **Time warping** — training efficiency, moderate complexity
-4. **CoDAR decoder** — biggest quality jump, but adds a whole second model
+**ELI5:** Our ODE solver takes 200 steps to go from noise to text. Each step is a
+tiny nudge. What if we could learn to make the ENTIRE journey in ONE step?
+
+Imagine you're learning to draw a face. At first you need 200 careful pencil strokes.
+But after practicing thousands of times, you develop "muscle memory" — you can sketch
+a recognizable face in a single fluid motion. The strokes are all compressed into one.
+
+That's a consistency model. You train a student network that watches the teacher
+(our multi-step ODE solver) make the full 200-step journey thousands of times. The
+student learns: "oh, if I'm at noise level t=150 with this pattern, the end result
+is always roughly THIS." Eventually, the student can jump directly from any noise
+level to the final answer.
+
+**Status:** Not implemented. This is a research direction, not a quick feature.
+
+**Diffusion-coded?** EXTREMELY. This is the deepest diffusion theory — it requires
+understanding the entire probability flow ODE, the consistency function
+`f(z_t, t) = z_0` that maps any point on the ODE trajectory to its endpoint,
+and how to enforce consistency across the trajectory during training.
+
+**The math:**
+```
+Consistency function:  f(z_t, t) = z₀  for all t along the same ODE trajectory
+Constraint:           f(z, t_min) = z  (at minimal noise, you're already done)
+Training:             f(z_{t_n}, t_n) ≈ f(z_{t_{n+1}}, t_{n+1})
+                      (adjacent points on the trajectory should map to the same answer)
+```
+
+The student is trained so that its output is CONSISTENT across all noise levels — if
+you start at t=300 or t=50 or t=5, the predicted clean output is the same. Once trained,
+generation is literally: sample noise → one forward pass → text.
+
+**Two flavors:**
+1. **Consistency Distillation (CD):** Train teacher (our ODE model) first, then distill
+   into student. Proven, reliable.
+2. **Consistency Training (CT):** Train the consistency model directly without a teacher.
+   Harder but avoids the two-stage pipeline.
+
+**For text (CDLM, Nov 2025):** Together AI showed consistency distillation on Dream 7B
+gives 4.1-7.7x step reduction with minor quality loss. The key insight: for text,
+you still want ~8-16 steps (not truly 1 step), because text is discrete and the
+rounding step benefits from some refinement.
+
+**Why we haven't implemented it yet:** It requires a fully trained teacher model first
+(that's what the 2500-step run is building). Once we have a good teacher, we can
+distill it into a consistency model as a follow-up experiment.
+
+**Connection to your question:** You asked "can't we look at it at the same time we
+chisel?" and "why can't a human do it in one step?" — this is literally the formalization
+of that intuition. The answer to your question is: yes, you CAN, but you need to
+practice (train) the 200-step version first, then compress that knowledge into the
+1-step version. You can't skip to the end without first understanding the journey.
+
+### Implementation Status
+
+| # | Improvement | Status | Diffusion-Coded? |
+|---|------------|--------|-----------------|
+| 1 | Self-conditioning | Done | No (engineering trick) |
+| 2 | Heun solver | Done | YES |
+| 3 | Time warping | Done (opt-in: `TIME_WARP=1`) | Sort of |
+| 4 | CoDAR decoder | Done (needs training) | No (post-processing) |
+| 5 | Consistency models | Not yet (needs trained teacher) | EXTREMELY |
 
 ## File Map
 
