@@ -29,7 +29,7 @@ Single source of truth for the continuous diffusion language model (CDCD + BD3-L
 | t_min | 1.0 | Min noise. Tokens distinguishable at sigma=1 |
 | t_max | 300.0 | Max noise. Pure Gaussian, no signal |
 | t_sampling | log-uniform | ln(t) ~ U(ln(t_min), ln(t_max)) |
-| self_cond_prob | 0.5 | Draft pass 50% of training steps. Free at inference. |
+| self_cond_prob | 0.0 | Disabled for speed. Re-enable on H100 once step budget is known. |
 | score_temp | 0.5 | Temperature on logits during ODE sampling |
 
 ## Block Diffusion Training
@@ -90,8 +90,8 @@ Single source of truth for the continuous diffusion language model (CDCD + BD3-L
 | Parameter | Value | Notes |
 |-----------|-------|-------|
 | eval_block_size | 4 | BD3-LM style. L'=4 gives ~18% gap to AR at scale. L'=1 = exact AR. |
-| eval_t_samples | 32 | MC noise samples per block. More = tighter bound. |
-| eval_context_len | 0 | 0 = unlimited left context. >0 = sliding window cap. |
+| eval_t_samples | 8 | MC noise samples per block. 8 = unbiased, just noisier than 32. |
+| eval_context_len | 2048 | Match train seq_len. Must be bounded or OOM on long val sets. |
 | scoring_method | Block NELBO | Valid upper bound on NLL. Converges to AR NLL as L'→1. |
 
 ## ODE Sampling (Text Generation)

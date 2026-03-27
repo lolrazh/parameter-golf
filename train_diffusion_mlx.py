@@ -81,7 +81,7 @@ class Hyperparameters:
     embed_dim: int = int(os.environ.get("EMBED_DIM", 64))       # continuous embedding dimension
     t_min: float = float(os.environ.get("T_MIN", 1.0))          # min noise level (tokens still distinguishable)
     t_max: float = float(os.environ.get("T_MAX", 300.0))        # max noise level (pure noise)
-    self_cond_prob: float = float(os.environ.get("SELF_COND_PROB", 0.5))  # self-conditioning probability
+    self_cond_prob: float = float(os.environ.get("SELF_COND_PROB", 0.0))  # self-conditioning probability
     score_temp: float = float(os.environ.get("SCORE_TEMP", 0.5))          # temperature during sampling
     sample_steps: int = int(os.environ.get("SAMPLE_STEPS", 200))          # ODE solver steps
     sample_len: int = int(os.environ.get("SAMPLE_LEN", 256))              # generation length
@@ -1557,8 +1557,8 @@ def main() -> None:
         if warm_seqs > 0:
             warm_chunk = val_tokens[:warm_seqs * args.train_seq_len]
             warm_ids = mx.array(warm_chunk.reshape(-1, args.train_seq_len), dtype=mx.int32)
-            t, eps = _sample_noise(warm_ids.shape[0], args.train_seq_len, args.embed_dim,
-                                   args.t_min, args.t_max)
+            t, eps = _sample_noise_uniform(warm_ids.shape[0], args.train_seq_len, args.embed_dim,
+                                           args.t_min, args.t_max)
             mx.eval(compiled_loss_no_sc(warm_ids, t, eps))
             mx.synchronize()
 
@@ -1627,8 +1627,8 @@ def main() -> None:
     # BLOCK NELBO → BPB EVALUATION (BD3-LM style, parameter-golf compatible)
     # ==============================================================================
     block_size = int(os.environ.get("EVAL_BLOCK_SIZE", 4))
-    num_t_eval = int(os.environ.get("EVAL_T_SAMPLES", 32))
-    eval_ctx = int(os.environ.get("EVAL_CONTEXT_LEN", 0))  # 0 = unlimited
+    num_t_eval = int(os.environ.get("EVAL_T_SAMPLES", 8))
+    eval_ctx = int(os.environ.get("EVAL_CONTEXT_LEN", 2048))  # match train seq_len
     if block_size > 0 and num_t_eval > 0:
         log(f"Computing block NELBO (L'={block_size}, {num_t_eval} MC samples)...")
         nelbo_t0 = time.perf_counter()
