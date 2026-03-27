@@ -87,6 +87,16 @@ class Hyperparameters:
     sample_len: int = int(os.environ.get("SAMPLE_LEN", 256))              # generation length
     train_block_size: int = int(os.environ.get("TRAIN_BLOCK_SIZE", 0))    # 0=uniform noise, >0=block diffusion
 
+    # TTT (Test-Time Training).
+    ttt_enabled: bool = os.environ.get("TTT_ENABLED", "0") == "1"
+    ttt_lr: float = float(os.environ.get("TTT_LR", 0.002))
+    ttt_epochs: int = int(os.environ.get("TTT_EPOCHS", 3))
+    ttt_chunk_tokens: int = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
+    ttt_freeze_blocks: int = int(os.environ.get("TTT_FREEZE_BLOCKS", 2))
+    ttt_momentum: float = float(os.environ.get("TTT_MOMENTUM", 0.9))
+    ttt_grad_clip: float = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
+    ttt_batch_seqs: int = int(os.environ.get("TTT_BATCH_SEQS", 8))
+
     # Optimizer.
     beta1: float = float(os.environ.get("BETA1", 0.9))
     beta2: float = float(os.environ.get("BETA2", 0.95))
@@ -1390,6 +1400,176 @@ def eval_block_nelbo_bpb(
     return avg_nelbo_nats, val_bpb
 
 
+def eval_block_nelbo_bpb_ttt(
+    model: DiffusionLM,
+    val_tokens: np.ndarray,
+    args: "Hyperparameters",
+    base_bytes_lut: np.ndarray,
+    has_leading_space_lut: np.ndarray,
+    is_boundary_token_lut: np.ndarray,
+    block_size: int = 4,
+    num_t_samples: int = 8,
+    context_len: int = 2048,
+    log_fn: Callable[[str], None] | None = None,
+) -> tuple[float, float]:
+    """Block NELBO → BPB with test-time training (score-first, then fine-tune).
+
+    Legal recipe (PR #461): every token is scored BEFORE any weight update
+    that could use it. Process val in chunks; for each chunk, score with
+    block NELBO, then fine-tune on that chunk with block diffusion loss.
+    """
+    t_min, t_max = args.t_min, args.t_max
+    embed_dim = args.embed_dim
+    log_range = math.log(t_max) - math.log(t_min)
+    seq_len = args.train_seq_len
+    ttt_chunk = args.ttt_chunk_tokens
+    ttt_block_size = args.train_block_size if args.train_block_size > 0 else 4
+
+    # Fixed noise levels for deterministic scoring
+    ln_ts = np.linspace(math.log(t_min), math.log(t_max), num_t_samples, dtype=np.float32)
+
+    total_tokens = val_tokens.size
+    num_blocks = total_tokens // block_size
+    num_chunks = (total_tokens + ttt_chunk - 1) // ttt_chunk
+
+    # --- Freeze early blocks ---
+    freeze_n = min(args.ttt_freeze_blocks, args.num_layers)
+    for i in range(freeze_n):
+        model.blocks[i].freeze()
+    unfrozen_count = sum(p.size for _, p in tree_flatten(model.trainable_parameters()))
+    frozen_count = sum(p.size for _, p in tree_flatten(model.parameters())) - unfrozen_count
+    if log_fn:
+        log_fn(f"ttt:start chunks={num_chunks} chunk_tokens={ttt_chunk} "
+               f"ttt_lr={args.ttt_lr} ttt_epochs={args.ttt_epochs} "
+               f"freeze_blocks={freeze_n} unfrozen={unfrozen_count} frozen={frozen_count}")
+
+    # --- SGD optimizer for TTT ---
+    ttt_optimizer = optim.SGD(learning_rate=args.ttt_lr, momentum=args.ttt_momentum)
+
+    # --- Uncompiled loss-and-grad for TTT training ---
+    ttt_loss_and_grad = nn.value_and_grad(
+        model, lambda ids, t, eps, m: model.loss(ids, t, eps, do_self_cond=False, block_mask=m)
+    )
+
+    # Fixed seed for reproducible scoring
+    rng_state_np = np.random.get_state()
+    np.random.seed(42)
+
+    total_nelbo_sum = 0.0
+    total_scored_tokens = 0
+    total_bytes = 0.0
+    t0 = time.time()
+
+    for ci in range(num_chunks):
+        chunk_start = ci * ttt_chunk
+        chunk_end = min((ci + 1) * ttt_chunk, total_tokens)
+
+        # === Phase 1: SCORE blocks in this chunk (inference only) ===
+        block_start_idx = chunk_start // block_size
+        block_end_idx = min(chunk_end // block_size, num_blocks)
+
+        for b_idx in range(block_start_idx, block_end_idx):
+            b_start = b_idx * block_size
+            b_end = b_start + block_size
+
+            if context_len > 0:
+                ctx_start = max(0, b_start - context_len)
+            else:
+                ctx_start = 0
+
+            ctx_tokens = val_tokens[ctx_start:b_start]
+            blk_tokens = val_tokens[b_start:b_end]
+            full_tokens_np = np.concatenate([ctx_tokens, blk_tokens])
+            full_len = len(full_tokens_np)
+            ctx_len = len(ctx_tokens)
+            if full_len == 0:
+                continue
+
+            full_ids = mx.array(full_tokens_np.reshape(1, full_len), dtype=mx.int32)
+
+            block_ce_sum = 0.0
+            for ln_t in ln_ts:
+                t_val = math.exp(float(ln_t))
+                t_per_pos = np.zeros((1, full_len), dtype=np.float32)
+                t_per_pos[0, ctx_len:] = t_val
+                t_arr = mx.array(t_per_pos)
+                eps = mx.random.normal((1, full_len, embed_dim))
+                blk_mask = np.zeros((1, full_len), dtype=np.float32)
+                blk_mask[0, ctx_len:] = 1.0
+                blk_mask_arr = mx.array(blk_mask)
+                ce = model.loss(full_ids, t_arr, eps, do_self_cond=False, block_mask=blk_mask_arr)
+                mx.eval(ce)
+                block_ce_sum += float(ce.item())
+
+            block_nelbo = log_range * block_ce_sum / num_t_samples
+            total_nelbo_sum += block_nelbo * block_size
+            total_scored_tokens += block_size
+
+            # Byte counting
+            for pos in range(block_size):
+                global_pos = b_start + pos
+                if global_pos == 0:
+                    continue
+                tgt_id = int(blk_tokens[pos])
+                prev_id = int(val_tokens[global_pos - 1])
+                b_count = int(base_bytes_lut[tgt_id])
+                b_count += int(has_leading_space_lut[tgt_id]) & (1 - int(is_boundary_token_lut[prev_id]))
+                total_bytes += b_count
+
+        # === Phase 2: TRAIN on this chunk (already scored = legal) ===
+        is_last_chunk = (ci == num_chunks - 1)
+        if not is_last_chunk and args.ttt_epochs > 0:
+            chunk_tokens = val_tokens[chunk_start:chunk_end]
+            num_seqs = len(chunk_tokens) // seq_len
+            if num_seqs > 0:
+                # Cosine LR schedule across chunks
+                cos_lr = args.ttt_lr * 0.5 * (1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1)))
+                ttt_optimizer.learning_rate = cos_lr
+
+                train_tokens = chunk_tokens[:num_seqs * seq_len].reshape(num_seqs, seq_len)
+                for _ep in range(args.ttt_epochs):
+                    for bs in range(0, num_seqs, args.ttt_batch_seqs):
+                        be = min(bs + args.ttt_batch_seqs, num_seqs)
+                        batch_ids = mx.array(train_tokens[bs:be], dtype=mx.int32)
+                        B = batch_ids.shape[0]
+                        t, eps, block_mask = _sample_noise_block(
+                            B, seq_len, embed_dim, t_min, t_max, ttt_block_size)
+                        loss, grads = ttt_loss_and_grad(batch_ids, t, eps, block_mask)
+                        # Gradient clipping (approximate: clip global norm)
+                        if args.ttt_grad_clip > 0:
+                            grad_sq_sum = sum(mx.sum(g * g).item() for _, g in tree_flatten(grads))
+                            grad_norm = math.sqrt(grad_sq_sum)
+                            if grad_norm > args.ttt_grad_clip:
+                                clip_scale = args.ttt_grad_clip / grad_norm
+                                grads = tree_unflatten([
+                                    (k, v * clip_scale) for k, v in tree_flatten(grads)
+                                ])
+                        ttt_optimizer.update(model, grads)
+                        mx.eval(model.parameters(), ttt_optimizer.state)
+
+        # Progress logging
+        if log_fn and (ci % max(num_chunks // 10, 1) == 0 or ci == num_chunks - 1):
+            elapsed = time.time() - t0
+            avg_nelbo = total_nelbo_sum / max(total_scored_tokens, 1)
+            avg_bpb = avg_nelbo / math.log(2.0) * (total_scored_tokens / max(total_bytes, 1)) if total_bytes > 0 else 0.0
+            log_fn(f"  ttt_chunk [{ci+1}/{num_chunks}] bpb={avg_bpb:.6f} time={elapsed:.1f}s")
+
+    # --- Unfreeze all blocks ---
+    for i in range(freeze_n):
+        model.blocks[i].unfreeze()
+
+    # Restore RNG state
+    np.random.set_state(rng_state_np)
+
+    # Final conversion: NELBO (nats) → BPB
+    if total_scored_tokens == 0 or total_bytes == 0:
+        return 0.0, 0.0
+    avg_nelbo_nats = total_nelbo_sum / total_scored_tokens
+    bits_per_token = avg_nelbo_nats / math.log(2.0)
+    val_bpb = bits_per_token * (total_scored_tokens / total_bytes)
+    return avg_nelbo_nats, val_bpb
+
+
 # -----------------------------
 # TRAINING
 # -----------------------------
@@ -1687,6 +1867,23 @@ def main() -> None:
             q_ms = 1000.0 * (time.perf_counter() - q_t0)
             log(f"final_int8_zlib_roundtrip val_loss:{q_nelbo_nats:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_ms:.0f}ms")
             log(f"final_int8_zlib_roundtrip_exact val_loss:{q_nelbo_nats:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    # ==============================================================================
+    # TTT (Test-Time Training) — score-first, then fine-tune per chunk
+    # ==============================================================================
+    if args.ttt_enabled and block_size > 0 and num_t_eval > 0:
+        log(f"Starting TTT eval (L'={block_size}, {num_t_eval} MC, "
+            f"chunk={args.ttt_chunk_tokens}, epochs={args.ttt_epochs}, lr={args.ttt_lr})...")
+        ttt_t0 = time.perf_counter()
+        ttt_nelbo_nats, ttt_val_bpb = eval_block_nelbo_bpb_ttt(
+            model, val_tokens, args,
+            base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            block_size=block_size, num_t_samples=num_t_eval,
+            context_len=eval_ctx, log_fn=log,
+        )
+        ttt_ms = 1000.0 * (time.perf_counter() - ttt_t0)
+        log(f"final_ttt val_loss:{ttt_nelbo_nats:.4f} val_bpb:{ttt_val_bpb:.4f} eval_time:{ttt_ms:.0f}ms")
+        log(f"final_ttt_exact val_loss:{ttt_nelbo_nats:.8f} val_bpb:{ttt_val_bpb:.8f}")
 
     # ==============================================================================
     # GENERATION DEMO: Text from noise
