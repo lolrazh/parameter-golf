@@ -1643,15 +1643,50 @@ def main() -> None:
             f"(L'={block_size}, {num_t_eval} MC, {nelbo_ms:.0f}ms)")
 
     # ==============================================================================
-    # SERIALIZATION
+    # SERIALIZATION + QUANTIZED ROUNDTRIP EVAL
     # ==============================================================================
     if os.environ.get("SKIP_SERIALIZATION", "0") == "1":
-        log("skip_serialization:1 — skipping model save")
+        log("skip_serialization:1 — skipping model save + quantized roundtrip eval")
     else:
+        # 1. Save raw model
         out_path = out_dir / f"{args.run_id}_diffusion_model.npz"
         flat_state = {k: v for k, v in tree_flatten(model.state)}
         mx.savez(str(out_path), **flat_state)
         log(f"saved_model:{out_path} bytes:{out_path.stat().st_size}")
+
+        # 2. Quantize (int8 + pickle + zlib)
+        quant_obj, quant_stats = quantize_state_dict_int8(flat_state)
+        quant_raw = pickle.dumps(quant_obj, protocol=pickle.HIGHEST_PROTOCOL)
+        quant_blob = zlib.compress(quant_raw, level=9)
+        quant_path = out_dir / f"{args.run_id}_diffusion_model.int8.ptz"
+        with quant_path.open("wb") as f:
+            f.write(quant_blob)
+        quant_file_bytes = quant_path.stat().st_size
+        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+        log(
+            f"serialized_model_int8_zlib:{quant_file_bytes} bytes "
+            f"(payload:{quant_stats['int8_payload_bytes']} raw_pickle:{len(quant_raw)} payload_ratio:{ratio:.2f}x)"
+        )
+
+        # 3. Dequantize roundtrip: load from disk → dequantize → load back
+        with quant_path.open("rb") as f:
+            quant_blob_disk = f.read()
+        quant_flat = dequantize_state_dict_int8(pickle.loads(zlib.decompress(quant_blob_disk)))
+        model.update(tree_unflatten(list(quant_flat.items())))
+
+        # 4. Re-eval with block NELBO on dequantized model
+        if block_size > 0 and num_t_eval > 0:
+            log(f"Computing post-quant block NELBO (L'={block_size}, {num_t_eval} MC samples)...")
+            q_t0 = time.perf_counter()
+            q_nelbo_nats, q_val_bpb = eval_block_nelbo_bpb(
+                model, val_tokens, args,
+                base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                block_size=block_size, num_t_samples=num_t_eval,
+                context_len=eval_ctx, log_fn=log,
+            )
+            q_ms = 1000.0 * (time.perf_counter() - q_t0)
+            log(f"final_int8_zlib_roundtrip val_loss:{q_nelbo_nats:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_ms:.0f}ms")
+            log(f"final_int8_zlib_roundtrip_exact val_loss:{q_nelbo_nats:.8f} val_bpb:{q_val_bpb:.8f}")
 
     # ==============================================================================
     # GENERATION DEMO: Text from noise
