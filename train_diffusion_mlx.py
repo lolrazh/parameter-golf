@@ -86,6 +86,7 @@ class Hyperparameters:
     sample_steps: int = int(os.environ.get("SAMPLE_STEPS", 200))          # ODE solver steps
     sample_len: int = int(os.environ.get("SAMPLE_LEN", 256))              # generation length
     train_block_size: int = int(os.environ.get("TRAIN_BLOCK_SIZE", 0))    # 0=uniform noise, >0=block diffusion
+    eval_t_batch_size: int = int(os.environ.get("EVAL_T_BATCH_SIZE", 8))  # MC samples processed per forward pass
 
     # TTT (Test-Time Training).
     ttt_enabled: bool = os.environ.get("TTT_ENABLED", "0") == "1"
@@ -1282,6 +1283,7 @@ def eval_block_nelbo_bpb(
     is_boundary_token_lut: np.ndarray,
     block_size: int = 4,
     num_t_samples: int = 32,
+    t_batch_size: int | None = None,
     context_len: int = 0,
     log_fn: Callable[[str], None] | None = None,
 ) -> tuple[float, float]:
@@ -1306,6 +1308,7 @@ def eval_block_nelbo_bpb(
     t_min, t_max = args.t_min, args.t_max
     embed_dim = args.embed_dim
     log_range = math.log(t_max) - math.log(t_min)
+    t_batch_size = num_t_samples if t_batch_size is None or t_batch_size <= 0 else min(t_batch_size, num_t_samples)
 
     # Fixed noise levels for deterministic scoring
     ln_ts = np.linspace(math.log(t_min), math.log(t_max), num_t_samples, dtype=np.float32)
@@ -1322,7 +1325,10 @@ def eval_block_nelbo_bpb(
     # Process sequence block by block
     num_blocks = total_tokens // block_size
     if log_fn:
-        log_fn(f"block_nelbo: {num_blocks} blocks of {block_size} tokens, {num_t_samples} MC samples each")
+        log_fn(
+            f"block_nelbo: {num_blocks} blocks of {block_size} tokens, "
+            f"{num_t_samples} MC samples each, mc_batch:{t_batch_size}"
+        )
 
     for b_idx in range(num_blocks):
         block_start = b_idx * block_size
@@ -1346,25 +1352,30 @@ def eval_block_nelbo_bpb(
 
         # Score block at multiple noise levels using per-position t
         block_ce_sum = 0.0
-        for ln_t in ln_ts:
-            t_val = math.exp(float(ln_t))
+        for t_start in range(0, num_t_samples, t_batch_size):
+            ln_t_chunk = ln_ts[t_start:t_start + t_batch_size]
+            mc_batch = len(ln_t_chunk)
+            t_vals = np.exp(ln_t_chunk).astype(np.float32, copy=False)
 
-            # Per-position noise: context=0, block=t_val
-            t_per_pos = np.zeros((1, full_len), dtype=np.float32)
-            t_per_pos[0, ctx_len:] = t_val
-            t_arr = mx.array(t_per_pos)  # [1, full_len]
+            t_per_pos = np.zeros((mc_batch, full_len), dtype=np.float32)
+            t_per_pos[:, ctx_len:] = t_vals[:, None]
+            t_arr = mx.array(t_per_pos)
 
-            eps = mx.random.normal((1, full_len, embed_dim))
+            eps = mx.array(np.random.normal(size=(mc_batch, full_len, embed_dim)).astype(np.float32))
 
-            # Use model's loss() to get CE on block positions only
-            blk_mask = np.zeros((1, full_len), dtype=np.float32)
-            blk_mask[0, ctx_len:] = 1.0
+            blk_mask = np.zeros((mc_batch, full_len), dtype=np.float32)
+            blk_mask[:, ctx_len:] = 1.0
             blk_mask_arr = mx.array(blk_mask)
 
-            # Direct call — model now handles per-position t natively
-            ce = model.loss(full_ids, t_arr, eps, do_self_cond=False, block_mask=blk_mask_arr)
+            ce = model.loss(
+                mx.broadcast_to(full_ids, (mc_batch, full_len)),
+                t_arr,
+                eps,
+                do_self_cond=False,
+                block_mask=blk_mask_arr,
+            )
             mx.eval(ce)
-            block_ce_sum += float(ce.item())
+            block_ce_sum += float(ce.item()) * mc_batch
 
         # Block NELBO = log_range × mean(CE across noise levels)
         block_nelbo = log_range * block_ce_sum / num_t_samples
@@ -1409,6 +1420,7 @@ def eval_block_nelbo_bpb_ttt(
     is_boundary_token_lut: np.ndarray,
     block_size: int = 4,
     num_t_samples: int = 8,
+    t_batch_size: int | None = None,
     context_len: int = 2048,
     log_fn: Callable[[str], None] | None = None,
 ) -> tuple[float, float]:
@@ -1424,6 +1436,7 @@ def eval_block_nelbo_bpb_ttt(
     seq_len = args.train_seq_len
     ttt_chunk = args.ttt_chunk_tokens
     ttt_block_size = args.train_block_size if args.train_block_size > 0 else 4
+    t_batch_size = num_t_samples if t_batch_size is None or t_batch_size <= 0 else min(t_batch_size, num_t_samples)
 
     # Fixed noise levels for deterministic scoring
     ln_ts = np.linspace(math.log(t_min), math.log(t_max), num_t_samples, dtype=np.float32)
@@ -1488,18 +1501,30 @@ def eval_block_nelbo_bpb_ttt(
             full_ids = mx.array(full_tokens_np.reshape(1, full_len), dtype=mx.int32)
 
             block_ce_sum = 0.0
-            for ln_t in ln_ts:
-                t_val = math.exp(float(ln_t))
-                t_per_pos = np.zeros((1, full_len), dtype=np.float32)
-                t_per_pos[0, ctx_len:] = t_val
+            for t_start in range(0, num_t_samples, t_batch_size):
+                ln_t_chunk = ln_ts[t_start:t_start + t_batch_size]
+                mc_batch = len(ln_t_chunk)
+                t_vals = np.exp(ln_t_chunk).astype(np.float32, copy=False)
+
+                t_per_pos = np.zeros((mc_batch, full_len), dtype=np.float32)
+                t_per_pos[:, ctx_len:] = t_vals[:, None]
                 t_arr = mx.array(t_per_pos)
-                eps = mx.random.normal((1, full_len, embed_dim))
-                blk_mask = np.zeros((1, full_len), dtype=np.float32)
-                blk_mask[0, ctx_len:] = 1.0
+
+                eps = mx.array(np.random.normal(size=(mc_batch, full_len, embed_dim)).astype(np.float32))
+
+                blk_mask = np.zeros((mc_batch, full_len), dtype=np.float32)
+                blk_mask[:, ctx_len:] = 1.0
                 blk_mask_arr = mx.array(blk_mask)
-                ce = model.loss(full_ids, t_arr, eps, do_self_cond=False, block_mask=blk_mask_arr)
+
+                ce = model.loss(
+                    mx.broadcast_to(full_ids, (mc_batch, full_len)),
+                    t_arr,
+                    eps,
+                    do_self_cond=False,
+                    block_mask=blk_mask_arr,
+                )
                 mx.eval(ce)
-                block_ce_sum += float(ce.item())
+                block_ce_sum += float(ce.item()) * mc_batch
 
             block_nelbo = log_range * block_ce_sum / num_t_samples
             total_nelbo_sum += block_nelbo * block_size
@@ -1808,19 +1833,20 @@ def main() -> None:
     # ==============================================================================
     block_size = int(os.environ.get("EVAL_BLOCK_SIZE", 4))
     num_t_eval = int(os.environ.get("EVAL_T_SAMPLES", 8))
+    eval_t_batch = int(os.environ.get("EVAL_T_BATCH_SIZE", args.eval_t_batch_size))
     eval_ctx = int(os.environ.get("EVAL_CONTEXT_LEN", 2048))  # match train seq_len
     if block_size > 0 and num_t_eval > 0:
-        log(f"Computing block NELBO (L'={block_size}, {num_t_eval} MC samples)...")
+        log(f"Computing block NELBO (L'={block_size}, {num_t_eval} MC samples, batch={eval_t_batch})...")
         nelbo_t0 = time.perf_counter()
         nelbo_nats, val_bpb = eval_block_nelbo_bpb(
             model, val_tokens, args,
             base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             block_size=block_size, num_t_samples=num_t_eval,
-            context_len=eval_ctx, log_fn=log,
+            t_batch_size=eval_t_batch, context_len=eval_ctx, log_fn=log,
         )
         nelbo_ms = 1000.0 * (time.perf_counter() - nelbo_t0)
         log(f"NELBO: {nelbo_nats:.4f} nats/token  val_bpb:{val_bpb:.4f}  "
-            f"(L'={block_size}, {num_t_eval} MC, {nelbo_ms:.0f}ms)")
+            f"(L'={block_size}, {num_t_eval} MC, batch={eval_t_batch}, {nelbo_ms:.0f}ms)")
 
     # ==============================================================================
     # SERIALIZATION + QUANTIZED ROUNDTRIP EVAL
@@ -1856,13 +1882,13 @@ def main() -> None:
 
         # 4. Re-eval with block NELBO on dequantized model
         if block_size > 0 and num_t_eval > 0:
-            log(f"Computing post-quant block NELBO (L'={block_size}, {num_t_eval} MC samples)...")
+            log(f"Computing post-quant block NELBO (L'={block_size}, {num_t_eval} MC samples, batch={eval_t_batch})...")
             q_t0 = time.perf_counter()
             q_nelbo_nats, q_val_bpb = eval_block_nelbo_bpb(
                 model, val_tokens, args,
                 base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
                 block_size=block_size, num_t_samples=num_t_eval,
-                context_len=eval_ctx, log_fn=log,
+                t_batch_size=eval_t_batch, context_len=eval_ctx, log_fn=log,
             )
             q_ms = 1000.0 * (time.perf_counter() - q_t0)
             log(f"final_int8_zlib_roundtrip val_loss:{q_nelbo_nats:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_ms:.0f}ms")
@@ -1872,14 +1898,14 @@ def main() -> None:
     # TTT (Test-Time Training) — score-first, then fine-tune per chunk
     # ==============================================================================
     if args.ttt_enabled and block_size > 0 and num_t_eval > 0:
-        log(f"Starting TTT eval (L'={block_size}, {num_t_eval} MC, "
+        log(f"Starting TTT eval (L'={block_size}, {num_t_eval} MC, batch={eval_t_batch}, "
             f"chunk={args.ttt_chunk_tokens}, epochs={args.ttt_epochs}, lr={args.ttt_lr})...")
         ttt_t0 = time.perf_counter()
         ttt_nelbo_nats, ttt_val_bpb = eval_block_nelbo_bpb_ttt(
             model, val_tokens, args,
             base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             block_size=block_size, num_t_samples=num_t_eval,
-            context_len=eval_ctx, log_fn=log,
+            t_batch_size=eval_t_batch, context_len=eval_ctx, log_fn=log,
         )
         ttt_ms = 1000.0 * (time.perf_counter() - ttt_t0)
         log(f"final_ttt val_loss:{ttt_nelbo_nats:.4f} val_bpb:{ttt_val_bpb:.4f} eval_time:{ttt_ms:.0f}ms")

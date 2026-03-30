@@ -57,6 +57,7 @@ class Hyperparameters:
     train_block_size = int(os.environ.get("TRAIN_BLOCK_SIZE", 4))
     eval_block_size = int(os.environ.get("EVAL_BLOCK_SIZE", 4))
     eval_t_samples = int(os.environ.get("EVAL_T_SAMPLES", 8))
+    eval_t_batch_size = int(os.environ.get("EVAL_T_BATCH_SIZE", 8))
     eval_context_len = int(os.environ.get("EVAL_CONTEXT_LEN", 2048))
     # Optimizer
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.025))
@@ -787,6 +788,7 @@ def eval_block_nelbo_bpb(
     args: Hyperparameters,
     block_size: int = 4,
     num_t_samples: int = 32,
+    t_batch_size: int | None = None,
     context_len: int = 0,
     log0=print,
 ) -> tuple[float, float]:
@@ -801,6 +803,7 @@ def eval_block_nelbo_bpb(
     t_min, t_max = args.t_min, args.t_max
     embed_dim = args.embed_dim
     log_range = math.log(t_max) - math.log(t_min)
+    t_batch_size = num_t_samples if t_batch_size is None or t_batch_size <= 0 else min(t_batch_size, num_t_samples)
 
     # Fixed noise levels for deterministic scoring
     ln_ts = np.linspace(math.log(t_min), math.log(t_max), num_t_samples, dtype=np.float32)
@@ -813,6 +816,7 @@ def eval_block_nelbo_bpb(
     my_block_end = (num_blocks * (rank + 1)) // world_size
 
     log0(f"block_nelbo: {num_blocks} blocks of {block_size} tokens, {num_t_samples} MC samples, "
+         f"mc_batch:{t_batch_size}, "
          f"rank {rank} blocks [{my_block_start}, {my_block_end})")
 
     total_nelbo_sum = torch.zeros((), device=device, dtype=torch.float64)
@@ -845,22 +849,30 @@ def eval_block_nelbo_bpb(
 
             # Score block at multiple noise levels
             block_ce_sum = 0.0
-            for ln_t in ln_ts:
-                t_val = math.exp(float(ln_t))
+            for t_start in range(0, num_t_samples, t_batch_size):
+                ln_t_chunk = ln_ts[t_start : t_start + t_batch_size]
+                mc_batch = len(ln_t_chunk)
+                t_vals = torch.tensor(np.exp(ln_t_chunk).astype(np.float32, copy=False), device=device)
 
-                # Per-position noise: context=0, block=t_val
-                t_per_pos = torch.zeros(1, full_len, device=device)
-                t_per_pos[0, ctx_len:] = t_val
+                # Per-position noise: context=0, block=t_val for each MC sample
+                t_per_pos = torch.zeros(mc_batch, full_len, device=device)
+                t_per_pos[:, ctx_len:] = t_vals[:, None]
 
-                eps = torch.randn(1, full_len, embed_dim, device=device, dtype=torch.bfloat16, generator=rng)
+                eps = torch.randn(mc_batch, full_len, embed_dim, device=device, dtype=torch.bfloat16, generator=rng)
 
                 # Block mask: only score block positions
-                blk_mask = torch.zeros(1, full_len, device=device)
-                blk_mask[0, ctx_len:] = 1.0
+                blk_mask = torch.zeros(mc_batch, full_len, device=device)
+                blk_mask[:, ctx_len:] = 1.0
 
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    ce = model.loss(full_ids, t_per_pos, eps, do_self_cond=False, block_mask=blk_mask)
-                block_ce_sum += float(ce.item())
+                    ce = model.loss(
+                        full_ids.expand(mc_batch, -1),
+                        t_per_pos,
+                        eps,
+                        do_self_cond=False,
+                        block_mask=blk_mask,
+                    )
+                block_ce_sum += float(ce.item()) * mc_batch
 
             # Block NELBO = log_range * mean(CE across noise levels)
             block_nelbo = log_range * block_ce_sum / num_t_samples
@@ -1635,19 +1647,20 @@ def main() -> None:
     t_qeval = time.perf_counter()
     block_size = args.eval_block_size
     num_t_eval = args.eval_t_samples
+    eval_t_batch = args.eval_t_batch_size
     eval_ctx = args.eval_context_len
     if block_size > 0 and num_t_eval > 0:
-        log0(f"Computing block NELBO (L'={block_size}, {num_t_eval} MC samples)...")
+        log0(f"Computing block NELBO (L'={block_size}, {num_t_eval} MC samples, batch={eval_t_batch})...")
         nelbo_nats, val_bpb = eval_block_nelbo_bpb(
             eval_model, rank, world_size, device,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             args, block_size=block_size, num_t_samples=num_t_eval,
-            context_len=eval_ctx, log0=log0,
+            t_batch_size=eval_t_batch, context_len=eval_ctx, log0=log0,
         )
         torch.cuda.synchronize()
         log0(
             f"final_int6_block_nelbo val_loss:{nelbo_nats:.4f} val_bpb:{val_bpb:.4f} "
-            f"(L'={block_size}, {num_t_eval} MC) "
+            f"(L'={block_size}, {num_t_eval} MC, batch={eval_t_batch}) "
             f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
         )
         log0(f"final_int6_block_nelbo_exact val_loss:{nelbo_nats:.8f} val_bpb:{val_bpb:.8f}")

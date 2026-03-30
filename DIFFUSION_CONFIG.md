@@ -91,6 +91,7 @@ Single source of truth for the continuous diffusion language model (CDCD + BD3-L
 |-----------|-------|-------|
 | eval_block_size | 4 | BD3-LM style. L'=4 gives ~18% gap to AR at scale. L'=1 = exact AR. |
 | eval_t_samples | 8 | MC noise samples per block. 8 = unbiased, just noisier than 32. |
+| eval_t_batch_size | 8 | Batch multiple MC noise levels into one forward pass during block NELBO scoring. |
 | eval_context_len | 2048 | Match train seq_len. Must be bounded or OOM on long val sets. |
 | scoring_method | Block NELBO | Valid upper bound on NLL. Converges to AR NLL as L'→1. |
 
